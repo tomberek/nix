@@ -1,37 +1,67 @@
+//#include "binary-cache-store.hh"
 #include "http-binary-cache-store.hh"
-#include "binary-cache-store.hh"
 #include "filetransfer.hh"
 #include "globals.hh"
 #include "nar-info-disk-cache.hh"
 #include "callback.hh"
+#include "util.hh"
+
 
 namespace nix {
 
 MakeError(UploadToHTTP, Error);
+MakeError(NotImplemented, Error);
 
-    HttpBinaryCacheStore::HttpBinaryCacheStore(
+struct ZsyncBinaryCacheStoreConfig : virtual HttpBinaryCacheStoreConfig
+{
+    using HttpBinaryCacheStoreConfig::HttpBinaryCacheStoreConfig;
+
+    const std::string name() override { return "Http+zsync Binary Cache Store"; }
+};
+
+class ZsyncBinaryCacheStore : public virtual ZsyncBinaryCacheStoreConfig, public virtual HttpBinaryCacheStore, public virtual BinaryCacheStore
+{
+private:
+
+    Path cacheUri;
+
+    struct State
+    {
+        bool enabled = true;
+        std::chrono::steady_clock::time_point disabledUntil;
+    };
+
+    Sync<State> _state;
+
+public:
+
+    ZsyncBinaryCacheStore(
         const std::string & scheme,
         const Path & _cacheUri,
         const Params & params)
         : StoreConfig(params)
         , BinaryCacheStoreConfig(params)
         , HttpBinaryCacheStoreConfig(params)
+        , ZsyncBinaryCacheStoreConfig(params)
         , Store(params)
         , BinaryCacheStore(params)
+        , HttpBinaryCacheStore(scheme.substr(0,scheme.find("+")),_cacheUri,params)
         , cacheUri(scheme + "://" + _cacheUri)
     {
         if (cacheUri.back() == '/')
             cacheUri.pop_back();
+        auto myScheme = scheme.substr(0,scheme.find("+"));
+        cacheUri = myScheme + "://" + _cacheUri;
 
         diskCache = getNarInfoDiskCache();
     }
 
-    std::string HttpBinaryCacheStore::getUri()
+    std::string getUri() override
     {
         return cacheUri;
     }
 
-    void HttpBinaryCacheStore::init()
+    void init() override
     {
         // FIXME: do this lazily?
         if (auto cacheInfo = diskCache->cacheExists(cacheUri)) {
@@ -47,15 +77,15 @@ MakeError(UploadToHTTP, Error);
         }
     }
 
-    std::set<std::string> HttpBinaryCacheStore::uriSchemes()
+    static std::set<std::string> uriSchemes()
     {
-        static bool forceHttp = getEnv("_NIX_FORCE_HTTP") == "1";
-        auto ret = std::set<std::string>({"http", "https"});
-        if (forceHttp) ret.insert("file");
+        auto ret = std::set<std::string>({"http+zsync", "https+zsync"});
         return ret;
     }
 
-    void HttpBinaryCacheStore::maybeDisable()
+protected:
+
+    void maybeDisable()
     {
         auto state(_state.lock());
         if (state->enabled && settings.tryFallback) {
@@ -66,7 +96,7 @@ MakeError(UploadToHTTP, Error);
         }
     }
 
-    void HttpBinaryCacheStore::checkEnabled()
+    void checkEnabled()
     {
         auto state(_state.lock());
         if (state->enabled) return;
@@ -78,7 +108,7 @@ MakeError(UploadToHTTP, Error);
         throw SubstituterDisabled("substituter '%s' is disabled", getUri());
     }
 
-    bool HttpBinaryCacheStore::fileExists(const std::string & path)
+    bool fileExists(const std::string & path) override
     {
         checkEnabled();
 
@@ -97,10 +127,11 @@ MakeError(UploadToHTTP, Error);
         }
     }
 
-    void HttpBinaryCacheStore::upsertFile(const std::string & path,
+    void upsertFile(const std::string & path,
         std::shared_ptr<std::basic_iostream<char>> istream,
-        const std::string & mimeType)
+        const std::string & mimeType) override
     {
+        //throw NotImplemented("not implemented: uploading to Zsync+HTTP binary cache at '%s'", cacheUri);
         auto req = makeRequest(path);
         req.data = std::make_shared<string>(StreamToSourceAdapter(istream).drain());
         req.mimeType = mimeType;
@@ -111,7 +142,7 @@ MakeError(UploadToHTTP, Error);
         }
     }
 
-    FileTransferRequest HttpBinaryCacheStore::makeRequest(const std::string & path)
+    FileTransferRequest makeRequest(const std::string & path)
     {
         return FileTransferRequest(
             hasPrefix(path, "https://") || hasPrefix(path, "http://") || hasPrefix(path, "file://")
@@ -120,43 +151,45 @@ MakeError(UploadToHTTP, Error);
 
     }
 
-    void HttpBinaryCacheStore::getFile(const std::string & path, Sink & sink)
+    void getFile(const std::string & path, Sink & sink) override
     {
+        if (!hasSuffix(path,".nar.gz")){
+                return HttpBinaryCacheStore::getFile(path,sink);
+        }
         checkEnabled();
-        auto request(makeRequest(path));
+        auto basePath = baseNameOf(path);
+        RunOptions options(
+            "sh",
+            { "-c", ("zsync " + cacheUri + "/" + path + ".zsync $(find /tmp/*.nar.gz -iname '*.nar.gz' -printf '-i %p ') 1>&2" + "; cat ").append(basePath) }
+        );
+        options.chdir = "/tmp";
+        options.standardOut = &sink;
         try {
-            getFileTransfer()->download(std::move(request), sink);
-        } catch (FileTransferError & e) {
-            if (e.error == FileTransfer::NotFound || e.error == FileTransfer::Forbidden)
-                throw NoSuchBinaryCacheFile("file '%s' does not exist in binary cache '%s'", path, getUri());
-            maybeDisable();
+            runProgram2(options);
+        } catch (ExecError & e) {
             throw;
         }
     }
+    std::shared_ptr<std::string> getFile(const std::string & path) {
+        StringSink sink;
+        try {
+            getFile(path, sink);
+        } catch (NoSuchBinaryCacheFile &) {
+            return nullptr;
+        }
+        return sink.s;
+    }
 
-    void HttpBinaryCacheStore::getFile(const std::string & path,
+    void getFile(const std::string & path,
         Callback<std::shared_ptr<std::string>> callback) noexcept
     {
-        checkEnabled();
-
-        auto request(makeRequest(path));
-
-        auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
-
-        getFileTransfer()->enqueueFileTransfer(request,
-            {[callbackPtr, this](std::future<FileTransferResult> result) {
-                try {
-                    (*callbackPtr)(result.get().data);
-                } catch (FileTransferError & e) {
-                    if (e.error == FileTransfer::NotFound || e.error == FileTransfer::Forbidden)
-                        return (*callbackPtr)(std::shared_ptr<std::string>());
-                    maybeDisable();
-                    callbackPtr->rethrow();
-                } catch (...) {
-                    callbackPtr->rethrow();
-                }
-            }});
-    }
+            try {
+                callback(getFile(path));
+            } catch (...) { callback.rethrow(); }
+        }
 
 };
 
+static RegisterStoreImplementation<ZsyncBinaryCacheStore, ZsyncBinaryCacheStoreConfig> regZsyncBinaryCacheStore;
+
+}
