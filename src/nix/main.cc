@@ -266,7 +266,7 @@ void mainWrapped(int argc, char * * argv)
     });
 
     try {
-        args.parseCmdline(argvToStrings(argc, argv));
+        args.parseCmdline(programName, argvToStrings(argc, argv));
     } catch (HelpRequested &) {
         std::vector<std::string> subcommand;
         MultiCommand * command = &args;

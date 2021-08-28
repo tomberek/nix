@@ -470,6 +470,11 @@ std::string toLower(const std::string & s);
 std::string shellEscape(const std::string & s);
 
 
+/* Recreate the effect of the perl shellwords function, breaking up a
+ * string into arguments like a shell word, including escapes */
+std::vector<string> shellwords(const string & s);
+
+
 /* Exception handling in destructors: print an error message, then
    ignore the exception. */
 void ignoreException();

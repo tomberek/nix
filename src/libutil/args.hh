@@ -20,6 +20,10 @@ public:
        wrong. */
     void parseCmdline(const Strings & cmdline);
 
+    /* Parse the command line with argv0, throwing a UsageError if something
+       goes wrong. */
+    void parseCmdline(const string & argv0, const Strings & cmdline);
+
     /* Return a short one-line description of the command. */
     virtual std::string description() { return ""; }
 

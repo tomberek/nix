@@ -46,6 +46,7 @@ cat > $flake1Dir/flake.nix <<EOF
 
   outputs = inputs: rec {
     packages.$system.foo = import ./simple.nix;
+    packages.$system.fooScript = (import ./shell.nix {}).foo;
     defaultPackage.$system = packages.$system.foo;
 
     # To test "nix flake init".
@@ -54,8 +55,8 @@ cat > $flake1Dir/flake.nix <<EOF
 }
 EOF
 
-cp ./simple.nix ./simple.builder.sh ./config.nix $flake1Dir/
-git -C $flake1Dir add flake.nix simple.nix simple.builder.sh config.nix
+cp ./simple.nix ./shell.nix ./simple.builder.sh ./config.nix $flake1Dir/
+git -C $flake1Dir add flake.nix simple.nix shell.nix simple.builder.sh config.nix
 git -C $flake1Dir commit -m 'Initial'
 
 cat > $flake2Dir/flake.nix <<EOF
@@ -92,7 +93,17 @@ cat > $nonFlakeDir/README.md <<EOF
 FNORD
 EOF
 
-git -C $nonFlakeDir add README.md
+cat > $nonFlakeDir/shebang.sh <<EOF
+#! $(type -P env) nix
+#! nix --offline shell
+#! nix flake1#fooScript
+#! nix --no-write-lock-file --command bash
+set -e
+foo
+EOF
+chmod +x $nonFlakeDir/shebang.sh
+
+git -C $nonFlakeDir add README.md shebang.sh
 git -C $nonFlakeDir commit -m 'Initial'
 
 # Construct a custom registry, additionally test the --registry flag
@@ -772,3 +783,6 @@ EOF
 git -C $flakeFollowsA add flake.nix
 
 nix flake lock $flakeFollowsA 2>&1 | grep 'this is a security violation'
+
+# Test shebang
+[[ $($nonFlakeDir/shebang.sh) = "foo" ]]
