@@ -217,7 +217,7 @@ struct CmdHelp : Command
 
     std::string description() override
     {
-        return "show help about `nix` or a particular subcommand";
+        return "show help about **nix** or a particular subcommand";
     }
 
     std::string doc() override

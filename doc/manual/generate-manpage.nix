@@ -11,7 +11,7 @@ let
       **Warning**: This program is **experimental** and its interface is subject to change.
     ''
     + "# Name\n\n"
-    + "`${command}` - ${def.description}\n\n"
+    + "**${command}** - ${def.description}\n\n"
     + "# Synopsis\n\n"
     + showSynopsis { inherit command; args = def.args; }
     + (if def.commands or {} != {}
@@ -20,7 +20,7 @@ let
            categories = sort (x: y: x.id < y.id) (unique (map (cmd: cmd.category) (attrValues def.commands)));
            listCommands = cmds:
              concatStrings (map (name:
-               "* [`${command} ${name}`](./${appendName filename name}.md) - ${cmds.${name}.description}\n")
+               "* [**${command} ${name}**](./${appendName filename name}.md) - ${cmds.${name}.description}\n")
                (attrNames cmds));
          in
          "where *subcommand* is one of the following:\n\n"
@@ -63,8 +63,8 @@ let
               let
                 flag = flags.${longName};
               in
-                "  - `--${longName}`"
-                + (if flag ? shortName then " / `-${flag.shortName}`" else "")
+                "  - **--${longName}**"
+                + (if flag ? shortName then " / **-${flag.shortName}**" else "")
                 + (if flag ? labels then " " + (concatStringsSep " " (map (s: "*${s}*") flag.labels)) else "")
                 + "  \n"
                 + "    " + flag.description + "\n\n"
@@ -73,7 +73,7 @@ let
 
   showSynopsis =
     { command, args }:
-    "`${command}` [*option*...] ${concatStringsSep " "
+    "**${command}** [*option*...] ${concatStringsSep " "
       (map (arg: "*${arg.label}*" + (if arg ? arity then "" else "...")) args)}\n\n";
 
   processCommand = { command, def, filename }:
