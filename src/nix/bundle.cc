@@ -17,7 +17,7 @@ struct CmdBundle : InstallableCommand
         addFlag({
             .longName = "bundler",
             .description = fmt("Use a custom bundler instead of the default (`%s`).", bundler),
-            .labels = {"flake-url"},
+            .labels = {"flake-uri"},
             .handler = {&bundler},
             .completer = {[&](size_t, std::string_view prefix) {
                 completeFlakeRef(getStore(), prefix);

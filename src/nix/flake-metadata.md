@@ -6,8 +6,8 @@ R""(
 
   ```console
   # nix flake metadata nixpkgs
-  Resolved URL:  github:edolstra/dwarffs
-  Locked URL:    github:edolstra/dwarffs/f691e2c991e75edb22836f1dbe632c40324215c5
+  Resolved URI:  github:edolstra/dwarffs
+  Locked URI:    github:edolstra/dwarffs/f691e2c991e75edb22836f1dbe632c40324215c5
   Description:   A filesystem that fetches DWARF debug info from the Internet on demand
   Path:          /nix/store/769s05vjydmc2lcf6b02az28wsa9ixh1-source
   Revision:      f691e2c991e75edb22836f1dbe632c40324215c5
@@ -39,31 +39,31 @@ R""(
       "id": "dwarffs",
       "type": "indirect"
     },
-    "originalUrl": "flake:dwarffs",
+    "originalUri": "flake:dwarffs",
     "path": "/nix/store/hang3792qwdmm2n0d9nsrs5n6bsws6kv-source",
     "resolved": {
       "owner": "edolstra",
       "repo": "dwarffs",
       "type": "github"
     },
-    "resolvedUrl": "github:edolstra/dwarffs",
+    "resolvedUri": "github:edolstra/dwarffs",
     "revision": "d181d714fd36eb06f4992a1997cd5601e26db8f5",
-    "url": "github:edolstra/dwarffs/d181d714fd36eb06f4992a1997cd5601e26db8f5"
+    "uri": "github:edolstra/dwarffs/d181d714fd36eb06f4992a1997cd5601e26db8f5"
   }
   ```
 
 # Description
 
 This command shows information about the flake specified by the flake
-reference *flake-url*. It resolves the flake reference using the
+reference *flake-uri*. It resolves the flake reference using the
 [flake registry](./nix3-registry.md), fetches it, and prints some meta
 data. This includes:
 
-* `Resolved URL`: If *flake-url* is a flake identifier, then this is
+* `Resolved URI`: If *flake-uri* is a flake identifier, then this is
   the flake reference that specifies its actual location, looked up in
   the flake registry.
 
-* `Locked URL`: A flake reference that contains a commit or content
+* `Locked URI`: A flake reference that contains a commit or content
   hash and thus uniquely identifies a specific flake version.
 
 * `Description`: A one-line description of the flake, taken from the
@@ -86,14 +86,14 @@ data. This includes:
 
 With `--json`, the output is a JSON object with the following fields:
 
-* `original` and `originalUrl`: The flake reference specified by the
-  user (*flake-url*) in attribute set and URL representation.
+* `original` and `originalUri`: The flake reference specified by the
+  user (*flake-uri*) in attribute set and URI representation.
 
-* `resolved` and `resolvedUrl`: The resolved flake reference (see
-  above) in attribute set and URL representation.
+* `resolved` and `resolvedUri`: The resolved flake reference (see
+  above) in attribute set and URI representation.
 
-* `locked` and `lockedUrl`: The locked flake reference (see above) in
-  attribute set and URL representation.
+* `locked` and `lockedUri`: The locked flake reference (see above) in
+  attribute set and URI representation.
 
 * `description`: See `Description` above.
 

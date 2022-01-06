@@ -30,7 +30,7 @@ public:
     FlakeCommand()
     {
         expectArgs({
-            .label = "flake-url",
+            .label = "flake-uri",
             .optional = true,
             .handler = {&flakeUrl},
             .completer = {[&](size_t, std::string_view prefix) {
@@ -168,11 +168,11 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
             nlohmann::json j;
             if (flake.description)
                 j["description"] = *flake.description;
-            j["originalUrl"] = flake.originalRef.to_string();
+            j["originalUri"] = flake.originalRef.to_string();
             j["original"] = fetchers::attrsToJSON(flake.originalRef.toAttrs());
-            j["resolvedUrl"] = flake.resolvedRef.to_string();
+            j["resolvedUri"] = flake.resolvedRef.to_string();
             j["resolved"] = fetchers::attrsToJSON(flake.resolvedRef.toAttrs());
-            j["url"] = flake.lockedRef.to_string(); // FIXME: rename to lockedUrl
+            j["uri"] = flake.lockedRef.to_string(); // FIXME: rename to lockedUrl
             j["locked"] = fetchers::attrsToJSON(flake.lockedRef.toAttrs());
             if (auto rev = flake.lockedRef.input.getRev())
                 j["revision"] = rev->to_string(Base16, false);
@@ -185,10 +185,10 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
             logger->cout("%s", j.dump());
         } else {
             logger->cout(
-                ANSI_BOLD "Resolved URL:" ANSI_NORMAL "  %s",
+                ANSI_BOLD "Resolved URI:" ANSI_NORMAL "  %s",
                 flake.resolvedRef.to_string());
             logger->cout(
-                ANSI_BOLD "Locked URL:" ANSI_NORMAL "    %s",
+                ANSI_BOLD "Locked URI:" ANSI_NORMAL "    %s",
                 flake.lockedRef.to_string());
             if (flake.description)
                 logger->cout(

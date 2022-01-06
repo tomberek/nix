@@ -18,7 +18,7 @@ R""(
 # Description
 
 This command verifies that the flake specified by flake reference
-*flake-url* can be evaluated successfully (as detailed below), and
+*flake-uri* can be evaluated successfully (as detailed below), and
 that the derivations specified by the flake's `checks` output can be
 built successfully.
 

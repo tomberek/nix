@@ -13,6 +13,6 @@ R""(
 # Description
 
 This command performs a Git or Mercurial clone of the repository
-containing the source code of the flake *flake-url*.
+containing the source code of the flake *flake-uri*.
 
 )""

@@ -92,7 +92,7 @@ MixFlakeOptions::MixFlakeOptions()
         .longName = "override-input",
         .description = "Override a specific flake input (e.g. `dwarffs/nixpkgs`). This implies `--no-write-lock-file`.",
         .category = category,
-        .labels = {"input-path", "flake-url"},
+        .labels = {"input-path", "flake-uri"},
         .handler = {[&](std::string inputPath, std::string flakeRef) {
             lockFlags.writeLockFile = false;
             lockFlags.inputOverrides.insert_or_assign(
@@ -105,7 +105,7 @@ MixFlakeOptions::MixFlakeOptions()
         .longName = "inputs-from",
         .description = "Use the inputs of the specified flake as registry entries.",
         .category = category,
-        .labels = {"flake-url"},
+        .labels = {"flake-uri"},
         .handler = {[&](std::string flakeRef) {
             auto evalState = getEvalState();
             auto flake = flake::lockFlake(

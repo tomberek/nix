@@ -31,7 +31,7 @@ R""(
 # Description
 
 This command shows the output attributes provided by the flake
-specified by flake reference *flake-url*. These are the top-level
+specified by flake reference *flake-uri*. These are the top-level
 attributes in the `outputs` of the flake, as well as lower-level
 attributes for some standard outputs (e.g. `packages` or `checks`).
 
