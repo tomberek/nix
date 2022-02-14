@@ -101,6 +101,7 @@ static FlakeInput parseFlakeInput(EvalState & state,
 
     auto sInputs = state.symbols.create("inputs");
     auto sUrl = state.symbols.create("url");
+    auto sValue = state.symbols.create("value");
     auto sFlake = state.symbols.create("flake");
     auto sFollows = state.symbols.create("follows");
 
@@ -113,6 +114,11 @@ static FlakeInput parseFlakeInput(EvalState & state,
                 expectType(state, nString, *attr.value, *attr.pos);
                 url = attr.value->string.s;
                 attrs.emplace("url", *url);
+            } else if (attr.name == sValue) {
+                expectType(state, nString, *attr.value, *attr.pos);
+                url = attr.value->string.s;
+                attrs.emplace("value", *url);
+                input.isFlake = false;
             } else if (attr.name == sFlake) {
                 expectType(state, nBool, *attr.value, *attr.pos);
                 input.isFlake = attr.value->boolean;
@@ -146,6 +152,13 @@ static FlakeInput parseFlakeInput(EvalState & state,
     }
 
     if (attrs.count("type"))
+        try {
+            input.ref = FlakeRef::fromAttrs(attrs);
+        } catch (Error & e) {
+            e.addTrace(pos, hintfmt("in flake input"));
+            throw;
+        }
+    else if (attrs.count("value"))
         try {
             input.ref = FlakeRef::fromAttrs(attrs);
         } catch (Error & e) {
