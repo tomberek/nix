@@ -131,6 +131,7 @@ struct InstallableCommand : virtual Args, SourceExprCommand
     InstallableCommand();
 
     void prepare() override;
+    std::shared_ptr<Installable> load();
 
     std::optional<FlakeRef> getFlakeRefForCompletion() override
     {

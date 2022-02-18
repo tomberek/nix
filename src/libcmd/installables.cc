@@ -957,10 +957,13 @@ InstallableCommand::InstallableCommand()
         }}
     });
 }
+std::shared_ptr<Installable> InstallableCommand::load() {
+    return parseInstallable(getStore(), _installable);
+}
 
 void InstallableCommand::prepare()
 {
-    installable = parseInstallable(getStore(), _installable);
+    installable = load();
 }
 
 }
