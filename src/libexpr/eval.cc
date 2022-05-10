@@ -538,6 +538,10 @@ Path EvalState::checkSourcePath(const Path & path_)
     if (i != resolvedPaths.end())
         return i->second;
 
+    if (path_.substr(0,5) == "path:" || path_.substr(0,7) == "github:") {
+        warn("returning: %s",path_);
+        return std::string(path_);
+    }
     bool found = false;
 
     /* First canonicalize the path without symlinks, so we make sure an
@@ -2071,6 +2075,11 @@ std::string EvalState::copyPathToStore(PathSet & context, const Path & path)
 
     Path dstPath;
     auto i = srcToStore.find(path);
+    warn("resolving");
+    // TODO: hack, instead use flakeref parsing to determine if valid
+    if (path.substr(0,5) == "path:") return std::string(path);
+    if (path.substr(0,7) == "github:") return std::string(path);
+    warn("done resolving");
     if (i != srcToStore.end())
         dstPath = store->printStorePath(i->second);
     else {

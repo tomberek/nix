@@ -10,6 +10,9 @@ static void checkName(std::string_view path, std::string_view name)
         throw BadStorePath("store path '%s' has an empty name", path);
     if (name.size() > 211)
         throw BadStorePath("store path '%s' has a name longer than 211 characters", path);
+    // TODO: hack, use parsing
+    if (path.substr(0,5) == "path:") return;
+    if (path.substr(0,7) == "github:") return;
     for (auto c : name)
         if (!((c >= '0' && c <= '9')
                 || (c >= 'a' && c <= 'z')

@@ -569,6 +569,20 @@ LockedFlake lockFlake(
                     throw;
                 }
             }
+            for (auto & [id, edge] : node->inputs) {
+                LockedNode * n  = std::get_if<std::shared_ptr<LockedNode>>(&edge)->get();
+                warn("new len %d",state.getSearchPath().size());
+                auto p = state.store->printStorePath(n->computeStorePath(*(state.store)));
+                if (n->isFlake) {
+                    state.addToSearchPath(fmt("%s=%s",n->originalRef.to_string(),n->lockedRef.to_string()));
+                    warn("adding %s=%s",n->originalRef.to_string(),n->lockedRef.to_string());
+                } else {
+                    state.addToSearchPath(fmt("%s=%s",n->originalRef.to_string(),p));
+                    warn("adding %s=%s",n->originalRef.to_string(),p);
+                }
+                state.allowPath(p);
+                state.allowPath(n->lockedRef.to_string());
+            }
         };
 
         // Bring in the current ref for relative path resolution if we have it

@@ -119,8 +119,8 @@ PATH        {PATH_CHAR}*(\/{PATH_CHAR}+)+\/?
 PATH_SEG    {PATH_CHAR}*\/
 HPATH       \~(\/{PATH_CHAR}+)+\/?
 HPATH_START \~\/
-SPATH       \<{PATH_CHAR}+(\/{PATH_CHAR}+)*\>
 URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~\*\']+
+SPATH       \<({URI}|{PATH_CHAR}+(\/{PATH_CHAR}+)*)\>
 
 
 %%

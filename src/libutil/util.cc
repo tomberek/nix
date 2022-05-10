@@ -111,6 +111,9 @@ Path canonPath(PathView path, bool resolveSymlinks)
     std::string s;
     s.reserve(256);
 
+    // TODO: hack, use parsing
+    if (path.substr(0,5) == "path:") return std::string(path);
+    if (path.substr(0,7) == "github:") return std::string(path);
     if (path[0] != '/')
         throw Error("not an absolute path: '%1%'", path);
 

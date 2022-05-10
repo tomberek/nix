@@ -23,6 +23,9 @@
 #include "nixexpr.hh"
 #include "eval.hh"
 #include "globals.hh"
+#include <libexpr/attr-path.hh>
+#include <libexpr/flake/flakeref.hh>
+#include <libexpr/flake/flake.hh>
 
 namespace nix {
 
@@ -759,10 +762,16 @@ Path EvalState::findFile(const std::string_view path)
     return findFile(searchPath, path);
 }
 
-
 Path EvalState::findFile(SearchPath & searchPath, const std::string_view path, const PosIdx pos)
 {
+    warn("path: %s %d",path,getSearchPath().size());
+    searchPath = getSearchPath();
     for (auto & i : searchPath) {
+        auto rFlake = resolveSearchPathElem(i);
+        warn("path resolved: %s %d %s",path,getSearchPath().size(),rFlake.second);
+        if (!rFlake.first || i.first != path ) continue;
+        warn("path resolved: returning");
+        return rFlake.second;
         std::string suffix;
         if (i.first.empty())
             suffix = concatStrings("/", path);
@@ -796,6 +805,14 @@ std::pair<bool, std::string> EvalState::resolveSearchPathElem(const SearchPathEl
 {
     auto i = searchPathResolved.find(elem.second);
     if (i != searchPathResolved.end()) return i->second;
+    warn("trying parsing %s",elem.second);
+    try {
+        auto r = parseFlakeRef(elem.second);
+        auto flake = nix::flake::getFlake(*this, r, true);
+        return {true,flake.lockedRef.to_string()};
+    } catch (Error &) {
+    }
+    warn("after trying");
 
     std::pair<bool, std::string> res;
 
