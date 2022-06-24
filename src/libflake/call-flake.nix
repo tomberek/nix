@@ -86,7 +86,8 @@ let
           inherit outputs;
           inherit sourceInfo;
           _type = "flake";
-        };
+        }
+        // (if key == "root" then { inherit lockFileStr; } else { });
 
     in
     {
