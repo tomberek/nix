@@ -61,13 +61,21 @@ output=$($TEST_ROOT/shell.shebang.sh abc def)
 
 # Test nix-shell shebang mode with an alternate working directory
 sed -e "s|@ENV_PROG@|$(type -P env)|" shell.shebang.expr > $TEST_ROOT/shell.shebang.expr
-chmod a+rx $TEST_ROOT/shell.shebang.expr
+sed -e "s|nix-shell -E|nix-shell --relative -E|" \
+    -e "s|@ENV_PROG@|$(type -P env)|" \
+    shell.shebang.expr > $TEST_ROOT/shell.shebang.expr.relative
+chmod a+rx $TEST_ROOT/shell.shebang.expr{,.relative}
 # Should fail due to expressions using relative path
+pushd ..
 ! $TEST_ROOT/shell.shebang.expr bar
+popd
 cp shell.nix config.nix $TEST_ROOT
-# Should succeed
-output=$($TEST_ROOT/shell.shebang.expr bar)
-[ "$output" = '-e load(ARGV.shift) -- '"$TEST_ROOT"'/shell.shebang.expr bar' ]
+# Should fail
+pushd ..
+! $TEST_ROOT/shell.shebang.expr bar
+output=$($TEST_ROOT/shell.shebang.expr.relative bar)
+popd
+[ "$output" = '-e load(ARGV.shift) -- '"$TEST_ROOT"'/shell.shebang.expr.relative bar' ]
 
 # Test nix-shell shebang mode again with metacharacters in the filename.
 # First word of filename is chosen to not match any file in the test root.

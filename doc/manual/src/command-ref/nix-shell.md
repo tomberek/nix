@@ -13,6 +13,7 @@
   [`--exclude` *regexp*]
   [`--pure`]
   [`--keep` *name*]
+  [`--relative`]
   {{`--packages` | `-p`} {*packages* | *expressions*} … | [*path*]}
 
 # Disambiguation
@@ -100,6 +101,10 @@ All options not listed here are passed to `nix-store
   - `--keep` *name*\
     When a `--pure` shell is started, keep the listed environment
     variables.
+
+  - `--relative`\
+    If this flag is specified when using the shebang feature, relative paths
+    will be resolved relative to the script's location.
 
 {{#include ./opt-common.md}}
 

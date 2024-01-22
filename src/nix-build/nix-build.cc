@@ -107,6 +107,7 @@ static void main_nix_build(int argc, char * * argv)
     auto myName = runEnv ? "nix-shell" : "nix-build";
 
     auto inShebang = false;
+    auto inShebangRelative = false;
     std::string script;
     std::vector<std::string> savedArgs;
 
@@ -206,6 +207,9 @@ static void main_nix_build(int argc, char * * argv)
         else if (runEnv && (*arg == "--packages" || *arg == "-p"))
             packages = true;
 
+        else if (inShebang && (*arg == "--relative")) {
+            inShebangRelative = true;
+        }
         else if (inShebang && *arg == "-i") {
             auto interpreter = getArg(*arg, arg, end);
             interactive = false;
@@ -300,7 +304,7 @@ static void main_nix_build(int argc, char * * argv)
             if (fromArgs)
                 exprs.push_back(state->parseExprFromString(
                     std::move(i),
-                    state->rootPath(CanonPath::fromCwd(inShebang ? dirOf(script) : "."))));
+                    state->rootPath(CanonPath::fromCwd((inShebang && inShebangRelative) ? dirOf(script) : "."))));
             else {
                 auto absolute = i;
                 try {
@@ -313,7 +317,7 @@ static void main_nix_build(int argc, char * * argv)
                     /* If we're in a #! script, interpret filenames
                        relative to the script. */
                     exprs.push_back(state->parseExprFromFile(resolveExprPath(state->checkSourcePath(lookupFileArg(*state,
-                                        inShebang ? absPath(i, absPath(dirOf(script))) : i)))));
+                                        (inShebang && inShebangRelative) ? absPath(i, absPath(dirOf(script))) : i)))));
             }
         }
 
