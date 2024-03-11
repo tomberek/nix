@@ -19,7 +19,7 @@ using namespace flake;
 
 namespace flake {
 
-typedef std::pair<StorePath, FlakeRef> FetchedFlake;
+typedef std::pair<ref<SourceAccessor>, FlakeRef> FetchedFlake;
 typedef std::vector<std::pair<FlakeRef, FetchedFlake>> FlakeCache;
 
 static std::optional<FetchedFlake> lookupInFlakeCache(
@@ -49,12 +49,12 @@ static std::tuple<StorePath, FlakeRef, FlakeRef> fetchOrSubstituteTree(
 
     if (!fetched) {
         if (originalRef.input.isDirect()) {
-            fetched.emplace(originalRef.fetchTree(state.store));
+            fetched.emplace(originalRef.lazyFetch(state.store));
         } else {
             if (allowLookup) {
                 resolvedRef = originalRef.resolve(state.store);
                 auto fetchedResolved = lookupInFlakeCache(flakeCache, originalRef);
-                if (!fetchedResolved) fetchedResolved.emplace(resolvedRef.fetchTree(state.store));
+                if (!fetchedResolved) fetchedResolved.emplace(resolvedRef.lazyFetch(state.store));
                 flakeCache.push_back({resolvedRef, *fetchedResolved});
                 fetched.emplace(*fetchedResolved);
             }
@@ -65,10 +65,10 @@ static std::tuple<StorePath, FlakeRef, FlakeRef> fetchOrSubstituteTree(
         flakeCache.push_back({originalRef, *fetched});
     }
 
-    auto [storePath, lockedRef] = *fetched;
+    auto [accessor, lockedRef] = *fetched;
 
-    debug("got tree '%s' from '%s'",
-        state.store->printStorePath(storePath), lockedRef);
+    auto [storePath , storePathS ]= state.store->toStorePath(SourcePath(accessor).path.abs());
+    debug("got tree '%s' from '%s'", storePathS, lockedRef);
 
     state.allowPath(storePath);
 
@@ -782,7 +782,7 @@ void callFlake(EvalState & state,
 
         emitTreeAttrs(
             state,
-            storePath,
+            sourcePath,
             lockedNode ? lockedNode->lockedRef.input : lockedFlake.flake.lockedRef.input,
             vSourceInfo,
             false,
