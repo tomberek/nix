@@ -208,9 +208,17 @@ public:
      * the inputSrcs of the derivations.
 
      * For canonicity, the store paths should be in sorted order.
+     *
+     * We allocate extra bytes for a size_t in order to preserve
+     * the size of strings prior to the string itself, which is
+     * null-terminated.
      */
+    struct LenChar {
+        size_t len;
+        char c_str[];
+    };
     struct StringWithContext {
-        const char * c_str;
+        const LenChar * s;
         const char * * context; // must be in sorted order
     };
 
@@ -314,20 +322,18 @@ public:
         finishValue(tBool, { .boolean = b });
     }
 
-    inline void mkString(const char * s, const char * * context = 0)
-    {
-        finishValue(tString, { .string = { .c_str = s, .context = context } });
-    }
-
-    void mkString(std::string_view s);
-
     void mkString(std::string_view s, const NixStringContext & context);
+    void mkString(std::string_view s, const char * * context = 0);
 
-    void mkStringMove(const char * s, const NixStringContext & context);
+    void mkStringMove(const LenChar * s, const NixStringContext & context);
+
+    inline void mkStringMove(const LenChar * s, const char * * context = 0){
+        finishValue(tString, { .string = { .s = s, .context = context } });
+    }
 
     inline void mkString(const Symbol & s)
     {
-        mkString(((const std::string &) s).c_str());
+        mkString(std::string_view((const std::string &) s));
     }
 
     void mkPath(const SourcePath & path);
@@ -445,13 +451,17 @@ public:
     std::string_view string_view() const
     {
         assert(internalType == tString);
-        return std::string_view(payload.string.c_str);
+        if (payload.string.s == NULL)
+            return std::string_view();
+        return std::string_view(payload.string.s->c_str, payload.string.s->len);
     }
 
     const char * c_str() const
     {
         assert(internalType == tString);
-        return payload.string.c_str;
+        if (payload.string.s == NULL)
+            return "";
+        return payload.string.s->c_str;
     }
 
     const char * * context() const

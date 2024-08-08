@@ -85,15 +85,18 @@ static char * dupString(const char * s)
 // string allocations.
 // This function handles makeImmutableString(std::string_view()) by returning
 // the empty string.
-static const char * makeImmutableString(std::string_view s)
+static const Value::LenChar * makeImmutableString(std::string_view s)
 {
     const size_t size = s.size();
     if (size == 0)
-        return "";
-    auto t = allocString(size + 1);
+        return NULL;
+    auto t = allocString(size + 1 + sizeof(size_t));
+    auto ts = t;
+    ((size_t *)ts)[0] = size;
+    t += sizeof(size_t);
     memcpy(t, s.data(), size);
     t[size] = '\0';
-    return t;
+    return (const Value::LenChar *) ts;
 }
 
 
@@ -824,12 +827,6 @@ DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
         evalState.runDebugRepl(nullptr, trace.env, trace.expr);
 }
 
-void Value::mkString(std::string_view s)
-{
-    mkString(makeImmutableString(s));
-}
-
-
 static const char * * encodeContext(const NixStringContext & context)
 {
     if (!context.empty()) {
@@ -846,17 +843,25 @@ static const char * * encodeContext(const NixStringContext & context)
 
 void Value::mkString(std::string_view s, const NixStringContext & context)
 {
-    mkString(makeImmutableString(s), encodeContext(context));
+    mkStringMove(makeImmutableString(s), context);
 }
 
-void Value::mkStringMove(const char * s, const NixStringContext & context)
+void Value::mkString(std::string_view s, const char * * context){
+    mkStringMove(makeImmutableString(s), context);
+}
+
+void Value::mkStringMove(const Value::LenChar * s, const NixStringContext & context)
 {
-    mkString(s, encodeContext(context));
+    mkStringMove(s, encodeContext(context));
 }
 
 void Value::mkPath(const SourcePath & path)
 {
-    mkPath(&*path.accessor, makeImmutableString(path.path.abs()));
+    auto s = makeImmutableString(path.path.abs());
+    if (s == NULL)
+        mkPath(&*path.accessor, "");
+    else
+        mkPath(&*path.accessor, makeImmutableString(path.path.abs())->c_str);
 }
 
 
@@ -1994,12 +1999,15 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
     /* c_str() is not str().c_str() because we want to create a string
        Value. allocating a GC'd string directly and moving it into a
        Value lets us avoid an allocation and copy. */
-    const auto c_str = [&] {
-        char * result = allocString(sSize + 1);
-        char * tmp = result;
+    const auto len_str = [&] {
+        Value::LenChar * result = (Value::LenChar *) (allocString(sSize + 1 + sizeof(size_t)));
+        size_t * size = &(result->len);
+        *size=0;
+        char * tmp = (char *) &(result->c_str);
         for (const auto & part : s) {
             memcpy(tmp, part->data(), part->size());
             tmp += part->size();
+            *size += part->size();
         }
         *tmp = 0;
         return result;
@@ -2062,7 +2070,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
             state.error<EvalError>("a string that refers to a store path cannot be appended to a path").atPos(pos).withFrame(env, *this).debugThrow();
         v.mkPath(state.rootPath(CanonPath(canonPath(str()))));
     } else
-        v.mkStringMove(c_str(), context);
+        v.mkStringMove(len_str(), context);
 }
 
 
