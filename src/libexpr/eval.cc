@@ -305,6 +305,8 @@ EvalState::EvalState(
     , regexCache(makeRegexCache())
 #if HAVE_BOEHMGC
     , valueAllocCache(std::allocate_shared<void *>(traceable_allocator<void *>(), nullptr))
+    // C++20 can initialize this directly
+    , valueBindingsCache(std::array<std::shared_ptr<void *>, BINDINGS_ARENA_LIMIT>{})
     , env1AllocCache(std::allocate_shared<void *>(traceable_allocator<void *>(), nullptr))
     , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &allocEnv(BASE_ENV_SIZE)))
     , baseEnv(**baseEnvP)
@@ -321,6 +323,12 @@ EvalState::EvalState(
     assertGCInitialized();
 
     static_assert(sizeof(Env) <= 16, "environment must be <= 16 bytes");
+
+#if HAVE_BOEHMGC
+    for (int i; i< BINDINGS_ARENA_LIMIT; i++) {
+        valueBindingsCache[i] = std::allocate_shared<void *>(traceable_allocator<void *>(), nullptr);
+    }
+#endif
 
     vEmptyList.mkList(buildList(0));
     vNull.mkNull();
@@ -3006,6 +3014,7 @@ void EvalState::printStatistics()
     };
     topObj["sets"] = {
         {"number", nrAttrsets},
+        {"numberInArena", nrAttrsetsInArena},
         {"bytes", bAttrsets},
         {"elements", nrAttrsInAttrsets},
     };

@@ -353,6 +353,8 @@ private:
      * Allocation cache for GC'd Value objects.
      */
     std::shared_ptr<void *> valueAllocCache;
+    static constexpr size_t BINDINGS_ARENA_LIMIT = 10;
+    std::array<std::shared_ptr<void *>,BINDINGS_ARENA_LIMIT> valueBindingsCache;
 
     /**
      * Allocation cache for size-1 Env objects.
@@ -691,6 +693,7 @@ public:
      * Allocation primitives.
      */
     inline Value * allocValue();
+    inline Bindings * allocBindingsArena(size_t capacity);
     inline Env & allocEnv(size_t size);
 
     Bindings * allocBindings(size_t capacity);
@@ -820,6 +823,7 @@ private:
     unsigned long nrListElems = 0;
     unsigned long nrLookups = 0;
     unsigned long nrAttrsets = 0;
+    unsigned long nrAttrsetsInArena = 0;
     unsigned long nrAttrsInAttrsets = 0;
     unsigned long nrAvoided = 0;
     unsigned long nrOpUpdates = 0;

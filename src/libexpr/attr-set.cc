@@ -19,6 +19,12 @@ Bindings * EvalState::allocBindings(size_t capacity)
         throw Error("attribute set of size %d is too big", capacity);
     nrAttrsets++;
     nrAttrsInAttrsets += capacity;
+#if HAVE_BOEHMGC
+    if (capacity < BINDINGS_ARENA_LIMIT) {
+        nrAttrsetsInArena++;
+        return new (allocBindingsArena(capacity)) Bindings((Bindings::size_t) capacity);
+    }
+#endif
     return new (allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity)) Bindings((Bindings::size_t) capacity);
 }
 

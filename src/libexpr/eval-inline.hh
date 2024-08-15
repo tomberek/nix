@@ -23,6 +23,35 @@ inline void * allocBytes(size_t n)
     return p;
 }
 
+[[gnu::always_inline]]
+Bindings * EvalState::allocBindingsArena(size_t capacity)
+{
+#if HAVE_BOEHMGC
+    /* We use the boehm batch allocator to speed up allocations of Values (of which there are many).
+       GC_malloc_many returns a linked list of objects of the given size, where the first word
+       of each object is also the pointer to the next object in the list. This also means that we
+       have to explicitly clear the first word of every object we take. */
+    // return new (allocBytes(
+    // sizeof(Bindings) + sizeof(Attr) * capacity))
+    // Bindings((Bindings::size_t) capacity);
+    if (!*valueBindingsCache[capacity]) {
+        *valueBindingsCache[capacity] = GC_malloc_many(
+                sizeof(Bindings) + sizeof(Attr) * capacity
+                );
+        if (!*valueBindingsCache[capacity]) throw std::bad_alloc();
+    }
+
+    /* GC_NEXT is a convenience macro for accessing the first word of an object.
+       Take the first list item, advance the list to the next item, and clear the next pointer. */
+    void * p = *valueBindingsCache[capacity];
+    *valueBindingsCache[capacity] = GC_NEXT(p);
+    GC_NEXT(p) = nullptr;
+#else
+    void * p = allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity);
+#endif
+    return (Bindings *) p;
+}
+
 
 [[gnu::always_inline]]
 Value * EvalState::allocValue()
