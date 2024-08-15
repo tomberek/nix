@@ -824,12 +824,21 @@ DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
         evalState.runDebugRepl(nullptr, trace.env, trace.expr);
 }
 
+unsigned long nrSmallStrings = 0;
+
 void Value::mkString(std::string_view s)
 {
-    CORD c = CORD_from_char_star(std::string(s).c_str());
-    mkStringCord(c);
+    if (s.length() == 0) {
+        mkStringCord(CORD_EMPTY, NULL);
+    }
+    if (s.length() < (sizeof(char *) * 2)){
+        nrSmallStrings++;
+        mkStringSmall(s);
+    } else {
+        CORD c = CORD_from_char_star(std::string(s).c_str());
+        mkStringCord(c, NULL);
+    }
 }
-
 
 static const char * * encodeContext(const NixStringContext & context)
 {
@@ -847,8 +856,16 @@ static const char * * encodeContext(const NixStringContext & context)
 
 void Value::mkString(std::string_view s, const NixStringContext & context)
 {
-    CORD c = CORD_from_char_star(std::string(s).c_str());
-    mkStringCord(c, encodeContext(context));
+    if (s.length() == 0) {
+        mkStringCord(CORD_EMPTY, encodeContext(context));
+    }
+    if (context.empty() && s.length() < (sizeof(char *) * 2)){
+        nrSmallStrings++;
+        mkStringSmall(s);
+    } else {
+        CORD c = CORD_from_char_star(std::string(s).c_str());
+        mkStringCord(c, encodeContext(context));
+    }
 }
 
 void Value::mkStringMove(const char * s, const NixStringContext & context)
@@ -2243,8 +2260,8 @@ std::string_view EvalState::forceString(Value & v, const PosIdx pos, std::string
 
 void copyContext(const Value & v, NixStringContext & context)
 {
-    if (v.payload.string.context)
-        for (const char * * p = v.payload.string.context; *p; ++p)
+    if (v.context())
+        for (const char * * p = v.context(); *p; ++p)
             context.insert(NixStringContextElem::parse(*p));
 }
 
@@ -2991,6 +3008,9 @@ void EvalState::printStatistics()
         {"number", nrAttrsets},
         {"bytes", bAttrsets},
         {"elements", nrAttrsInAttrsets},
+    };
+    topObj["strings"] = {
+        {"nrSmallStrings", nrSmallStrings},
     };
     topObj["sizes"] = {
         {"Env", sizeof(Env)},

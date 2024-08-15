@@ -27,6 +27,7 @@ typedef enum {
     tBool,
     tString,
     tStringCord,
+    tStringSmall,
     tPath,
     tNull,
     tAttrs,
@@ -211,6 +212,11 @@ public:
 
      * For canonicity, the store paths should be in sorted order.
      */
+    struct SmallStringWithoutContext { // Force the size to be 2 pointers
+        void * c_str;
+        void * c_str_2;
+    };
+
     struct StringWithContext {
         const char * c_str;
         const char * * context; // must be in sorted order
@@ -247,6 +253,7 @@ public:
 
         StringWithContext string;
         CordWithContext cord;
+        SmallStringWithoutContext smallString;
 
         Path path;
 
@@ -280,7 +287,7 @@ public:
             case tUninitialized: break;
             case tInt: return nInt;
             case tBool: return nBool;
-            case tString: case tStringCord: return nString;
+            case tString: case tStringCord: case tStringSmall: return nString;
             case tPath: return nPath;
             case tNull: return nNull;
             case tAttrs: return nAttrs;
@@ -342,6 +349,14 @@ public:
     inline void mkStringCord(CORD s, const char * * context = 0)
     {
         finishValue(tStringCord, { .cord = { .cord = s, .context = context } });
+    }
+
+    void mkStringSmall(std::string_view s){
+        auto len = s.length();
+        internalType = tStringSmall;
+        char * t = (char *) &(payload.smallString.c_str);
+        memcpy(t, s.data(), len);
+        t[len] = '\0';
     }
 
     void mkPath(const SourcePath & path);
@@ -458,30 +473,41 @@ public:
 
     std::string_view string_view() const
     {
-        assert(internalType == tString || internalType == tStringCord);
-        if (internalType == tString)
-            return std::string_view(payload.string.c_str);
-        return std::string_view(CORD_to_const_char_star(payload.cord.cord), CORD_len(payload.cord.cord));
+        assert(internalType == tString || internalType == tStringCord || internalType == tStringSmall);
+        if (internalType == tStringSmall)
+            return std::string_view((char *) &payload.smallString.c_str);
+        if (internalType == tStringCord)
+            return std::string_view(CORD_to_const_char_star(payload.cord.cord), CORD_len(payload.cord.cord));
+        if (payload.string.c_str == NULL)
+            return std::string_view();
+        return std::string_view(payload.string.c_str);
     }
 
     const char * c_str() const
     {
-        assert(internalType == tString || internalType == tStringCord);
-        if (internalType == tString)
-            return payload.string.c_str;
-        return CORD_to_const_char_star(payload.cord.cord);
+        assert(internalType == tString || internalType == tStringCord || internalType == tStringSmall);
+        if (internalType == tStringSmall)
+            return (char *) &payload.smallString.c_str;
+        if (internalType == tStringCord)
+            return CORD_to_const_char_star(payload.cord.cord);
+        if (payload.string.c_str == NULL)
+            return "";
+        return payload.string.c_str;
     }
 
     CORD cord()
     {
-        assert(internalType == tString || internalType == tStringCord);
+        assert(internalType == tString || internalType == tStringCord || internalType == tStringSmall);
+        if (internalType == tStringSmall){
+            char * c = (char *) &payload.smallString.c_str;
+            if (strcmp(c,"") == 0)
+                finishValue(tStringCord, { .cord = { .cord = CORD_EMPTY, .context = 0, } });
+            else
+                finishValue(tStringCord, { .cord = { .cord = CORD_from_char_star(c), .context = 0, } });
+        }
         if (internalType == tString){
-            finishValue(tStringCord, {
-                .cord = {
-                    .cord = payload.string.c_str == NULL || strcmp(payload.string.c_str,"") == 0 ? CORD_EMPTY : payload.string.c_str,
-                    .context = payload.string.context,
-                    }
-                });
+            CORD c = payload.string.c_str == NULL || strcmp(payload.string.c_str,"") == 0 ? CORD_EMPTY : payload.string.c_str;
+            finishValue(tStringCord, { .cord = { .cord = c, .context = payload.string.context, } });
         }
         return payload.cord.cord;
     }
@@ -490,8 +516,11 @@ public:
     {
         if (internalType == tString)
             return payload.string.context;
-        else
+        if (internalType == tStringCord)
             return payload.cord.context;
+        if (internalType == tStringSmall)
+            return 0;
+        unreachable();
     }
 
     ExternalValueBase * external() const
