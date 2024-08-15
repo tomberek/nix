@@ -601,7 +601,7 @@ struct CompareValues
                 case nFloat:
                     return v1->fpoint() < v2->fpoint();
                 case nString:
-                    return strcmp(v1->c_str(), v2->c_str()) < 0;
+                    return CORD_cmp(v1->cord(), v2->cord()) < 0;
                 case nPath:
                     // Note: we don't take the accessor into account
                     // since it's not obvious how to compare them in a
@@ -2649,7 +2649,7 @@ static void prim_attrNames(EvalState & state, const PosIdx pos, Value * * args, 
         (list[n] = state.allocValue())->mkString(state.symbols[i.name]);
 
     std::sort(list.begin(), list.end(),
-              [](Value * v1, Value * v2) { return strcmp(v1->c_str(), v2->c_str()) < 0; });
+              [](Value * v1, Value * v2) { return CORD_cmp(v1->cord(), v2->cord()) < 0; });
 
     v.mkList(list);
 }
@@ -3962,10 +3962,10 @@ static RegisterPrimOp primop_lessThan({
 static void prim_toString(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     NixStringContext context;
-    auto s = state.coerceToString(pos, *args[0], context,
+    auto s = state.coerceToCord(pos, *args[0], context,
             "while evaluating the first argument passed to builtins.toString",
             true, false);
-    v.mkString(*s, context);
+    v.mkStringCord(s, context);
 }
 
 static RegisterPrimOp primop_toString({
@@ -4011,15 +4011,16 @@ static void prim_substring(EvalState & state, const PosIdx pos, Value * * args, 
     if (len == 0) {
         state.forceValue(*args[2], pos);
         if (args[2]->type() == nString) {
-            v.mkString("", args[2]->context());
+            v.mkStringCord(CORD_EMPTY, args[2]->context());
             return;
         }
     }
 
     NixStringContext context;
-    auto s = state.coerceToString(pos, *args[2], context, "while evaluating the third argument (the string) passed to builtins.substring");
+    auto s = state.coerceToCord(pos, *args[2], context, "while evaluating the third argument (the string) passed to builtins.substring");
 
-    v.mkString((unsigned int) start >= s->size() ? "" : s->substr(start, len), context);
+    len = (size_t) len > (CORD_len(s) - start) ? CORD_len(s) - start : len;
+    v.mkStringCord((unsigned int) start >= CORD_len(s) ? CORD_EMPTY : CORD_substr(s,start, len), context);
 }
 
 static RegisterPrimOp primop_substring({
@@ -4046,8 +4047,8 @@ static RegisterPrimOp primop_substring({
 static void prim_stringLength(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     NixStringContext context;
-    auto s = state.coerceToString(pos, *args[0], context, "while evaluating the argument passed to builtins.stringLength");
-    v.mkInt(s->size());
+    auto s = state.coerceToCord(pos, *args[0], context, "while evaluating the argument passed to builtins.stringLength");
+    v.mkInt(CORD_len(s));
 }
 
 static RegisterPrimOp primop_stringLength({
@@ -4393,19 +4394,20 @@ static void prim_concatStringsSep(EvalState & state, const PosIdx pos, Value * *
 {
     NixStringContext context;
 
-    auto sep = state.forceString(*args[0], context, pos, "while evaluating the first argument (the separator string) passed to builtins.concatStringsSep");
+    state.forceString(*args[0], context, pos, "while evaluating the first argument (the separator string) passed to builtins.concatStringsSep");
+    auto sep = args[0]->cord();
     state.forceList(*args[1], pos, "while evaluating the second argument (the list of strings to concat) passed to builtins.concatStringsSep");
 
-    std::string res;
-    res.reserve((args[1]->listSize() + 32) * sep.size());
+    CORD res = CORD_EMPTY;
     bool first = true;
 
     for (auto elem : args[1]->listItems()) {
-        if (first) first = false; else res += sep;
-        res += *state.coerceToString(pos, *elem, context, "while evaluating one element of the list of strings to concat passed to builtins.concatStringsSep");
+        if (first) first = false; else res = CORD_cat(res,sep);
+        auto item = state.coerceToCord(pos, *elem, context, "while evaluating one element of the list of strings to concat passed to builtins.concatStringsSep");
+        res = CORD_cat(res,item);
     }
 
-    v.mkString(res, context);
+    v.mkStringCord(res, context);
 }
 
 static RegisterPrimOp primop_concatStringsSep({

@@ -11,6 +11,7 @@
 
 #if HAVE_BOEHMGC
 #include <gc/gc_allocator.h>
+#include <gc/cord.h>
 #endif
 #include <nlohmann/json_fwd.hpp>
 
@@ -25,6 +26,7 @@ typedef enum {
     tInt = 1,
     tBool,
     tString,
+    tStringCord,
     tPath,
     tNull,
     tAttrs,
@@ -214,6 +216,11 @@ public:
         const char * * context; // must be in sorted order
     };
 
+    struct CordWithContext {
+        CORD cord;
+        const char * * context; // must be in sorted order
+    };
+
     struct Path {
         SourceAccessor * accessor;
         const char * path;
@@ -239,6 +246,7 @@ public:
         bool boolean;
 
         StringWithContext string;
+        CordWithContext cord;
 
         Path path;
 
@@ -272,7 +280,7 @@ public:
             case tUninitialized: break;
             case tInt: return nInt;
             case tBool: return nBool;
-            case tString: return nString;
+            case tString: case tStringCord: return nString;
             case tPath: return nPath;
             case tNull: return nNull;
             case tAttrs: return nAttrs;
@@ -328,6 +336,12 @@ public:
     inline void mkString(const SymbolStr & s)
     {
         mkString(s.c_str());
+    }
+
+    void mkStringCord(CORD s, const NixStringContext & context);
+    inline void mkStringCord(CORD s, const char * * context = 0)
+    {
+        finishValue(tStringCord, { .cord = { .cord = s, .context = context } });
     }
 
     void mkPath(const SourcePath & path);
@@ -444,19 +458,40 @@ public:
 
     std::string_view string_view() const
     {
-        assert(internalType == tString);
-        return std::string_view(payload.string.c_str);
+        assert(internalType == tString || internalType == tStringCord);
+        if (internalType == tString)
+            return std::string_view(payload.string.c_str);
+        return std::string_view(CORD_to_const_char_star(payload.cord.cord), CORD_len(payload.cord.cord));
     }
 
     const char * c_str() const
     {
-        assert(internalType == tString);
-        return payload.string.c_str;
+        assert(internalType == tString || internalType == tStringCord);
+        if (internalType == tString)
+            return payload.string.c_str;
+        return CORD_to_const_char_star(payload.cord.cord);
+    }
+
+    CORD cord()
+    {
+        assert(internalType == tString || internalType == tStringCord);
+        if (internalType == tString){
+            finishValue(tStringCord, {
+                .cord = {
+                    .cord = payload.string.c_str == NULL || strcmp(payload.string.c_str,"") == 0 ? CORD_EMPTY : payload.string.c_str,
+                    .context = payload.string.context,
+                    }
+                });
+        }
+        return payload.cord.cord;
     }
 
     const char * * context() const
     {
-        return payload.string.context;
+        if (internalType == tString)
+            return payload.string.context;
+        else
+            return payload.cord.context;
     }
 
     ExternalValueBase * external() const

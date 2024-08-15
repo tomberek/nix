@@ -20,6 +20,8 @@
 #include <optional>
 #include <functional>
 
+#include <gc/cord.h>
+
 namespace nix {
 
 /**
@@ -527,6 +529,10 @@ public:
      * booleans and lists to a string.  If `copyToStore` is set,
      * referenced paths are copied to the Nix store as a side effect.
      */
+    CORD coerceToCord(const PosIdx pos, Value & v, NixStringContext & context,
+        std::string_view errorCtx,
+        bool coerceMore = false, bool copyToStore = true,
+        bool canonicalizePath = true);
     BackedStringView coerceToString(const PosIdx pos, Value & v, NixStringContext & context,
         std::string_view errorCtx,
         bool coerceMore = false, bool copyToStore = true,

@@ -826,7 +826,8 @@ DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
 
 void Value::mkString(std::string_view s)
 {
-    mkString(makeImmutableString(s));
+    CORD c = CORD_from_char_star(std::string(s).c_str());
+    mkStringCord(c);
 }
 
 
@@ -846,12 +847,17 @@ static const char * * encodeContext(const NixStringContext & context)
 
 void Value::mkString(std::string_view s, const NixStringContext & context)
 {
-    mkString(makeImmutableString(s), encodeContext(context));
+    CORD c = CORD_from_char_star(std::string(s).c_str());
+    mkStringCord(c, encodeContext(context));
 }
 
 void Value::mkStringMove(const char * s, const NixStringContext & context)
 {
     mkString(s, encodeContext(context));
+}
+
+void Value::mkStringCord(CORD s, const NixStringContext & context){
+    mkStringCord(s, encodeContext(context));
 }
 
 void Value::mkPath(const SourcePath & path)
@@ -1977,23 +1983,25 @@ void EvalState::concatLists(Value & v, size_t nrLists, Value * const * lists, co
 void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
 {
     NixStringContext context;
-    std::vector<BackedStringView> s;
-    size_t sSize = 0;
+    CORD s = CORD_EMPTY;
     NixInt n = 0;
     NixFloat nf = 0;
 
     bool first = !forceString;
     ValueType firstType = nString;
 
+    /*
     const auto str = [&] {
         std::string result;
         result.reserve(sSize);
         for (const auto & part : s) result += *part;
         return result;
     };
+    */
     /* c_str() is not str().c_str() because we want to create a string
        Value. allocating a GC'd string directly and moving it into a
        Value lets us avoid an allocation and copy. */
+    /*
     const auto c_str = [&] {
         char * result = allocString(sSize + 1);
         char * tmp = result;
@@ -2004,6 +2012,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         *tmp = 0;
         return result;
     };
+    */
 
     // List of returned strings. References to these Values must NOT be persisted.
     SmallTemporaryValueVector<conservativeStackReservation> values(es->size());
@@ -2039,15 +2048,13 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
             } else
                 state.error<EvalError>("cannot add %1% to a float", showType(vTmp)).atPos(i_pos).withFrame(env, *this).debugThrow();
         } else {
-            if (s.empty()) s.reserve(es->size());
             /* skip canonization of first path, which would only be not
             canonized in the first place if it's coming from a ./${foo} type
             path */
-            auto part = state.coerceToString(i_pos, vTmp, context,
+            auto part = state.coerceToCord(i_pos, vTmp, context,
                                              "while evaluating a path segment",
                                              false, firstType == nString, !first);
-            sSize += part->size();
-            s.emplace_back(std::move(part));
+            s = CORD_cat(s,part);
         }
 
         first = false;
@@ -2060,9 +2067,9 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
     else if (firstType == nPath) {
         if (!context.empty())
             state.error<EvalError>("a string that refers to a store path cannot be appended to a path").atPos(pos).withFrame(env, *this).debugThrow();
-        v.mkPath(state.rootPath(CanonPath(canonPath(str()))));
+        v.mkPath(state.rootPath(CanonPath(canonPath(CORD_to_const_char_star(s)))));
     } else
-        v.mkStringMove(c_str(), context);
+        v.mkStringCord(s, context);
 }
 
 
@@ -2284,6 +2291,99 @@ std::optional<std::string> EvalState::tryAttrsToString(const PosIdx pos, Value &
     }
 
     return {};
+}
+
+CORD EvalState::coerceToCord(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx,
+    bool coerceMore,
+    bool copyToStore,
+    bool canonicalizePath)
+{
+    forceValue(v, pos);
+
+    if (v.type() == nString) {
+        copyContext(v, context);
+        return v.cord();
+    }
+
+    if (v.type() == nPath) {
+        return
+            !canonicalizePath && !copyToStore
+            ? // FIXME: hack to preserve path literals that end in a
+              // slash, as in /foo/${x}.
+              v.payload.path.path
+            : copyToStore
+            ? CORD_from_char_star(store->printStorePath(copyPathToStore(context, v.path())).c_str())
+            : CORD_from_char_star(v.path().path.abs().c_str());
+    }
+
+    if (v.type() == nAttrs) {
+        auto maybeString = tryAttrsToString(pos, v, context, coerceMore, copyToStore);
+        if (maybeString)
+            return maybeString->c_str();
+        auto i = v.attrs()->find(sOutPath);
+        if (i == v.attrs()->end()) {
+            error<TypeError>(
+                "cannot coerce %1% to a string: %2%",
+                showType(v),
+                ValuePrinter(*this, v, errorPrintOptions)
+            )
+                .withTrace(pos, errorCtx)
+                .debugThrow();
+        }
+        return coerceToCord(pos, *i->value, context, errorCtx,
+                              coerceMore, copyToStore, canonicalizePath);
+    }
+
+    /*
+    if (v.type() == nExternal) {
+        try {
+            return v.external()->coerceToString(*this, pos, context, coerceMore, copyToStore);
+        } catch (Error & e) {
+            e.addTrace(nullptr, errorCtx);
+            throw;
+        }
+    }
+    */
+
+    if (coerceMore) {
+        /* Note that `false' is represented as an empty string for
+           shell scripting convenience, just like `null'. */
+        if (v.type() == nBool && v.boolean()) return CORD_from_char_star("1");
+        if (v.type() == nBool && !v.boolean()) return CORD_EMPTY;
+        if (v.type() == nInt) return CORD_from_char_star(std::to_string(v.integer()).c_str());
+        if (v.type() == nFloat) return CORD_from_char_star(std::to_string(v.fpoint()).c_str());
+        if (v.type() == nNull) return CORD_EMPTY;
+
+        if (v.isList()) {
+            CORD result = CORD_EMPTY;
+            for (auto [n, v2] : enumerate(v.listItems())) {
+                try {
+                    result = CORD_cat(result,coerceToCord(pos, *v2, context,
+                            "while evaluating one element of the list",
+                            coerceMore, copyToStore, canonicalizePath));
+                } catch (Error & e) {
+                    e.addTrace(positions[pos], errorCtx);
+                    throw;
+                }
+                if (n < v.listSize() - 1
+                    /* !!! not quite correct */
+                    && (!v2->isList() || v2->listSize() != 0))
+                    result=CORD_cat(result,CORD_from_char_star(" "));
+            }
+            return result;
+        }
+    }
+
+    error<TypeError>("cannot coerce %1% to a string: %2%",
+        showType(v),
+        ValuePrinter(*this, v, errorPrintOptions)
+    )
+        .withTrace(pos, errorCtx)
+        .debugThrow();
 }
 
 BackedStringView EvalState::coerceToString(
@@ -2564,7 +2664,7 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
         return;
 
     case nString:
-        if (strcmp(v1.c_str(), v2.c_str()) != 0) {
+        if (CORD_cmp(v1.cord(), v2.cord()) != 0) {
             error<AssertionError>(
                 "string '%s' is not equal to string '%s'",
                 ValuePrinter(*this, v1, errorPrintOptions),
@@ -2743,7 +2843,7 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
             return v1.boolean() == v2.boolean();
 
         case nString:
-            return strcmp(v1.c_str(), v2.c_str()) == 0;
+            return CORD_cmp(v1.cord(), v2.cord()) == 0;
 
         case nPath:
             return
