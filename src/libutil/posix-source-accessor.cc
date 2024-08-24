@@ -199,4 +199,9 @@ ref<SourceAccessor> makeFSSourceAccessor(std::filesystem::path root)
 {
     return make_ref<PosixSourceAccessor>(std::move(root));
 }
+
+bool PosixSourceAccessor::toStringReturnsStorePath() const {
+    return false;
+}
+
 }
