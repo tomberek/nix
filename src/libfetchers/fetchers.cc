@@ -167,8 +167,29 @@ bool Input::contains(const Input & other) const
 
 std::pair<StorePath, Input> Input::fetchToStore(ref<Store> store) const
 {
+// TODO: lazy-trees gets rid of this. Why?
+#if 0
     if (!scheme)
         throw Error("cannot fetch unsupported input '%s'", attrsToJSON(toAttrs()));
+
+    /* The tree may already be in the Nix store, or it could be
+       substituted (which is often faster than fetching from the
+       original source). So check that. */
+    if (getNarHash()) {
+        try {
+            auto storePath = computeStorePath(*store);
+
+            store->ensurePath(storePath);
+
+            debug("using substituted/cached input '%s' in '%s'",
+                to_string(), store->printStorePath(storePath));
+
+            return {std::move(storePath), *this};
+        } catch (Error & e) {
+            debug("substitution of input '%s' failed: %s", to_string(), e.what());
+        }
+    }
+#endif
 
     auto [storePath, input] = [&]() -> std::pair<StorePath, Input> {
         try {
@@ -176,8 +197,9 @@ std::pair<StorePath, Input> Input::fetchToStore(ref<Store> store) const
 
             auto storePath = nix::fetchToStore(*store, SourcePath(accessor), FetchMode::Copy, final.getName());
 
-            auto narHash = store->queryPathInfo(storePath)->narHash;
-            final.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
+            // TODO: do we really want to throw this out?
+            // auto narHash = store->queryPathInfo(storePath)->narHash;
+            // final.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
 
             scheme->checkLocks(*this, final);
 
