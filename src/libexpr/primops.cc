@@ -257,6 +257,7 @@ static void import(EvalState & state, const PosIdx pos, Value & vPath, Value * v
     auto path = realisePath(state, pos, vPath, std::nullopt);
     auto path2 = path.path.abs();
 
+    // FIXME
     auto isValidDerivationInStore = [&]() -> std::optional<StorePath> {
         if (!state.store->isStorePath(path2))
             return std::nullopt;
@@ -266,27 +267,14 @@ static void import(EvalState & state, const PosIdx pos, Value & vPath, Value * v
         return storePath;
     };
 
-        Env * env = &state.allocEnv(vScope->attrs()->size());
-        env->up = &state.baseEnv;
-
-        auto staticEnv = std::make_shared<StaticEnv>(nullptr, state.staticBaseEnv.get(), vScope->attrs()->size());
-
-        unsigned int displ = 0;
-        for (auto & attr : *vScope->attrs()) {
-            staticEnv->vars.emplace_back(attr.name, displ);
-            env->values[displ++] = attr.value;
-        }
-
-        state.forceFunction(**state.vImportedDrvToDerivation, pos, "while evaluating imported-drv-to-derivation.nix.gen.hh");
-        v.mkApp(*state.vImportedDrvToDerivation, w);
-        state.forceAttrs(v, pos, "while calling imported-drv-to-derivation.nix.gen.hh");
-    } else {
-        if (!vScope)
-            state.evalFile(path, v);
-        else {
-            state.forceAttrs(*vScope, pos, "while evaluating the first argument passed to builtins.scopedImport");
-
-        e->eval(state, *env, v);
+    if (auto storePath = isValidDerivationInStore()) {
+        derivationToValue(state, pos, path, *storePath, v);
+    }
+    else if (vScope) {
+        scopedImport(state, pos, path, vScope, v);
+    }
+    else {
+        state.evalFile(path, v);
     }
 }
 
