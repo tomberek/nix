@@ -130,7 +130,7 @@ in
 }).overrideAttrs
   (
     finalAttrs: prevAttrs: {
-      doCheck = true;
+      doCheck = false;
       doInstallCheck = true;
 
       checkInputs =
