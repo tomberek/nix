@@ -53,10 +53,8 @@ suites = [
       'nix-collect-garbage-d.sh',
       'remote-store.sh',
       'legacy-ssh-store.sh',
-      'lang.sh',
       'lang-gc.sh',
       'characterisation-test-infra.sh',
-      'experimental-features.sh',
       'fetchMercurial.sh',
       'gc-auto.sh',
       'user-envs.sh',
@@ -71,11 +69,9 @@ suites = [
       'timeout.sh',
       'fetchGitRefs.sh',
       'gc-runtime.sh',
-      'tarball.sh',
       'fetchGit.sh',
       'fetchurl.sh',
       'fetchPath.sh',
-      'fetchTree-file.sh',
       'simple.sh',
       'referrers.sh',
       'optimise-store.sh',
@@ -109,14 +105,11 @@ suites = [
       'impure-eval.sh',
       'pure-eval.sh',
       'eval.sh',
-      'repl.sh',
       'binary-cache-build-remote.sh',
       'search.sh',
       'logging.sh',
       'export.sh',
-      'config.sh',
       'add.sh',
-      'chroot-store.sh',
       'filter-source.sh',
       'misc.sh',
       'dump-db.sh',
@@ -132,7 +125,6 @@ suites = [
       'nix-copy-ssh-ng.sh',
       'post-hook.sh',
       'function-trace.sh',
-      'fmt.sh',
       'eval-store.sh',
       'why-depends.sh',
       'derivation-json.sh',
@@ -149,11 +141,8 @@ suites = [
       'db-migration.sh',
       'bash-profile.sh',
       'pass-as-file.sh',
-      'nix-profile.sh',
-      'suggestions.sh',
       'store-info.sh',
       'fetchClosure.sh',
-      'completions.sh',
       'impure-derivations.sh',
       'path-from-hash-part.sh',
       'path-info.sh',
@@ -204,9 +193,6 @@ if nix_expr.found() and get_option('default_library') != 'static'
   }
 endif
 
-subdir('ca')
-subdir('dyn-drv')
-subdir('flakes')
 subdir('git-hashing')
 subdir('local-overlay-store')
 

@@ -18,8 +18,6 @@
 #include "get-drvs.hh"
 #include "derivations.hh"
 #include "globals.hh"
-#include "flake/flake.hh"
-#include "flake/lockfile.hh"
 #include "users.hh"
 #include "editor-for.hh"
 #include "finally.hh"
@@ -88,7 +86,6 @@ struct NixRepl
     ProcessLineResult processLine(std::string line);
 
     void loadFile(const Path & path);
-    void loadFlake(const std::string & flakeRef);
     void loadFiles();
     void reloadFiles();
     void addAttrsToScope(Value & attrs);
@@ -288,8 +285,6 @@ StringSet NixRepl::completePrefix(const std::string & prefix)
             // Quietly ignore parse errors.
         } catch (EvalError & e) {
             // Quietly ignore evaluation errors.
-        } catch (BadURL & e) {
-            // Quietly ignore BadURL flake-related errors.
         } catch (FileNotFound & e) {
             // Quietly ignore non-existent file beeing `import`-ed.
         }
@@ -374,7 +369,6 @@ ProcessLineResult NixRepl::processLine(std::string line)
              << "  :i <expr>                    Build derivation, then install result into\n"
              << "                               current profile\n"
              << "  :l, :load <path>             Load Nix expression and add it to scope\n"
-             << "  :lf, :load-flake <ref>       Load Nix flake and add it to scope\n"
              << "  :p, :print <expr>            Evaluate and print expression recursively\n"
              << "                               Strings are printed directly, without escaping.\n"
              << "  :q, :quit                    Exit nix-repl\n"
@@ -459,10 +453,6 @@ ProcessLineResult NixRepl::processLine(std::string line)
     else if (command == ":l" || command == ":load") {
         state->resetFileCache();
         loadFile(arg);
-    }
-
-    else if (command == ":lf" || command == ":load-flake") {
-        loadFlake(arg);
     }
 
     else if (command == ":r" || command == ":reload") {
@@ -710,35 +700,6 @@ void NixRepl::loadFile(const Path & path)
     state->evalFile(lookupFileArg(*state, path), v);
     state->autoCallFunction(*autoArgs, v, v2);
     addAttrsToScope(v2);
-}
-
-void NixRepl::loadFlake(const std::string & flakeRefS)
-{
-    if (flakeRefS.empty())
-        throw Error("cannot use ':load-flake' without a path specified. (Use '.' for the current working directory.)");
-
-    std::filesystem::path cwd;
-    try {
-        cwd = std::filesystem::current_path();
-    } catch (std::filesystem::filesystem_error & e) {
-        throw SysError("cannot determine current working directory");
-    }
-
-    auto flakeRef = parseFlakeRef(fetchSettings, flakeRefS, cwd.string(), true);
-    if (evalSettings.pureEval && !flakeRef.input.isLocked())
-        throw Error("cannot use ':load-flake' on locked flake reference '%s' (use --impure to override)", flakeRefS);
-
-    Value v;
-
-    flake::callFlake(*state,
-        flake::lockFlake(flakeSettings, *state, flakeRef,
-            flake::LockFlags {
-                .updateLockFile = false,
-                .useRegistries = !evalSettings.pureEval,
-                .allowUnlocked = !evalSettings.pureEval,
-            }),
-        v);
-    addAttrsToScope(v);
 }
 
 

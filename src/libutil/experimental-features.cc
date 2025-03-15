@@ -74,8 +74,7 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
         .tag = Xp::Flakes,
         .name = "flakes",
         .description = R"(
-            Enable flakes. See the manual entry for [`nix
-            flake`](@docroot@/command-ref/new-cli/nix3-flake.md) for details.
+            Enable flakes. Disabled.
         )",
         .trackingUrl = "https://github.com/NixOS/nix/milestone/27",
     },

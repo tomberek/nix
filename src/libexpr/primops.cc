@@ -1983,31 +1983,6 @@ static RegisterPrimOp primop_findFile(PrimOp {
       >   }
       >   ```
 
-      Search paths can also point to source trees using [flake URLs](@docroot@/command-ref/new-cli/nix3-flake.md#url-like-syntax).
-
-
-      > **Example**
-      >
-      > The search path entry
-      >
-      > ```
-      > {
-      >   prefix = "nixpkgs";
-      >   path = "flake:nixpkgs";
-      > }
-      > ```
-      > specifies that the prefix `nixpkgs` shall refer to the source tree downloaded from the `nixpkgs` entry in the flake registry.
-      >
-      > Similarly
-      >
-      > ```
-      > {
-      >   prefix = "nixpkgs";
-      >   path = "flake:github:nixos/nixpkgs/nixos-22.05";
-      > }
-      > ```
-      >
-      > makes `<nixpkgs>` refer to a particular branch of the `NixOS/nixpkgs` repository on GitHub.
     )",
     .fun = prim_findFile,
 });

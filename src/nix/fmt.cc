@@ -22,12 +22,6 @@ struct CmdFmt : SourceExprCommand {
 
     Category category() override { return catSecondary; }
 
-    Strings getDefaultFlakeAttrPaths() override {
-        return Strings{"formatter." + settings.thisSystem.get()};
-    }
-
-    Strings getDefaultFlakeAttrPathPrefixes() override { return Strings{}; }
-
     void run(ref<Store> store) override
     {
         auto evalState = getEvalState();

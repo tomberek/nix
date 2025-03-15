@@ -405,9 +405,6 @@ static RegisterPrimOp primop_fetchTree({
       - `"sourcehut"`
       - `"mercurial"`
 
-     *input* can also be a [URL-like reference](@docroot@/command-ref/new-cli/nix3-flake.md#flake-references).
-     The additional input types and the URL-like syntax requires the [`flakes` experimental feature](@docroot@/development/experimental-features.md#xp-feature-flakes) to be enabled.
-
       > **Example**
       >
       > Fetch a GitHub repository using the attribute set representation:

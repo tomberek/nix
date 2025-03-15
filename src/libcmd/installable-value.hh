@@ -2,7 +2,8 @@
 ///@file
 
 #include "installables.hh"
-#include "flake/flake.hh"
+#include "types.hh"
+#include "value.hh"
 
 namespace nix {
 

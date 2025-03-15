@@ -23,7 +23,6 @@ deps_public_maybe_subproject = [
   dependency('nix-store'),
   dependency('nix-fetchers'),
   dependency('nix-expr'),
-  dependency('nix-flake'),
   dependency('nix-main'),
 ]
 subdir('nix-meson-build-support/subprojects')
@@ -80,7 +79,6 @@ sources = files(
   'editor-for.cc',
   'installable-attr-path.cc',
   'installable-derived-path.cc',
-  'installable-flake.cc',
   'installable-value.cc',
   'installables.cc',
   'legacy.cc',
@@ -102,7 +100,6 @@ headers = [config_h] + files(
   'editor-for.hh',
   'installable-attr-path.hh',
   'installable-derived-path.hh',
-  'installable-flake.hh',
   'installable-value.hh',
   'installables.hh',
   'legacy.hh',

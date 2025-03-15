@@ -17,7 +17,6 @@
 #include "users.hh"
 #include "network-proxy.hh"
 #include "eval-cache.hh"
-#include "flake/flake.hh"
 #include "self-exe.hh"
 #include "json-utils.hh"
 #include "crash-handler.hh"
@@ -232,7 +231,6 @@ struct NixArgs : virtual MultiCommand, virtual MixCommonArgs, virtual RootArgs
             j["experimentalFeature"] = storeConfig->experimentalFeature();
         }
         res["stores"] = std::move(stores);
-        res["fetchers"] = fetchers::dumpRegisterInputSchemeInfo();
 
         return res.dump();
     }
@@ -368,7 +366,6 @@ void mainWrapped(int argc, char * * argv)
 
     initNix();
     initGC();
-    flake::initLib(flakeSettings);
 
     /* Set the build hook location
 

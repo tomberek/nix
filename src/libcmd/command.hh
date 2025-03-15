@@ -5,7 +5,6 @@
 #include "args.hh"
 #include "common-eval-args.hh"
 #include "path.hh"
-#include "flake/lockfile.hh"
 
 #include <optional>
 
@@ -108,31 +107,7 @@ private:
     std::shared_ptr<EvalState> evalState;
 };
 
-/**
- * A mixin class for commands that process flakes, adding a few standard
- * flake-related options/flags.
- */
-struct MixFlakeOptions : virtual Args, EvalCommand
-{
-    flake::LockFlags lockFlags;
-
-    MixFlakeOptions();
-
-    /**
-     * The completion for some of these flags depends on the flake(s) in
-     * question.
-     *
-     * This method should be implemented to gather all flakerefs the
-     * command is operating with (presumably specified via some other
-     * arguments) so that the completions for these flags can use them.
-     */
-    virtual std::vector<FlakeRef> getFlakeRefsForCompletion()
-    {
-        return {};
-    }
-};
-
-struct SourceExprCommand : virtual Args, MixFlakeOptions
+struct SourceExprCommand : virtual Args, EvalCommand
 {
     std::optional<Path> file;
     std::optional<std::string> expr;
@@ -142,10 +117,6 @@ struct SourceExprCommand : virtual Args, MixFlakeOptions
     Installables parseInstallables(ref<Store> store, std::vector<std::string> ss);
 
     ref<Installable> parseInstallable(ref<Store> store, const std::string & installable);
-
-    virtual Strings getDefaultFlakeAttrPaths();
-
-    virtual Strings getDefaultFlakeAttrPathPrefixes();
 
     /**
      * Complete an installable from the given prefix.
@@ -189,8 +160,6 @@ struct RawInstallablesCommand : virtual Args, SourceExprCommand
 
     bool readFromStdIn = false;
 
-    std::vector<FlakeRef> getFlakeRefsForCompletion() override;
-
 private:
 
     std::vector<std::string> rawInstallables;
@@ -217,8 +186,6 @@ struct InstallableCommand : virtual Args, SourceExprCommand
     virtual void run(ref<Store> store, ref<Installable> installable) = 0;
 
     void run(ref<Store> store) override;
-
-    std::vector<FlakeRef> getFlakeRefsForCompletion() override;
 
 private:
 
@@ -346,22 +313,6 @@ struct MixEnvironment : virtual Args
      */
     void setEnviron();
 };
-
-void completeFlakeInputAttrPath(
-    AddCompletions & completions,
-    ref<EvalState> evalState,
-    const std::vector<FlakeRef> & flakeRefs,
-    std::string_view prefix);
-
-void completeFlakeRef(AddCompletions & completions, ref<Store> store, std::string_view prefix);
-
-void completeFlakeRefWithFragment(
-    AddCompletions & completions,
-    ref<EvalState> evalState,
-    flake::LockFlags lockFlags,
-    Strings attrPathPrefixes,
-    const Strings & defaultFlakeAttrPaths,
-    std::string_view prefix);
 
 std::string showVersions(const std::set<std::string> & versions);
 

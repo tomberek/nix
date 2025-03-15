@@ -1,6 +1,5 @@
 #include "config-global.hh"
 #include "eval.hh"
-#include "installable-flake.hh"
 #include "command-installable-value.hh"
 #include "common-args.hh"
 #include "shared.hh"
@@ -458,24 +457,6 @@ struct Common : InstallableCommand, MixProfile
         rewrites.insert({BuildEnvironment::getString(fileInBuilderEnv->second), targetFilePath.string()});
     }
 
-    Strings getDefaultFlakeAttrPaths() override
-    {
-        Strings paths{
-            "devShells." + settings.thisSystem.get() + ".default",
-            "devShell." + settings.thisSystem.get(),
-        };
-        for (auto & p : SourceExprCommand::getDefaultFlakeAttrPaths())
-            paths.push_back(p);
-        return paths;
-    }
-
-    Strings getDefaultFlakeAttrPathPrefixes() override
-    {
-        auto res = SourceExprCommand::getDefaultFlakeAttrPathPrefixes();
-        res.emplace_front("devShells." + settings.thisSystem.get() + ".");
-        return res;
-    }
-
     StorePath getShellOutPath(ref<Store> store, ref<Installable> installable)
     {
         auto path = installable->getStorePath();
@@ -636,45 +617,6 @@ struct CmdDevelop : Common, MixEnvironment
 
         Path shell = "bash";
 
-        try {
-            auto state = getEvalState();
-
-            auto nixpkgsLockFlags = lockFlags;
-            nixpkgsLockFlags.inputOverrides = {};
-            nixpkgsLockFlags.inputUpdates = {};
-
-            auto nixpkgs = defaultNixpkgsFlakeRef();
-            if (auto * i = dynamic_cast<const InstallableFlake *>(&*installable))
-                nixpkgs = i->nixpkgsFlakeRef();
-
-            auto bashInstallable = make_ref<InstallableFlake>(
-                this,
-                state,
-                std::move(nixpkgs),
-                "bashInteractive",
-                ExtendedOutputsSpec::Default(),
-                Strings{},
-                Strings{"legacyPackages." + settings.thisSystem.get() + "."},
-                nixpkgsLockFlags);
-
-            bool found = false;
-
-            for (auto & path : Installable::toStorePathSet(getEvalStore(), store, Realise::Outputs, OperateOn::Output, {bashInstallable})) {
-                auto s = store->printStorePath(path) + "/bin/bash";
-                if (pathExists(s)) {
-                    shell = s;
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found)
-                throw Error("package 'nixpkgs#bashInteractive' does not provide a 'bin/bash'");
-
-        } catch (Error &) {
-            ignoreExceptionExceptInterrupt();
-        }
-
         // Override SHELL with the one chosen for this environment.
         // This is to make sure the system shell doesn't leak into the build environment.
         setEnv("SHELL", shell.c_str());
@@ -686,20 +628,6 @@ struct CmdDevelop : Common, MixEnvironment
         // Ctrl-C, so don't pass --rcfile
         auto args = phase || !command.empty() ? Strings{std::string(baseNameOf(shell)), rcFilePath}
             : Strings{std::string(baseNameOf(shell)), "--rcfile", rcFilePath};
-
-        // Need to chdir since phases assume in flake directory
-        if (phase) {
-            // chdir if installable is a flake of type git+file or path
-            auto installableFlake = installable.dynamic_pointer_cast<InstallableFlake>();
-            if (installableFlake) {
-                auto sourcePath = installableFlake->getLockedFlake()->flake.resolvedRef.input.getSourcePath();
-                if (sourcePath) {
-                    if (chdir(sourcePath->c_str()) == -1) {
-                        throw SysError("chdir to %s failed", *sourcePath);
-                    }
-                }
-            }
-        }
 
         // Release our references to eval caches to ensure they are persisted to disk, because
         // we are about to exec out of this process without running C++ destructors.

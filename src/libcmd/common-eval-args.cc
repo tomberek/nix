@@ -7,8 +7,6 @@
 #include "eval.hh"
 #include "fetchers.hh"
 #include "registry.hh"
-#include "flake/flakeref.hh"
-#include "flake/settings.hh"
 #include "store-api.hh"
 #include "command.hh"
 #include "tarball.hh"
@@ -27,28 +25,11 @@ static GlobalConfig::Register rFetchSettings(&fetchSettings);
 EvalSettings evalSettings {
     settings.readOnlyMode,
     {
-        {
-            "flake",
-            [](EvalState & state, std::string_view rest) {
-                experimentalFeatureSettings.require(Xp::Flakes);
-                // FIXME `parseFlakeRef` should take a `std::string_view`.
-                auto flakeRef = parseFlakeRef(fetchSettings, std::string { rest }, {}, true, false);
-                debug("fetching flake search path element '%s''", rest);
-                auto [accessor, lockedRef] = flakeRef.resolve(state.store).lazyFetch(state.store);
-                auto storePath = nix::fetchToStore(*state.store, SourcePath(accessor), FetchMode::Copy, lockedRef.input.getName());
-                state.allowPath(storePath);
-                return state.storePath(storePath);
-            },
-        },
     },
 };
 
 static GlobalConfig::Register rEvalSettings(&evalSettings);
 
-
-flake::Settings flakeSettings;
-
-static GlobalConfig::Register rFlakeSettings(&flakeSettings);
 
 
 CompatibilitySettings compatibilitySettings {};
@@ -118,23 +99,6 @@ MixEvalArgs::MixEvalArgs()
     });
 
     addFlag({
-        .longName = "override-flake",
-        .description = "Override the flake registries, redirecting *original-ref* to *resolved-ref*.",
-        .category = category,
-        .labels = {"original-ref", "resolved-ref"},
-        .handler = {[&](std::string _from, std::string _to) {
-            auto from = parseFlakeRef(fetchSettings, _from, fs::current_path().string());
-            auto to = parseFlakeRef(fetchSettings, _to, fs::current_path().string());
-            fetchers::Attrs extraAttrs;
-            if (to.subdir != "") extraAttrs["dir"] = to.subdir;
-            fetchers::overrideRegistry(from.input, to.input, extraAttrs);
-        }},
-        .completer = {[&](AddCompletions & completions, size_t, std::string_view prefix) {
-            completeFlakeRef(completions, openStore(), prefix);
-        }}
-    });
-
-    addFlag({
         .longName = "eval-store",
         .description =
           R"(
@@ -179,15 +143,6 @@ SourcePath lookupFileArg(EvalState & state, std::string_view s, const Path * bas
             state.fetchSettings,
             EvalSettings::resolvePseudoUrl(s));
         auto storePath = fetchToStore(*state.store, SourcePath(accessor), FetchMode::Copy);
-        return state.storePath(storePath);
-    }
-
-    else if (hasPrefix(s, "flake:")) {
-        experimentalFeatureSettings.require(Xp::Flakes);
-        auto flakeRef = parseFlakeRef(fetchSettings, std::string(s.substr(6)), {}, true, false);
-        auto [accessor, lockedRef] = flakeRef.resolve(state.store).lazyFetch(state.store);
-        auto storePath = nix::fetchToStore(*state.store, SourcePath(accessor), FetchMode::Copy, lockedRef.input.getName());
-        state.allowPath(storePath);
         return state.storePath(storePath);
     }
 

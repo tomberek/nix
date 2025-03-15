@@ -1,7 +1,5 @@
 ## `manifest.json`
 
-The manifest file records the provenance of the packages that are installed in a [profile](./profiles.md) managed by [`nix profile`](@docroot@/command-ref/new-cli/nix3-profile.md) (experimental).
-
 Here is an example of what the file might look like after installing `zoom-us` from Nixpkgs:
 
 ```json
@@ -24,10 +22,6 @@ Here is an example of what the file might look like after installing `zoom-us` f
 
 Each object in the array `elements` denotes an installed package and
 has the following fields:
-
-* `originalUrl`: The [flake reference](@docroot@/command-ref/new-cli/nix3-flake.md) specified by
-  the user at the time of installation (e.g. `nixpkgs`). This is also
-  the flake reference that will be used by `nix profile upgrade`.
 
 * `uri`: The locked flake reference to which `originalUrl` resolved.
 

@@ -43,11 +43,6 @@ struct CmdRepl : RawInstallablesCommand
 
     std::vector<std::string> files;
 
-    Strings getDefaultFlakeAttrPaths() override
-    {
-        return {""};
-    }
-
     bool forceImpureByDefault() override
     {
         return true;

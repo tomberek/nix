@@ -1,17 +1,14 @@
 #include "command.hh"
-#include "installable-flake.hh"
 #include "common-args.hh"
 #include "shared.hh"
 #include "store-api.hh"
 #include "derivations.hh"
 #include "archive.hh"
 #include "builtins/buildenv.hh"
-#include "flake/flakeref.hh"
 #include "../nix-env/user-env.hh"
 #include "profiles.hh"
 #include "names.hh"
 #include "url.hh"
-#include "flake/url-name.hh"
 
 #include <nlohmann/json.hpp>
 #include <regex>
@@ -21,42 +18,16 @@
 
 using namespace nix;
 
-struct ProfileElementSource
-{
-    FlakeRef originalRef;
-    // FIXME: record original attrpath.
-    FlakeRef lockedRef;
-    std::string attrPath;
-    ExtendedOutputsSpec outputs;
-
-    // TODO libc++ 16 (used by darwin) missing `std::set::operator <=>`, can't do yet.
-    //auto operator <=> (const ProfileElementSource & other) const
-    auto operator < (const ProfileElementSource & other) const
-    {
-        return
-            std::tuple(originalRef.to_string(), attrPath, outputs) <
-            std::tuple(other.originalRef.to_string(), other.attrPath, other.outputs);
-    }
-
-    std::string to_string() const
-    {
-        return fmt("%s#%s%s", originalRef, attrPath, outputs.to_string());
-    }
-};
-
 const int defaultPriority = 5;
 
 struct ProfileElement
 {
     StorePathSet storePaths;
-    std::optional<ProfileElementSource> source;
     bool active = true;
     int priority = defaultPriority;
 
     std::string identifier() const
     {
-        if (source)
-            return source->to_string();
         StringSet names;
         for (auto & path : storePaths)
             names.insert(DrvName(path.name()).name);
@@ -69,8 +40,6 @@ struct ProfileElement
      */
     std::set<std::string> toInstallables(Store & store)
     {
-        if (source)
-            return {source->to_string()};
         StringSet rawPaths;
         for (auto & path : storePaths)
             rawPaths.insert(store.printStorePath(path));
@@ -108,9 +77,6 @@ struct ProfileElement
 std::string getNameFromElement(const ProfileElement & element)
 {
     std::optional<std::string> result = std::nullopt;
-    if (element.source) {
-        result = getNameFromURL(parseURL(element.source->to_string()));
-    }
     return result.value_or(element.identifier());
 }
 
@@ -156,20 +122,9 @@ struct ProfileManifest
                 if(e.contains("priority")) {
                     element.priority = e["priority"];
                 }
-                if (e.value(sUrl, "") != "") {
-                    element.source = ProfileElementSource {
-                        parseFlakeRef(fetchSettings, e[sOriginalUrl]),
-                        parseFlakeRef(fetchSettings, e[sUrl]),
-                        e["attrPath"],
-                        e["outputs"].get<ExtendedOutputsSpec>()
-                    };
-                }
-
                 std::string name =
                     elems.is_object()
                     ? elem.key()
-                    : element.source
-                    ? getNameFromURL(parseURL(element.source->to_string())).value_or(element.identifier())
                     : element.identifier();
 
                 addElement(name, std::move(element));
@@ -217,12 +172,6 @@ struct ProfileManifest
             obj["storePaths"] = paths;
             obj["active"] = element.active;
             obj["priority"] = element.priority;
-            if (element.source) {
-                obj["originalUrl"] = element.source->originalRef.to_string();
-                obj["url"] = element.source->lockedRef.to_string();
-                obj["attrPath"] = element.source->attrPath;
-                obj["outputs"] = element.source->outputs;
-            }
             es[name] = obj;
         }
         nlohmann::json json;
@@ -378,15 +327,6 @@ struct CmdProfileInstall : InstallablesCommand, MixDefaultProfile
             if (iter == builtPaths.end()) continue;
             auto & [res, info] = iter->second;
 
-            if (auto * info2 = dynamic_cast<ExtraPathInfoFlake *>(&*info)) {
-                element.source = ProfileElementSource {
-                    .originalRef = info2->flake.originalRef,
-                    .lockedRef = info2->flake.lockedRef,
-                    .attrPath = info2->value.attrPath,
-                    .outputs = info2->value.extendedOutputsSpec,
-                };
-            }
-
             // If --priority was specified we want to override the
             // priority of the installable.
             element.priority =
@@ -402,23 +342,6 @@ struct CmdProfileInstall : InstallablesCommand, MixDefaultProfile
             element.updateStorePaths(getEvalStore(), store, res);
 
             auto elementName = getNameFromElement(element);
-
-            // Check if the element already exists.
-            auto existingPair = manifest.elements.find(elementName);
-            if (existingPair != manifest.elements.end()) {
-                auto existingElement = existingPair->second;
-                auto existingSource = existingElement.source;
-                auto elementSource = element.source;
-                if (existingSource
-                    && elementSource
-                    && existingElement.priority == element.priority
-                    && existingSource->originalRef == elementSource->originalRef
-                    && existingSource->attrPath == elementSource->attrPath
-                    ) {
-                    warn("'%s' is already installed", elementName);
-                    continue;
-                }
-            }
 
             manifest.addElement(elementName, std::move(element));
         }
@@ -703,64 +626,6 @@ struct CmdProfileUpgrade : virtual SourceExprCommand, MixDefaultProfile, MixProf
             return;
         }
 
-        for (auto & name : matchingElementNames) {
-            auto & element = manifest.elements[name];
-
-            if (!element.source) {
-                warn(
-                    "Found package '%s', but it was not installed from a flake, so it can't be checked for upgrades!",
-                    element.identifier()
-                );
-                continue;
-            }
-            if (element.source->originalRef.input.isLocked()) {
-                warn(
-                    "Found package '%s', but it was installed from a locked flake reference so it can't be upgraded!",
-                    element.identifier()
-                );
-                continue;
-            }
-
-            upgradedCount++;
-
-            Activity act(*logger, lvlChatty, actUnknown,
-                fmt("checking '%s' for updates", element.source->attrPath));
-
-            auto installable = make_ref<InstallableFlake>(
-                this,
-                getEvalState(),
-                FlakeRef(element.source->originalRef),
-                "",
-                element.source->outputs,
-                Strings{element.source->attrPath},
-                Strings{},
-                lockFlags);
-
-            auto derivedPaths = installable->toDerivedPaths();
-            if (derivedPaths.empty()) continue;
-            auto * infop = dynamic_cast<ExtraPathInfoFlake *>(&*derivedPaths[0].info);
-            // `InstallableFlake` should use `ExtraPathInfoFlake`.
-            assert(infop);
-            auto & info = *infop;
-
-            if (info.flake.lockedRef.input.isLocked()
-                && element.source->lockedRef == info.flake.lockedRef)
-                continue;
-
-            printInfo("upgrading '%s' from flake '%s' to '%s'",
-                element.source->attrPath, element.source->lockedRef, info.flake.lockedRef);
-
-            element.source = ProfileElementSource {
-                .originalRef = installable->flakeRef,
-                .lockedRef = info.flake.lockedRef,
-                .attrPath = info.value.attrPath,
-                .outputs = installable->extendedOutputsSpec,
-            };
-
-            installables.push_back(installable);
-            elems.push_back(&element);
-        }
-
         if (upgradedCount == 0) {
             warn("Found some packages but none of them could be upgraded.");
             return;
@@ -810,11 +675,6 @@ struct CmdProfileList : virtual EvalCommand, virtual StoreCommand, MixDefaultPro
                 logger->cout("Name:               " ANSI_BOLD "%s" ANSI_NORMAL "%s",
                     name,
                     element.active ? "" : " " ANSI_RED "(inactive)" ANSI_NORMAL);
-                if (element.source) {
-                    logger->cout("Flake attribute:    %s%s", element.source->attrPath, element.source->outputs.to_string());
-                    logger->cout("Original flake URL: %s", element.source->originalRef.to_string());
-                    logger->cout("Locked flake URL:   %s", element.source->lockedRef.to_string());
-                }
                 logger->cout("Store paths:        %s", concatStringsSep(" ", store->printStorePathSet(element.storePaths)));
             }
         }

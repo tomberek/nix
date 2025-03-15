@@ -325,9 +325,11 @@ in
   nix-expr-test-support = callPackage ../src/libexpr-test-support/package.nix { };
   nix-expr-tests = callPackage ../src/libexpr-tests/package.nix { };
 
+/*
   nix-flake = callPackage ../src/libflake/package.nix { };
   nix-flake-c = callPackage ../src/libflake-c/package.nix { };
   nix-flake-tests = callPackage ../src/libflake-tests/package.nix { };
+*/
 
   nix-main = callPackage ../src/libmain/package.nix { };
   nix-main-c = callPackage ../src/libmain-c/package.nix { };

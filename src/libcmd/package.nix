@@ -7,7 +7,7 @@
   nix-store,
   nix-fetchers,
   nix-expr,
-  nix-flake,
+#   nix-flake,
   nix-main,
   editline,
   readline,
@@ -59,7 +59,7 @@ mkMesonLibrary (finalAttrs: {
     nix-store
     nix-fetchers
     nix-expr
-    nix-flake
+    # nix-flake
     nix-main
     nlohmann_json
   ];

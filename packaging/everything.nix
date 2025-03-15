@@ -19,9 +19,11 @@
   nix-expr-c,
   nix-expr-tests,
 
+/*
   nix-flake,
   nix-flake-c,
   nix-flake-tests,
+*/
 
   nix-main,
   nix-main-c,
@@ -52,8 +54,10 @@ let
         nix-fetchers
         nix-expr
         nix-expr-c
+/*
         nix-flake
         nix-flake-c
+*/
         nix-main
         nix-main-c
         nix-cmd
@@ -99,8 +103,10 @@ let
         "nix-expr"
         "nix-expr-c"
         "nix-fetchers"
+/*
         "nix-flake"
         "nix-flake-c"
+*/
         "nix-main"
         "nix-main-c"
         "nix-store"
@@ -170,7 +176,7 @@ stdenv.mkDerivation (finalAttrs: {
       nix-store-tests.tests.run
       nix-expr-tests.tests.run
       nix-fetchers-tests.tests.run
-      nix-flake-tests.tests.run
+      # nix-flake-tests.tests.run
 
       # Make sure the functional tests have passed
       nix-functional-tests

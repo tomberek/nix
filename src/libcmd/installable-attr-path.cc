@@ -11,7 +11,6 @@
 #include "get-drvs.hh"
 #include "store-api.hh"
 #include "shared.hh"
-#include "flake/flake.hh"
 #include "eval-cache.hh"
 #include "url.hh"
 #include "registry.hh"
