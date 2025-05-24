@@ -663,6 +663,7 @@ std::vector<std::pair<ref<Installable>, BuiltPathWithResult>> Installable::build
 
     for (auto & i : installables) {
         for (auto b : i->toDerivedPaths()) {
+            warn("%s: building %s", i->what(), b.path.to_string(store->config));
             pathsToBuild.push_back(b.path);
             backmap[b.path].push_back({.info = b.info, .installable = i});
         }

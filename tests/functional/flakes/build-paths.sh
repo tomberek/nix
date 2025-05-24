@@ -75,6 +75,33 @@ cat > "$flake1Dir"/flake.nix <<EOF
         outputSpecified = true;
       };
     };
+
+    a15 = {outPath = builtins.storePath "$dep";};
+    a16 = {type="derivation"; lazyDrvPath = true; out.outPath = builtins.storePath "$dep";};
+    a17 = {
+        type="derivation";
+        lazyDrvPath = true;
+        outputs = ["out" "man"];
+        out.outPath = ./foo;
+        man.outPath = builtins.path {name = "man"; path = ./foo;};
+        meta.outputsToInstall = ["out" "man"];
+    };
+    a18 = {
+        type="derivation";
+        lazyDrvPath = true;
+        outputs = ["out" "man"];
+        out.outPath = ./foo;
+        man.outPath = builtins.storePath "$dep";
+        meta.outputsToInstall = ["out" "man"];
+    };
+    a19 = {
+        type="derivation";
+        lazyDrvPath = true;
+        outputs = ["out" ];
+        out.outPath = builtins.storePath "$dep-should-not-exist";
+        drvPath = self.drvCall.drvPath;
+        meta.outputsToInstall = ["out" ];
+    };
   };
 }
 EOF
@@ -120,3 +147,23 @@ nix build --json --no-link "$flake1Dir"#a14.foo | jq --exit-status '
     (.drvPath | match(".*dot-installable.drv")) and
     (.outputs | keys == ["foo"]))
 '
+
+nix build --impure --json --out-link $TEST_ROOT/result $flake1Dir#a15
+nix build --impure --json --out-link $TEST_ROOT/result $flake1Dir#a16
+
+ls -alh $flake1Dir
+
+nix build --impure --json --out-link $TEST_ROOT/result $flake1Dir#a17
+[[ $(cat $TEST_ROOT/result-1) = bar ]]
+[[ $(cat $TEST_ROOT/result) = bar ]]
+rm "$TEST_ROOT"/result
+rm "$TEST_ROOT"/result-1
+
+nix build --impure --json --out-link $TEST_ROOT/result $flake1Dir#a18
+[[ -e $TEST_ROOT/result ]]
+[[ -e $TEST_ROOT/result-1 ]]
+
+nix build --impure --json --out-link $TEST_ROOT/result $flake1Dir#a19
+[[ $(readlink -e "$TEST_ROOT/result") = *simple ]]
+[[ -e $TEST_ROOT/result ]]
+[[ -e $TEST_ROOT/result-1 ]]

@@ -86,6 +86,11 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
         // FIXME: use eval cache?
         auto v = attr->forceValue();
 
+        // Similar to toString behavior
+        if (v.type() == nAttrs && attr->maybeGetAttr("outPath")){
+            v = attr->getAttr("outPath")->forceValue();
+        }
+
         if (std::optional derivedPathWithInfo = trySinglePathToDerivedPaths(
             v,
             noPos,
@@ -102,9 +107,9 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
         }
     }
 
-    auto drvPath = attr->forceDerivation();
-
     std::optional<NixInt::Inner> priority;
+
+    attr->forceValue();
 
     if (attr->maybeGetAttr(state->sOutputSpecified)) {
     } else if (auto aMeta = attr->maybeGetAttr(state->sMeta)) {
@@ -112,6 +117,57 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
             priority = aPriority->getInt().value;
     }
 
+    if (auto aLazyDrvPath = attr->maybeGetAttr(state->sLazyDrvPath)) {
+        if (aLazyDrvPath->getBool()) {
+            // Derivation has no drvPath, but has outputs
+            // encode this as mutiple opaque paths
+            // TODO: encode more directly
+            DerivedPathsWithInfo result;
+
+            // TODO: String set here loses order
+            StringSet outputsToInstall;
+            if (auto aOutputSpecified = attr->maybeGetAttr(state->sOutputSpecified)) {
+                if (aOutputSpecified->getBool()) {
+                    if (auto aOutputName = attr->maybeGetAttr("outputName"))
+                        outputsToInstall = { aOutputName->getString() };
+                }
+            } else if (auto aMeta = attr->maybeGetAttr(state->sMeta)) {
+                if (auto aOutputsToInstall = aMeta->maybeGetAttr("outputsToInstall"))
+                    for (auto & s : aOutputsToInstall->getListOfStrings())
+                        outputsToInstall.insert(s);
+            }
+
+            if (outputsToInstall.empty())
+                outputsToInstall.insert("out");
+
+            for (auto i : outputsToInstall) {
+                auto v2 = attr->getAttr(i);
+                Value v;
+                try {
+                    logger->warn(fmt("eval time fetching output %s",i));
+                    v = v2->getAttr("outPath")->forceValue();
+                } catch (const Error & e) {
+                    logger->warn(fmt("eval time fetch failed: %s",e.what()));
+                    // Give up trying to satisfy this output and create a DerivedPath::Built
+                    goto mark;
+                }
+                if (std::optional derivedPathWithInfo = trySinglePathToDerivedPaths(
+                    v,
+                    noPos,
+                    fmt("while evaluating the flake output attribute '%s'", attrPath)))
+                {
+                    result.push_back(*derivedPathWithInfo);
+                }
+            }
+            return result;
+        }
+    }
+mark:
+
+    if (!attr->maybeGetAttr("drvPath")) {
+        throw Error("expected flake output attribute '%s' to be a derivation with a 'drvPath' attribute",attrPath);
+    }
+    auto drvPath = attr->forceDerivation();
     return {{
         .path = DerivedPath::Built {
             .drvPath = makeConstantStorePathRef(std::move(drvPath)),
