@@ -195,6 +195,7 @@ EvalState::EvalState(
     , sWith(symbols.create("<with>"))
     , sOutPath(symbols.create("outPath"))
     , sDrvPath(symbols.create("drvPath"))
+    , sLazyDrvPath(symbols.create("lazyDrvPath"))
     , sType(symbols.create("type"))
     , sMeta(symbols.create("meta"))
     , sName(symbols.create("name"))

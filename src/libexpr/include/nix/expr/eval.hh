@@ -210,7 +210,7 @@ public:
     SymbolTable symbols;
     PosTable positions;
 
-    const Symbol sWith, sOutPath, sDrvPath, sType, sMeta, sName, sValue,
+    const Symbol sWith, sOutPath, sDrvPath, sLazyDrvPath, sType, sMeta, sName, sValue,
         sSystem, sOverrides, sOutputs, sOutputName, sIgnoreNulls,
         sFile, sLine, sColumn, sFunctor, sToString,
         sRight, sWrong, sStructuredAttrs,
