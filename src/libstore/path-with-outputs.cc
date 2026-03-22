@@ -73,6 +73,10 @@ StorePathWithOutputs::ParseResult StorePathWithOutputs::tryFromDerivedPath(const
                     },
                     bfd.drvPath->raw());
             },
+            [&](const DerivedPath::Prebuilt & pb) -> StorePathWithOutputs::ParseResult {
+                // Prebuilt has no single path, return monostate
+                return std::monostate{};
+            },
         },
         p.raw());
 }

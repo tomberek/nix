@@ -22,6 +22,7 @@ static StorePath pathPartOfReq(const DerivedPath & req)
         overloaded{
             [&](const DerivedPath::Opaque & bo) { return bo.path; },
             [&](const DerivedPath::Built & bfd) { return pathPartOfReq(*bfd.drvPath); },
+            [&](const DerivedPath::Prebuilt & pb) { return pb.getBaseStorePath(); },
         },
         req.raw());
 }

@@ -127,6 +127,11 @@ GoalPtr Worker::makeGoal(const DerivedPath & req, BuildMode buildMode)
             [&](const DerivedPath::Opaque & bo) -> GoalPtr {
                 return makePathSubstitutionGoal(bo.path, buildMode == bmRepair ? Repair : NoRepair);
             },
+            [&](const DerivedPath::Prebuilt & pb) -> GoalPtr {
+                // Prebuilt paths are like opaque - just substitute the first output
+                // The full output resolution happens elsewhere
+                return makePathSubstitutionGoal(pb.getBaseStorePath(), buildMode == bmRepair ? Repair : NoRepair);
+            },
         },
         req.raw());
 }

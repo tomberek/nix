@@ -36,6 +36,10 @@ struct CmdLog : InstallableCommand
             overloaded{
                 [&](const DerivedPath::Opaque & bo) { return make_ref<const SingleDerivedPath>(bo); },
                 [&](const DerivedPath::Built & bfd) { return bfd.drvPath; },
+                [&](const DerivedPath::Prebuilt & pb) {
+                    // Prebuilt has no derivation, use the base path
+                    return make_ref<const SingleDerivedPath>(DerivedPathOpaque{pb.getBaseStorePath()});
+                },
             },
             b.path.raw());
         auto path = resolveDerivedPath(*store, *oneUp);

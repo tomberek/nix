@@ -1019,6 +1019,7 @@ void removeTempRoots();
  */
 StorePath resolveDerivedPath(Store &, const SingleDerivedPath &, Store * evalStore = nullptr);
 OutputPathMap resolveDerivedPath(Store &, const DerivedPath::Built &, Store * evalStore = nullptr);
+OutputPathMap resolveDerivedPath(Store &, const DerivedPath::Prebuilt &);
 
 std::optional<ValidPathInfo>
 decodeValidPathInfo(const Store & store, std::istream & str, std::optional<HashResult> hashGiven = std::nullopt);

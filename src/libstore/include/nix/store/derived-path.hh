@@ -209,7 +209,48 @@ struct DerivedPathBuilt
     bool operator<(const DerivedPathBuilt &) const noexcept;
 };
 
-using _DerivedPathRaw = std::variant<DerivedPathOpaque, DerivedPathBuilt>;
+/**
+ * A "prebuilt" derived path representing a derivation-like structure
+ * with known outputs but no actual .drv file.
+ *
+ * This is used for "fake derivations" - attribute sets with
+ * type="derivation" but no drvPath attribute. The output paths are
+ * known at evaluation time and don't require building.
+ */
+struct DerivedPathPrebuilt
+{
+    /**
+     * Map of output names to their store paths.
+     * All paths are already known and available.
+     */
+    std::map<std::string, StorePath> outputPaths;
+
+    /**
+     * Which outputs to include from the map.
+     */
+    OutputsSpec outputs;
+
+    /**
+     * Get the store path for the first output.
+     * Used for compatibility with code expecting a single base path.
+     */
+    const StorePath & getBaseStorePath() const;
+
+    /**
+     * Uses `^` as the separator
+     */
+    std::string to_string(const StoreDirConfig & store) const;
+    /**
+     * Uses `!` as the separator
+     */
+    std::string to_string_legacy(const StoreDirConfig & store) const;
+
+    bool operator==(const DerivedPathPrebuilt &) const noexcept;
+    // TODO libc++ 16 (used by darwin) missing `std::set::operator <=>`, can't do yet.
+    bool operator<(const DerivedPathPrebuilt &) const noexcept;
+};
+
+using _DerivedPathRaw = std::variant<DerivedPathOpaque, DerivedPathBuilt, DerivedPathPrebuilt>;
 
 /**
  * A "derived path" is a very simple sort of expression that evaluates
@@ -220,6 +261,8 @@ using _DerivedPathRaw = std::variant<DerivedPathOpaque, DerivedPathBuilt>;
  *
  * - built, in which case it is a pair of a derivation path and some
  *   output names.
+ *
+ * - prebuilt, in which case it has known outputs without a derivation file
  */
 struct DerivedPath : _DerivedPathRaw
 {
@@ -228,6 +271,7 @@ struct DerivedPath : _DerivedPathRaw
 
     using Opaque = DerivedPathOpaque;
     using Built = DerivedPathBuilt;
+    using Prebuilt = DerivedPathPrebuilt;
 
     inline const Raw & raw() const
     {
@@ -298,4 +342,5 @@ JSON_IMPL(nix::SingleDerivedPath::Opaque)
 JSON_IMPL_WITH_XP_FEATURES(nix::SingleDerivedPath::Built)
 JSON_IMPL_WITH_XP_FEATURES(nix::SingleDerivedPath)
 JSON_IMPL_WITH_XP_FEATURES(nix::DerivedPath::Built)
+JSON_IMPL(nix::DerivedPath::Prebuilt)
 JSON_IMPL_WITH_XP_FEATURES(nix::DerivedPath)

@@ -560,6 +560,9 @@ void RemoteStore::copyDrvsFromEvalStore(const std::vector<DerivedPath> & paths, 
                         // Do nothing, path is hopefully there already
                     },
                     [&](const DerivedPath::Built & bp) { drvPaths2.insert(bp.drvPath->getBaseStorePath()); },
+                    [&](const DerivedPath::Prebuilt & pb) {
+                        // Like Opaque, no derivation to copy
+                    },
                 },
                 i.raw());
         }
@@ -655,6 +658,16 @@ std::vector<KeyedBuildResult> RemoteStore::buildPathsWithResults(
                             KeyedBuildResult{
                                 {.inner = std::move(success)},
                                 /* .path = */ bfd,
+                            });
+                    },
+                    [&](const DerivedPath::Prebuilt & pb) {
+                        // Prebuilt paths are already available, treat like Opaque
+                        results.push_back(
+                            KeyedBuildResult{
+                                {.inner{BuildResult::Success{
+                                    .status = BuildResult::Success::Substituted,
+                                }}},
+                                /* .path = */ pb,
                             });
                     }},
                 path.raw());

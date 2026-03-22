@@ -18,6 +18,9 @@ GENERATE_CMP_EXT(, std::strong_ordering, SingleDerivedPathBuilt, *me->drvPath, m
 GENERATE_EQUAL(, DerivedPathBuilt ::, DerivedPathBuilt, *me->drvPath, me->outputs);
 GENERATE_ONE_CMP(, bool, DerivedPathBuilt ::, <, DerivedPathBuilt, *me->drvPath, me->outputs);
 
+GENERATE_EQUAL(, DerivedPathPrebuilt ::, DerivedPathPrebuilt, me->outputPaths, me->outputs);
+GENERATE_ONE_CMP(, bool, DerivedPathPrebuilt ::, <, DerivedPathPrebuilt, me->outputPaths, me->outputs);
+
 std::string DerivedPath::Opaque::to_string(const StoreDirConfig & store) const
 {
     return store.printStorePath(path);
@@ -41,6 +44,21 @@ std::string DerivedPath::Built::to_string(const StoreDirConfig & store) const
 std::string DerivedPath::Built::to_string_legacy(const StoreDirConfig & store) const
 {
     return drvPath->to_string_legacy(store) + "!" + outputs.to_string();
+}
+
+std::string DerivedPath::Prebuilt::to_string(const StoreDirConfig & store) const
+{
+    // Format: <first-output-path>^<outputs>
+    if (outputPaths.empty())
+        throw Error("DerivedPathPrebuilt has no outputs");
+    return store.printStorePath(outputPaths.begin()->second) + '^' + outputs.to_string();
+}
+
+std::string DerivedPath::Prebuilt::to_string_legacy(const StoreDirConfig & store) const
+{
+    if (outputPaths.empty())
+        throw Error("DerivedPathPrebuilt has no outputs");
+    return store.printStorePath(outputPaths.begin()->second) + "!" + outputs.to_string();
 }
 
 std::string SingleDerivedPath::to_string(const StoreDirConfig & store) const
@@ -69,6 +87,7 @@ std::string DerivedPath::to_string_legacy(const StoreDirConfig & store) const
         overloaded{
             [&](const DerivedPath::Built & req) { return req.to_string_legacy(store); },
             [&](const DerivedPath::Opaque & req) { return req.to_string(store); },
+            [&](const DerivedPath::Prebuilt & req) { return req.to_string_legacy(store); },
         },
         this->raw());
 }
@@ -201,6 +220,13 @@ const StorePath & DerivedPath::Built::getBaseStorePath() const
     return drvPath->getBaseStorePath();
 }
 
+const StorePath & DerivedPath::Prebuilt::getBaseStorePath() const
+{
+    if (outputPaths.empty())
+        throw Error("DerivedPathPrebuilt has no outputs");
+    return outputPaths.begin()->second;
+}
+
 template<typename DP>
 static inline const StorePath & getBaseStorePath_(const DP & derivedPath)
 {
@@ -219,7 +245,13 @@ const StorePath & SingleDerivedPath::getBaseStorePath() const
 
 const StorePath & DerivedPath::getBaseStorePath() const
 {
-    return getBaseStorePath_(*this);
+    return std::visit(
+        overloaded{
+            [&](const DerivedPath::Built & bfd) -> auto & { return bfd.drvPath->getBaseStorePath(); },
+            [&](const DerivedPath::Opaque & bo) -> auto & { return bo.path; },
+            [&](const DerivedPath::Prebuilt & pb) -> auto & { return pb.getBaseStorePath(); },
+        },
+        raw());
 }
 
 } // namespace nix
@@ -276,6 +308,23 @@ adl_serializer<DerivedPath::Built>::from_json(const json & json0, const Experime
     };
 }
 
+void adl_serializer<DerivedPath::Prebuilt>::to_json(json & json, const DerivedPath::Prebuilt & pb)
+{
+    json = {
+        {"outputPaths", pb.outputPaths},
+        {"outputs", pb.outputs},
+    };
+}
+
+DerivedPath::Prebuilt adl_serializer<DerivedPath::Prebuilt>::from_json(const json & json0)
+{
+    auto & json = getObject(json0);
+    return {
+        .outputPaths = static_cast<std::map<std::string, StorePath>>(valueAt(json, "outputPaths")),
+        .outputs = adl_serializer<OutputsSpec>::from_json(valueAt(json, "outputs")),
+    };
+}
+
 void adl_serializer<SingleDerivedPath>::to_json(json & json, const SingleDerivedPath & sdp)
 {
     std::visit([&](const auto & buildable) { json = buildable; }, sdp.raw());
@@ -299,6 +348,8 @@ DerivedPath adl_serializer<DerivedPath>::from_json(const json & json, const Expe
 {
     if (json.is_string())
         return static_cast<DerivedPath::Opaque>(json);
+    else if (json.contains("outputPaths"))
+        return adl_serializer<DerivedPath::Prebuilt>::from_json(json);
     else
         return adl_serializer<DerivedPath::Built>::from_json(json, xpSettings);
 }

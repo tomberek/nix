@@ -646,6 +646,14 @@ std::vector<std::pair<ref<Installable>, BuiltPathWithResult>> Installable::build
                         [&](const DerivedPath::Opaque & bo) {
                             res.push_back({aux.installable, {.path = BuiltPath::Opaque{bo.path}, .info = aux.info}});
                         },
+                        [&](const DerivedPath::Prebuilt & pb) {
+                            auto outputs = resolveDerivedPath(*store, pb);
+                            // For prebuilt, we create Opaque paths for each output
+                            for (auto & [outputName, outputPath] : outputs) {
+                                res.push_back(
+                                    {aux.installable, {.path = BuiltPath::Opaque{outputPath}, .info = aux.info}});
+                            }
+                        },
                     },
                     path.raw());
             }
@@ -684,6 +692,14 @@ std::vector<std::pair<ref<Installable>, BuiltPathWithResult>> Installable::build
                             res.push_back(
                                 {aux.installable,
                                  {.path = BuiltPath::Opaque{bo.path}, .info = aux.info, .result = buildResult}});
+                        },
+                        [&](const DerivedPath::Prebuilt & pb) {
+                            auto outputs = resolveDerivedPath(*store, pb);
+                            for (auto & [outputName, outputPath] : outputs) {
+                                res.push_back(
+                                    {aux.installable,
+                                     {.path = BuiltPath::Opaque{outputPath}, .info = aux.info, .result = buildResult}});
+                            }
                         },
                     },
                     buildResult.path.raw());
@@ -767,6 +783,15 @@ StorePathSet Installable::toDerivations(ref<Store> store, const Installables & i
                                          : throw Error("argument '%s' did not evaluate to a derivation", i->what()));
                     },
                     [&](const DerivedPath::Built & bfd) { drvPaths.insert(resolveDerivedPath(*store, *bfd.drvPath)); },
+                    [&](const DerivedPath::Prebuilt & pb) {
+                        // Prebuilt paths have no derivation file
+                        if (!useDeriver)
+                            throw Error("argument '%s' did not evaluate to a derivation", i->what());
+                        // Try to find derivers for the output paths
+                        for (auto & [outputName, outputPath] : pb.outputPaths) {
+                            drvPaths.insert(getDeriver(store, *i, outputPath));
+                        }
+                    },
                 },
                 b.path.raw());
 

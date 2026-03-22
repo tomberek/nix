@@ -84,7 +84,72 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 
     auto attrPath = attr->getAttrPathStr();
 
-    if (!attr->isDerivation()) {
+    // Check if this is a real derivation (has both type="derivation" and drvPath attribute)
+    // or just a fake derivation or plain path
+    if (!attr->isDerivation() || !attr->maybeGetAttr(state->s.drvPath)) {
+
+        // Special handling for fake derivations (has type="derivation" but no drvPath)
+        if (attr->isDerivation()) {
+            // Build output path map for fake derivation
+            std::map<std::string, StorePath> outputPaths;
+
+            // Check if there's an "outputs" attribute listing output names
+            if (auto aOutputs = attr->maybeGetAttr(state->s.outputs)) {
+                auto outputsList = aOutputs->getListOfStrings();
+                for (auto & outputName : outputsList) {
+                    if (auto aOutput = attr->maybeGetAttr(outputName)) {
+                        auto outPathStr = aOutput->getString();
+                        auto storePath = state->store->parseStorePath(outPathStr);
+                        outputPaths[outputName] = std::move(storePath);
+                    }
+                }
+            } else if (auto aOutPath = attr->maybeGetAttr(state->s.outPath)) {
+                // Single output case: just "outPath" attribute
+                auto outPathStr = aOutPath->getString();
+                auto storePath = state->store->parseStorePath(outPathStr);
+                outputPaths["out"] = std::move(storePath);
+            }
+
+            if (!outputPaths.empty()) {
+                // Extract priority metadata if present
+                std::optional<NixInt::Inner> priority;
+                if (auto aMeta = attr->maybeGetAttr(state->s.meta)) {
+                    if (auto aPriority = aMeta->maybeGetAttr("priority"))
+                        priority = aPriority->getInt().value;
+                }
+
+                return {{
+                    .path =
+                        DerivedPath::Prebuilt{
+                            .outputPaths = std::move(outputPaths),
+                            .outputs = std::visit(
+                                overloaded{
+                                    [&](const ExtendedOutputsSpec::Default & d) -> OutputsSpec {
+                                        // Use all available outputs by default
+                                        StringSet outputNames;
+                                        for (auto & [name, path] : outputPaths)
+                                            outputNames.insert(name);
+                                        if (outputNames.empty())
+                                            outputNames.insert("out");
+                                        return OutputsSpec::Names{std::move(outputNames)};
+                                    },
+                                    [&](const ExtendedOutputsSpec::Explicit & e) -> OutputsSpec { return e; },
+                                },
+                                extendedOutputsSpec.raw),
+                        },
+                    .info = make_ref<ExtraPathInfoFlake>(
+                        ExtraPathInfoValue::Value{
+                            .priority = priority,
+                            .attrPath = attrPath,
+                            .extendedOutputsSpec = extendedOutputsSpec,
+                        },
+                        ExtraPathInfoFlake::Flake{
+                            .originalRef = flakeRef,
+                            .lockedRef = lockedFlake.flake.lockedRef,
+                        }),
+                }};
+            }
+        }
 
         // FIXME: use eval cache?
         auto v = attr->forceValue();

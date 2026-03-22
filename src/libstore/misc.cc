@@ -302,6 +302,36 @@ MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets)
                     for (auto & ref : info->second.references)
                         pool.enqueue(std::bind(doPath, DerivedPath::Opaque{ref}));
                 },
+                [&](const DerivedPath::Prebuilt & pb) {
+                    // Check each output path
+                    auto outputs = resolveDerivedPath(*this, pb);
+                    for (auto & [outputName, outputPath] : outputs) {
+                        if (isValidPath(outputPath))
+                            continue;
+
+                        SubstitutablePathInfos infos;
+                        querySubstitutablePathInfos({{outputPath, std::nullopt}}, infos);
+
+                        if (infos.empty()) {
+                            auto state(state_.lock());
+                            state->res.unknown.insert(outputPath);
+                            continue;
+                        }
+
+                        auto info = infos.find(outputPath);
+                        assert(info != infos.end());
+
+                        {
+                            auto state(state_.lock());
+                            state->res.willSubstitute.insert(outputPath);
+                            state->res.downloadSize += info->second.downloadSize;
+                            state->res.narSize += info->second.narSize;
+                        }
+
+                        for (auto & ref : info->second.references)
+                            pool.enqueue(std::bind(doPath, DerivedPath::Opaque{ref}));
+                    }
+                },
             },
             req.raw());
     };
@@ -425,6 +455,38 @@ OutputPathMap resolveDerivedPath(Store & store, const DerivedPath::Built & bfd)
             store.printStorePath(drvPath),
             concatStringsSep(", ", quoteStrings(std::get<OutputsSpec::Names>(bfd.outputs.raw))));
     return outputMap;
+}
+
+OutputPathMap resolveDerivedPath(Store & store, const DerivedPath::Prebuilt & pb)
+{
+    // For prebuilt paths, we already have the output map
+    // Just filter it according to the requested outputs
+    OutputPathMap result;
+    auto outputsLeft = std::visit(
+        overloaded{
+            [&](const OutputsSpec::All &) {
+                // Return all outputs
+                result = pb.outputPaths;
+                return StringSet{};
+            },
+            [&](const OutputsSpec::Names & names) {
+                // Return only requested outputs
+                for (auto & name : names) {
+                    auto it = pb.outputPaths.find(name);
+                    if (it != pb.outputPaths.end())
+                        result.insert(*it);
+                }
+                auto requested = static_cast<StringSet>(names);
+                for (auto & [name, path] : result)
+                    requested.erase(name);
+                return requested;
+            },
+        },
+        pb.outputs.raw);
+
+    if (!outputsLeft.empty())
+        throw Error("prebuilt derivation does not have outputs %s", concatStringsSep(", ", quoteStrings(outputsLeft)));
+    return result;
 }
 
 } // namespace nix
