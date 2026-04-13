@@ -13,6 +13,8 @@
 namespace nix {
 
 struct PackageInfo;
+struct EvalState;
+struct Value;
 
 enum class Realise {
     /**
@@ -182,5 +184,12 @@ struct Installable
     static BuiltPaths toBuiltPaths(
         ref<Store> evalStore, ref<Store> store, Realise mode, OperateOn operateOn, const Installables & installables);
 };
+
+/**
+ * Try to optimize derivation evaluation by using locally available output paths
+ * instead of forcing drvPath evaluation. Returns std::nullopt if optimization
+ * cannot be applied (outputs not available, missing attributes, etc).
+ */
+std::optional<DerivedPathsWithInfo> tryUseLocallyAvailableOutputs(EvalState & state, Value & v);
 
 } // namespace nix

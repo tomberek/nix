@@ -101,6 +101,13 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
         }
     }
 
+    // Try to optimize by using locally available outputs instead of forcing drvPath evaluation
+    // This avoids errors when fake derivations don't have a drvPath attribute
+    auto & v = attr->forceValue();
+    if (auto optimized = tryUseLocallyAvailableOutputs(*state, v)) {
+        return *optimized;
+    }
+
     auto drvPath = attr->forceDerivation();
 
     std::optional<NixInt::Inner> priority;

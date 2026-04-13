@@ -864,4 +864,75 @@ BuiltPaths toBuiltPaths(const std::vector<BuiltPathWithResult> & builtPathsWithR
     return res;
 }
 
+std::optional<DerivedPathsWithInfo> tryUseLocallyAvailableOutputs(EvalState & state, Value & v)
+{
+    debug("tryUseLocallyAvailableOutputs: checking if value is attrset for optimization");
+    if (v.type() != nAttrs) {
+        debug("tryUseLocallyAvailableOutputs: value is not an attrset (type=%d)", v.type());
+        return std::nullopt;
+    }
+
+    debug("tryUseLocallyAvailableOutputs: value is attrset, looking for 'outputs' attribute");
+    auto outputsAttr = v.attrs()->get(state.s.outputs);
+    if (!outputsAttr) {
+        debug("tryUseLocallyAvailableOutputs: no 'outputs' attribute found");
+        return std::nullopt;
+    }
+
+    try {
+        debug("tryUseLocallyAvailableOutputs: found 'outputs' attribute, attempting optimization");
+        state.forceList(*outputsAttr->value, outputsAttr->pos, "");
+        debug("tryUseLocallyAvailableOutputs: outputs is a list with %d elements", outputsAttr->value->listSize());
+
+        std::map<OutputName, StorePath> outputPaths;
+
+        // For each declared output, try to get its path
+        for (auto elem : outputsAttr->value->listView()) {
+            std::string outputName(state.forceStringNoCtx(*elem, outputsAttr->pos, ""));
+            debug("tryUseLocallyAvailableOutputs: processing output '%s'", outputName);
+
+            auto outputAttr = v.attrs()->get(state.symbols.create(outputName));
+            if (!outputAttr) {
+                debug("tryUseLocallyAvailableOutputs: output '%s' attribute not found, optimization not applicable", outputName);
+                return std::nullopt;
+            }
+
+            // coerceToStorePath automatically handles attrsets by looking for outPath
+            NixStringContext context;
+            auto outputPath = state.coerceToStorePath(outputAttr->pos, *outputAttr->value, context, "");
+            debug("tryUseLocallyAvailableOutputs: output '%s' coerced to path: %s", outputName, state.store->printStorePath(outputPath));
+
+            // Only use this path if it's already in the local store
+            // Don't trigger substitution during evaluation
+            if (!state.store->isValidPath(outputPath)) {
+                debug("tryUseLocallyAvailableOutputs: output '%s' path not valid in local store, optimization not applicable", outputName);
+                return std::nullopt;
+            }
+
+            debug("tryUseLocallyAvailableOutputs: output '%s' is valid locally", outputName);
+            outputPaths.emplace(outputName, std::move(outputPath));
+        }
+
+        if (outputPaths.empty()) {
+            debug("tryUseLocallyAvailableOutputs: no valid output paths found");
+            return std::nullopt;
+        }
+
+        debug("tryUseLocallyAvailableOutputs: SUCCESS! Using %d output path(s) from local store, skipping drvPath evaluation", outputPaths.size());
+
+        DerivedPathsWithInfo res;
+        for (auto & [outputName, outputPath] : outputPaths) {
+            debug("tryUseLocallyAvailableOutputs: returning opaque path for output '%s': %s", outputName, state.store->printStorePath(outputPath));
+            res.push_back(DerivedPathWithInfo{
+                .path = DerivedPath::Opaque{outputPath},
+                .info = make_ref<ExtraPathInfo>(),
+            });
+        }
+        return res;
+    } catch (Error & e) {
+        debug("tryUseLocallyAvailableOutputs: optimization failed: %s", e.what());
+        return std::nullopt;
+    }
+}
+
 } // namespace nix

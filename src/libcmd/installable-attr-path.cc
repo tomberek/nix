@@ -54,6 +54,11 @@ DerivedPathsWithInfo InstallableAttrPath::toDerivedPaths()
         return {*derivedPathWithInfo};
     }
 
+    // Try to optimize by using locally available outputs instead of forcing drvPath evaluation
+    if (auto optimized = tryUseLocallyAvailableOutputs(*state, *v)) {
+        return *optimized;
+    }
+
     Bindings & autoArgs = *cmd.getAutoArgs(*state);
 
     PackageInfos packageInfos;
