@@ -93,6 +93,22 @@ struct AttrDb
         state->txn = std::make_unique<SQLiteTxn>(state->db);
     }
 
+    void flush()
+    {
+        if (failed) return;
+        try {
+            auto state(_state->lock());
+            if (state->txn && state->txn->active) {
+                state->txn->commit();
+                state->txn->active = false;
+                state->txn.reset();
+            }
+        } catch (...) {
+            // Flush failure is not fatal
+            ignoreExceptionExceptInterrupt();
+        }
+    }
+
     ~AttrDb()
     {
         try {
@@ -317,6 +333,11 @@ Value * EvalCache::getRootValue()
 ref<AttrCursor> EvalCache::getRoot()
 {
     return make_ref<AttrCursor>(ref(shared_from_this()), std::nullopt);
+}
+
+void EvalCache::flush()
+{
+    if (db) db->flush();
 }
 
 AttrCursor::AttrCursor(

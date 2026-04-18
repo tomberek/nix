@@ -47,6 +47,8 @@ public:
     EvalCache(std::optional<std::reference_wrapper<const Hash>> useCache, EvalState & state, RootLoader rootLoader);
 
     ref<AttrCursor> getRoot();
+
+    void flush();
 };
 
 enum AttrType {
