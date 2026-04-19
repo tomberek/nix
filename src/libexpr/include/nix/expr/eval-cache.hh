@@ -96,12 +96,34 @@ typedef std::variant<
     std::vector<std::string>>
     AttrValue;
 
+// Wrapper to hold weak_ptr but provide -> operator like ref
+struct WeakEvalCacheRef {
+    std::weak_ptr<EvalCache> ptr;
+
+    WeakEvalCacheRef(ref<EvalCache> r) : ptr(r.get_ptr()) {}
+
+    EvalCache * operator->() const {
+        auto locked = ptr.lock();
+        if (!locked)
+            throw Error("eval cache destroyed while cursor still in use");
+        return locked.get();
+    }
+
+    // Explicit conversion to ref<EvalCache> for passing to constructors
+    ref<EvalCache> lock() const {
+        auto locked = ptr.lock();
+        if (!locked)
+            throw Error("eval cache destroyed while cursor still in use");
+        return ref<EvalCache>(locked);
+    }
+};
+
 class AttrCursor : public std::enable_shared_from_this<AttrCursor>
 {
     friend class EvalCache;
     friend struct CachedEvalError;
 
-    ref<EvalCache> root;
+    WeakEvalCacheRef root;
     using Parent = std::optional<std::pair<ref<AttrCursor>, Symbol>>;
     Parent parent;
     RootValue _value;
