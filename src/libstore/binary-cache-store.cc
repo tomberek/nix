@@ -156,39 +156,59 @@ void BinaryCacheStore::writeNarInfo(ref<NarInfo> narInfo)
 
 void BinaryCacheStore::uploadToLinks(NarListing & listing, std::shared_ptr<NarAccessor> narAccessor)
 {
-    /* Recursively traverse the listing and upload files to .links/ */
-    std::function<void(NarListing &, const CanonPath &)> visit =
-        [&](NarListing & node, const CanonPath & path) {
+    struct FileToUpload {
+        CanonPath path;
+        NarListing::Regular * reg;
+        std::string content;
+    };
 
-        if (auto * reg = std::get_if<NarListing::Regular>(&node.raw)) {
+    std::vector<FileToUpload> files;
+
+    /* First pass: collect all files and read content once */
+    std::function<void(NarListing &, const CanonPath &)> collect =
+        [&](NarListing & node, const CanonPath & path) {
+            if (auto * reg = std::get_if<NarListing::Regular>(&node.raw)) {
+                StringSink contentSink;
+                narAccessor->readFile(path, contentSink);
+                files.push_back({path, reg, std::move(contentSink.s)});
+            }
+            else if (auto * dir = std::get_if<NarListing::Directory>(&node.raw)) {
+                for (auto & [name, child] : dir->entries) {
+                    collect(child, path / name);
+                }
+            }
+        };
+
+    collect(listing, CanonPath::root);
+
+    /* Second pass: process files in parallel */
+    ThreadPool threadPool(25);
+
+    for (auto & file : files) {
+        threadPool.enqueue([&, file = &file]() {
+            checkInterrupt();
+
             /* Compute link hash using same method as LocalStore::optimisePath_
                This hashes the file serialized as NAR (which includes executable bit) */
             HashSink hashSink(HashAlgorithm::SHA256);
 
             /* Serialize file as a NAR entry (same as hashPath with NixArchive) */
-            {
-                StringSink narSink;
-                narSink << "nix-archive-1";
-                narSink << "(";
-                narSink << "type";
-                narSink << "regular";
-                if (reg->executable) {
-                    narSink << "executable";
-                    narSink << "";
-                }
-                narSink << "contents";
-
-                /* Get file content */
-                StringSink contentSink;
-                narAccessor->readFile(path, contentSink);
-                narSink << contentSink.s;
-
-                narSink << ")";
-                hashSink(narSink.s);
+            StringSink narSink;
+            narSink << "nix-archive-1";
+            narSink << "(";
+            narSink << "type";
+            narSink << "regular";
+            if (file->reg->executable) {
+                narSink << "executable";
+                narSink << "";
             }
+            narSink << "contents";
+            narSink << file->content;
+            narSink << ")";
+            hashSink(narSink.s);
 
             Hash linkHash = hashSink.finish().hash;
-            reg->contents.linkHash = linkHash;
+            file->reg->contents.linkHash = linkHash;
 
             /* Upload to .links/<hash> with compression if not exists */
             auto linkBase = ".links/" + linkHash.to_string(HashFormat::Nix32, false);
@@ -202,38 +222,27 @@ void BinaryCacheStore::uploadToLinks(NarListing & listing, std::shared_ptr<NarAc
                                                                    : "");
 
             if (!fileExists(linkFile)) {
-                /* Read file content from NAR accessor */
-                StringSink contentSink;
-                narAccessor->readFile(path, contentSink);
-
-                /* Compress the content */
+                /* Compress the content (already read once) */
                 StringSink compressedSink;
                 bool parallel = config.parallelCompression.overridden ? config.parallelCompression.get()
                                                                       : config.compression.get() == CompressionAlgo::zstd;
                 auto compressionSink = makeCompressionSink(config.compression, compressedSink, parallel, config.compressionLevel);
-                (*compressionSink)(contentSink.s);
+                (*compressionSink)(file->content);
                 compressionSink->finish();
 
                 StringSource compressedSource(compressedSink.s);
                 upsertFile(linkFile, compressedSource, "application/octet-stream", compressedSink.s.size());
 
-                auto originalSize = reg->contents.fileSize.value_or(0);
+                auto originalSize = file->reg->contents.fileSize.value_or(0);
                 auto compressedSize = compressedSink.s.size();
                 auto ratio = originalSize > 0 ? (1.0 - (double)compressedSize / originalSize) * 100.0 : 0.0;
                 printMsg(lvlDebug, "uploaded to %s (%d bytes, %.1f%% compression)",
                          linkFile, compressedSize, ratio);
             }
-        }
-        else if (auto * dir = std::get_if<NarListing::Directory>(&node.raw)) {
-            /* Recursively process directory entries */
-            for (auto & [name, child] : dir->entries) {
-                visit(child, path / name);
-            }
-        }
-        /* Symlinks don't need link hashes */
-    };
+        });
+    }
 
-    visit(listing, CanonPath::root);
+    threadPool.process();
 }
 
 bool BinaryCacheStore::allFilesHaveLinkHash(const NarListing & listing)
@@ -271,11 +280,22 @@ void BinaryCacheStore::substituteWithLinks(
     /* Ensure parent directory exists */
     createDirs(destPath.parent_path());
 
-    uint64_t bytesDownloaded = 0;
-    uint64_t bytesReused = 0;
+    struct FileToDownload {
+        Hash linkHash;
+        std::filesystem::path dest;
+        bool executable;
+        uint64_t size;
+        std::string linkFile;
+        CompressionAlgo compression;
+    };
 
-    /* Recursively create the store path from Links */
-    std::function<void(const NarListing &, const std::filesystem::path &)> visit =
+    std::vector<FileToDownload> toDownload;
+    std::vector<std::pair<Hash, std::filesystem::path>> toReuse;
+    std::atomic<uint64_t> bytesDownloaded{0};
+    std::atomic<uint64_t> bytesReused{0};
+
+    /* First pass: create directory structure and collect files to download/reuse */
+    std::function<void(const NarListing &, const std::filesystem::path &)> collect =
         [&](const NarListing & node, const std::filesystem::path & dest) {
 
         if (auto * reg = std::get_if<NarListing::Regular>(&node.raw)) {
@@ -287,13 +307,10 @@ void BinaryCacheStore::substituteWithLinks(
 
             /* Check if we already have this file in local .links/ */
             if (dst.hasLinkedFile(linkHash)) {
-                /* Fast path: reuse existing file */
-                dst.hardLinkFromLinks(linkHash, dest, false /* resetPermissions */);
+                toReuse.push_back({linkHash, dest});
                 bytesReused += reg->contents.fileSize.value_or(0);
-
-                printMsg(lvlDebug, "reused %s from local .links/", dest.filename().string());
             } else {
-                /* Download from binary cache's .links/ - try with compression extensions */
+                /* Find compressed link file in cache */
                 auto linkBase = ".links/" + linkHash.to_string(HashFormat::Nix32, false);
                 std::string linkFile;
                 CompressionAlgo compression = CompressionAlgo::none;
@@ -320,48 +337,7 @@ void BinaryCacheStore::substituteWithLinks(
                     throw Error("link file not found for hash %s", linkHash.to_string(HashFormat::Nix32, false));
                 }
 
-                /* Download and decompress if needed */
-                StringSink decompressedSink;
-                if (compression != CompressionAlgo::none) {
-                    StringSink compressedSink;
-                    getFile(linkFile, compressedSink);
-
-                    /* Convert CompressionAlgo to string for makeDecompressionSink */
-                    std::string compressionStr =
-                        (compression == CompressionAlgo::xz       ? "xz"
-                         : compression == CompressionAlgo::bzip2  ? "bzip2"
-                         : compression == CompressionAlgo::zstd   ? "zstd"
-                         : compression == CompressionAlgo::lzip   ? "lzip"
-                         : compression == CompressionAlgo::lz4    ? "lz4"
-                         : compression == CompressionAlgo::brotli ? "br"
-                                                                  : "none");
-
-                    auto decompressor = makeDecompressionSink(compressionStr, decompressedSink);
-                    (*decompressor)(compressedSink.s);
-                    decompressor->finish();
-                } else {
-                    getFile(linkFile, decompressedSink);
-                }
-
-                StringSource contentSource(decompressedSink.s);
-
-                /* Add to local .links/ with correct permissions (verifies hash) */
-                dst.addToLinks(linkHash, contentSource, reg->executable);
-
-                /* Hard-link to destination (don't reset permissions yet) */
-                dst.hardLinkFromLinks(linkHash, dest, false /* resetPermissions */);
-
-                bytesDownloaded += reg->contents.fileSize.value_or(0);
-
-                printMsg(lvlInfo, "downloaded %s (%s)",
-                    dest.filename().string(),
-                    renderSize(reg->contents.fileSize.value_or(0)));
-            }
-
-            /* Set executable bit if needed */
-            if (reg->executable) {
-                auto st = lstat(dest);
-                chmod(dest, st.st_mode | S_IXUSR | S_IXGRP | S_IXOTH);
+                toDownload.push_back({linkHash, dest, reg->executable, reg->contents.fileSize.value_or(0), linkFile, compression});
             }
         }
         else if (auto * dir = std::get_if<NarListing::Directory>(&node.raw)) {
@@ -370,7 +346,7 @@ void BinaryCacheStore::substituteWithLinks(
 
             /* Recursively process directory entries */
             for (auto & [name, child] : dir->entries) {
-                visit(child, dest / name);
+                collect(child, dest / name);
             }
         }
         else if (auto * sym = std::get_if<NarListing::Symlink>(&node.raw)) {
@@ -379,7 +355,69 @@ void BinaryCacheStore::substituteWithLinks(
         }
     };
 
-    visit(listing, destPath);
+    collect(listing, destPath);
+
+    /* Second pass: download files in parallel */
+    if (!toDownload.empty()) {
+        ThreadPool threadPool(25);
+
+        for (auto & file : toDownload) {
+            threadPool.enqueue([&, file = &file]() {
+                checkInterrupt();
+
+                /* Download and decompress if needed */
+                StringSink decompressedSink;
+                if (file->compression != CompressionAlgo::none) {
+                    StringSink compressedSink;
+                    getFile(file->linkFile, compressedSink);
+
+                    /* Convert CompressionAlgo to string for makeDecompressionSink */
+                    std::string compressionStr =
+                        (file->compression == CompressionAlgo::xz       ? "xz"
+                         : file->compression == CompressionAlgo::bzip2  ? "bzip2"
+                         : file->compression == CompressionAlgo::zstd   ? "zstd"
+                         : file->compression == CompressionAlgo::lzip   ? "lzip"
+                         : file->compression == CompressionAlgo::lz4    ? "lz4"
+                         : file->compression == CompressionAlgo::brotli ? "br"
+                                                                        : "none");
+
+                    auto decompressor = makeDecompressionSink(compressionStr, decompressedSink);
+                    (*decompressor)(compressedSink.s);
+                    decompressor->finish();
+                } else {
+                    getFile(file->linkFile, decompressedSink);
+                }
+
+                StringSource contentSource(decompressedSink.s);
+
+                /* Add to local .links/ with correct permissions (verifies hash) */
+                dst.addToLinks(file->linkHash, contentSource, file->executable);
+
+                bytesDownloaded += file->size;
+
+                printMsg(lvlDebug, "downloaded %s (%s)",
+                    file->dest.filename().string(),
+                    renderSize(file->size));
+            });
+        }
+
+        threadPool.process();
+    }
+
+    /* Third pass: hard-link everything (both downloaded and reused) */
+    for (auto & [linkHash, dest] : toReuse) {
+        dst.hardLinkFromLinks(linkHash, dest, false /* resetPermissions */);
+    }
+
+    for (auto & file : toDownload) {
+        dst.hardLinkFromLinks(file.linkHash, file.dest, false /* resetPermissions */);
+
+        /* Set executable bit if needed */
+        if (file.executable) {
+            auto st = lstat(file.dest);
+            chmod(file.dest, st.st_mode | S_IXUSR | S_IXGRP | S_IXOTH);
+        }
+    }
 
     /* Canonicalize permissions and timestamps */
     CanonicalizePathMetadataOptions options{NIX_WHEN_SUPPORT_ACLS(dst.config->getLocalSettings().ignoredAcls)};
@@ -391,8 +429,8 @@ void BinaryCacheStore::substituteWithLinks(
     printMsg(
         lvlInfo,
         "links-based substitution complete: %s downloaded, %s reused (%d%% savings)",
-        renderSize(bytesDownloaded),
-        renderSize(bytesReused),
+        renderSize(bytesDownloaded.load()),
+        renderSize(bytesReused.load()),
         bytesReused > 0 ? (int)(100.0 * bytesReused / (bytesDownloaded + bytesReused)) : 0);
 }
 
