@@ -380,6 +380,41 @@ public:
      */
     void optimisePath(const std::filesystem::path & path, RepairFlag repair);
 
+    /**
+     * Links-based API for file-level deduplication.
+     * These methods expose the .links/ directory functionality used by
+     * optimiseStore for use by Links-based binary caches.
+     */
+
+    /**
+     * Get the NAR-based content hash for a file.
+     * Uses the same hash calculation as optimisePath_ (NAR serialization + SHA256).
+     * Returns the hash that would be used as the filename in .links/<hash>.
+     */
+    Hash getFileLinkHash(const std::filesystem::path & path);
+
+    /**
+     * Check if a file with this link hash exists in .links/ directory.
+     */
+    bool hasLinkedFile(const Hash & linkHash);
+
+    /**
+     * Add a file to the .links/ directory.
+     * Verifies that the hash matches the content.
+     * Returns the path to .links/<hash>.
+     * If the file already exists, returns its path without error.
+     * If executable is true, file is created with +x permissions.
+     */
+    std::filesystem::path addToLinks(const Hash & linkHash, Source & source, bool executable = false);
+
+    /**
+     * Create a hard link from .links/<hash> to the destination path.
+     * Creates parent directories as needed.
+     * If resetPermissions is true, resets directory permissions after linking.
+     * Set to false during bulk extraction, then canonicalize once at the end.
+     */
+    void hardLinkFromLinks(const Hash & linkHash, const std::filesystem::path & dest, bool resetPermissions = true);
+
     bool verifyStore(bool checkContents, RepairFlag repair) override;
 
 protected:

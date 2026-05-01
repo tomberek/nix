@@ -36,12 +36,14 @@ NarListing::Regular adl_serializer<NarListing::Regular>::from_json(const json & 
     auto * execPtr = optionalValueAt(obj, "executable");
     auto * sizePtr = optionalValueAt(obj, "size");
     auto * offsetPtr = optionalValueAt(obj, "narOffset");
+    auto * linkHashPtr = optionalValueAt(obj, "linkHash");
     return NarListing::Regular{
         .executable = execPtr ? getBoolean(*execPtr) : false,
         .contents{
             .fileSize = ptrToOwned<uint64_t>(sizePtr),
             .narOffset = ptrToOwned<uint64_t>(offsetPtr).and_then(
                 [](auto v) { return v != 0 ? std::optional{v} : std::nullopt; }),
+            .linkHash = linkHashPtr ? std::optional<Hash>(Hash::parseAny(getString(*linkHashPtr), HashAlgorithm::SHA256)) : std::nullopt,
         },
     };
 }
@@ -55,6 +57,8 @@ void adl_serializer<NarListing::Regular>::to_json(json & j, const NarListing::Re
         j["executable"] = true;
     if (r.contents.narOffset)
         j["narOffset"] = *r.contents.narOffset;
+    if (r.contents.linkHash)
+        j["linkHash"] = r.contents.linkHash->to_string(HashFormat::Nix32, false);
 }
 
 template<typename Child>

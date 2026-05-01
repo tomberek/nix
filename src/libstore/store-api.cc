@@ -8,6 +8,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/outputs-query.hh"
+#include "nix/store/binary-cache-store.hh"
 #include "nix/util/util.hh"
 #include "nix/store/nar-info-disk-cache.hh"
 #include "nix/util/thread-pool.hh"
@@ -889,10 +890,16 @@ makeCopyPathMessage(const StoreConfig & srcCfg, const StoreConfig & dstCfg, std:
 void copyStorePath(
     Store & srcStore, Store & dstStore, const StorePath & storePath, RepairFlag repair, CheckSigsFlag checkSigs)
 {
+    std::cerr << ">>> LINKS-DEBUG: copyStorePath ENTRY for " << srcStore.printStorePath(storePath) << std::endl;
+    std::cerr << ">>> LINKS-DEBUG: srcStore type: " << typeid(srcStore).name() << std::endl;
+    std::cerr << ">>> LINKS-DEBUG: dstStore type: " << typeid(dstStore).name() << std::endl;
+
     /* Bail out early (before starting a download from srcStore) if
        dstStore already has this path. */
-    if (!repair && dstStore.isValidPath(storePath))
+    if (!repair && dstStore.isValidPath(storePath)) {
+        std::cerr << ">>> LINKS-DEBUG: path already exists, returning early" << std::endl;
         return;
+    }
 
     const auto & srcCfg = srcStore.config;
     const auto & dstCfg = dstStore.config;
@@ -923,6 +930,23 @@ void copyStorePath(
         auto info2 = make_ref<ValidPathInfo>(*info);
         info2->ultimate = false;
         info = info2;
+    }
+
+    std::cerr << ">>> LINKS-DEBUG: About to check for BinaryCacheStore" << std::endl;
+
+    /* Try Links-based copy if source is a BinaryCacheStore */
+    if (auto * bcStore = dynamic_cast<BinaryCacheStore *>(&srcStore)) {
+        std::cerr << ">>> LINKS-DEBUG: Source IS BinaryCacheStore!" << std::endl;
+        try {
+            if (bcStore->tryCopyPathWithLinks(dstStore, storePath)) {
+                printMsg(lvlInfo, "copied '%s' using links-based substitution", storePathS);
+                return;
+            }
+        } catch (Error & e) {
+            std::cerr << ">>> LINKS-DEBUG: Exception: " << e.what() << std::endl;
+        }
+    } else {
+        std::cerr << ">>> LINKS-DEBUG: Source is NOT BinaryCacheStore" << std::endl;
     }
 
     if (getEnv("_NIX_TEST_CONCURRENT_SUBSTITUTION"))
@@ -1044,6 +1068,19 @@ std::map<StorePath, StorePath> copyPaths(
 
         auto storePathForDst = computeStorePathForDst(*info);
         pathsMap.insert_or_assign(missingPath, storePathForDst);
+
+        /* Try Links-based copy if source is a BinaryCacheStore and dest is LocalStore */
+        if (auto * bcStore = dynamic_cast<BinaryCacheStore *>(&srcStore)) {
+            try {
+                if (bcStore->tryCopyPathWithLinks(dstStore, missingPath)) {
+                    printMsg(lvlInfo, "copied '%s' using links-based substitution", srcStore.printStorePath(missingPath));
+                    continue; // Skip the NAR-based copy
+                }
+            } catch (Error & e) {
+                debug("links-based copy failed for %s: %s", srcStore.printStorePath(missingPath), e.what());
+                // Fall through to NAR-based copy
+            }
+        }
 
         ValidPathInfo infoForDst = *info;
         infoForDst.path = storePathForDst;

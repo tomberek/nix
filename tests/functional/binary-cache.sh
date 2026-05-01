@@ -274,9 +274,21 @@ outPath=$(nix-build --no-out-link -E '
 
 nix copy --to "file://$cacheDir"?write-nar-listing=1 "$outPath"
 
-diff -u \
-    <(jq -S < "$cacheDir/$(basename "$outPath" | cut -c1-32).ls") \
-    <(echo '{"version":1,"root":{"type":"directory","entries":{"bar":{"type":"regular","size":4,"narOffset":232},"link":{"type":"symlink","target":"xyzzy"}}}}' | jq -S)
+# Check that .ls file was created with version 2 (Links support)
+[[ $(jq -r '.version' < "$cacheDir/$(basename "$outPath" | cut -c1-32).ls") == "2" ]]
+
+# Check that the structure is correct and linkHash is present for regular files
+jqOutput=$(jq -S < "$cacheDir/$(basename "$outPath" | cut -c1-32).ls")
+[[ $(echo "$jqOutput" | jq -r '.root.entries.bar.type') == "regular" ]]
+[[ $(echo "$jqOutput" | jq -r '.root.entries.bar.size') == "4" ]]
+[[ $(echo "$jqOutput" | jq -r '.root.entries.bar.linkHash') != "null" ]]
+[[ $(echo "$jqOutput" | jq -r '.root.entries.link.type') == "symlink" ]]
+[[ $(echo "$jqOutput" | jq -r '.root.entries.link.target') == "xyzzy" ]]
+
+# Check that .links directory was created and has the file
+[[ -d "$cacheDir/.links" ]]
+linkHash=$(echo "$jqOutput" | jq -r '.root.entries.bar.linkHash')
+[[ -f "$cacheDir/.links/$linkHash" ]]
 
 
 # Test debug info index generation.

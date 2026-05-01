@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/util/hash.hh"
 
 namespace nix {
 
@@ -18,6 +19,14 @@ struct NarListingRegularFile
      * We only set to non-`std::nullopt` if it is also non-zero.
      */
     std::optional<uint64_t> narOffset;
+
+    /**
+     * Content hash for Links-based binary caches.
+     * This is the NAR-based SHA256 hash used to identify the file
+     * in .links/<hash> directories, matching the hash used by
+     * `nix-store --optimise`.
+     */
+    std::optional<Hash> linkHash;
 
     auto operator<=>(const NarListingRegularFile &) const = default;
 };

@@ -124,6 +124,7 @@ void LocalBinaryCacheStore::init()
 {
     createDirs(config->binaryCacheDir / "nar");
     createDirs(config->binaryCacheDir / realisationsPrefix);
+    createDirs(config->binaryCacheDir / ".links");  // For Links-based storage
     if (config->writeDebugInfo)
         createDirs(config->binaryCacheDir / "debuginfo");
     createDirs(config->binaryCacheDir / "log");

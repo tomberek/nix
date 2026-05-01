@@ -4,6 +4,7 @@
 #include "nix/util/compression-settings.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/log-store.hh"
+#include "nix/util/nar-listing.hh"
 
 #include "nix/util/pool.hh"
 
@@ -13,6 +14,7 @@ namespace nix {
 
 struct NarInfo;
 class RemoteFSAccessor;
+struct NarAccessor;
 
 struct BinaryCacheStoreConfig : virtual StoreConfig
 {
@@ -183,6 +185,27 @@ private:
 
     void writeNarInfo(ref<NarInfo> narInfo);
 
+    /**
+     * Upload files to .links/ and add link hashes to the listing.
+     * Used for Links-based binary caches.
+     */
+    void uploadToLinks(NarListing & listing, std::shared_ptr<NarAccessor> narAccessor);
+
+    /**
+     * Check if all files in a listing have link hashes.
+     * Used to determine if Links-based substitution is possible.
+     */
+    bool allFilesHaveLinkHash(const NarListing & listing);
+
+    /**
+     * Perform Links-based substitution to a LocalStore.
+     * Downloads files from .links/ and hard-links them.
+     */
+    void substituteWithLinks(
+        class LocalStore & dst,
+        const ValidPathInfo & info,
+        const NarListing & listing);
+
     ref<const ValidPathInfo> addToStoreCommon(
         Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo);
 
@@ -192,6 +215,12 @@ private:
     ref<RemoteFSAccessor> getRemoteFSAccessor(bool requireValidPath = true);
 
 public:
+
+    /**
+     * Try to copy a path using Links-based substitution.
+     * Returns true if successful, false if Links not available (caller should use NAR).
+     */
+    bool tryCopyPathWithLinks(Store & dstStore, const StorePath & storePath);
 
     bool isValidPathUncached(const StorePath & path) override;
 

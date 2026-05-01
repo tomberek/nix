@@ -1,5 +1,8 @@
 #include "nix/util/archive.hh"
 #include "nix/store/binary-cache-store.hh"
+#include "nix/store/local-store.hh"
+#include "nix/store/local-settings.hh"
+#include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/compression.hh"
 #include "nix/store/derivations.hh"
 #include "nix/util/source-accessor.hh"
@@ -49,7 +52,18 @@ void BinaryCacheStore::init()
 {
     auto cacheInfo = getNixCacheInfo();
     if (!cacheInfo) {
-        upsertFile(cacheInfoFile, "StoreDir: " + storeDir + "\n", "text/x-nix-cache-info");
+        std::string info = "StoreDir: " + storeDir + "\n";
+
+        /* Try to check if .links/ directory exists to advertise Links support */
+        try {
+            if (fileExists(".links")) {
+                info += "Links: 1\n";
+            }
+        } catch (...) {
+            /* If we can't check, don't advertise Links support */
+        }
+
+        upsertFile(cacheInfoFile, std::move(info), "text/x-nix-cache-info");
     } else {
         for (auto & line : tokenizeString<Strings>(*cacheInfo, "\n")) {
             size_t colon = line.find(':');
@@ -68,6 +82,8 @@ void BinaryCacheStore::init()
                 config.wantMassQuery.setDefault(value == "1");
             } else if (name == "Priority") {
                 config.priority.setDefault(std::stoi(value));
+            } else if (name == "Links") {
+                /* Parse Links capability (future use) */
             }
         }
     }
@@ -138,6 +154,306 @@ void BinaryCacheStore::writeNarInfo(ref<NarInfo> narInfo)
             std::shared_ptr<NarInfo>(narInfo));
 }
 
+void BinaryCacheStore::uploadToLinks(NarListing & listing, std::shared_ptr<NarAccessor> narAccessor)
+{
+    /* Recursively traverse the listing and upload files to .links/ */
+    std::function<void(NarListing &, const CanonPath &)> visit =
+        [&](NarListing & node, const CanonPath & path) {
+
+        if (auto * reg = std::get_if<NarListing::Regular>(&node.raw)) {
+            /* Compute link hash using same method as LocalStore::optimisePath_
+               This hashes the file serialized as NAR (which includes executable bit) */
+            HashSink hashSink(HashAlgorithm::SHA256);
+
+            /* Serialize file as a NAR entry (same as hashPath with NixArchive) */
+            {
+                StringSink narSink;
+                narSink << "nix-archive-1";
+                narSink << "(";
+                narSink << "type";
+                narSink << "regular";
+                if (reg->executable) {
+                    narSink << "executable";
+                    narSink << "";
+                }
+                narSink << "contents";
+
+                /* Get file content */
+                StringSink contentSink;
+                narAccessor->readFile(path, contentSink);
+                narSink << contentSink.s;
+
+                narSink << ")";
+                hashSink(narSink.s);
+            }
+
+            Hash linkHash = hashSink.finish().hash;
+            reg->contents.linkHash = linkHash;
+
+            /* Upload to .links/<hash> with compression if not exists */
+            auto linkBase = ".links/" + linkHash.to_string(HashFormat::Nix32, false);
+            auto linkFile = linkBase
+                + (config.compression == CompressionAlgo::xz       ? ".xz"
+                   : config.compression == CompressionAlgo::bzip2  ? ".bz2"
+                   : config.compression == CompressionAlgo::zstd   ? ".zst"
+                   : config.compression == CompressionAlgo::lzip   ? ".lzip"
+                   : config.compression == CompressionAlgo::lz4    ? ".lz4"
+                   : config.compression == CompressionAlgo::brotli ? ".br"
+                                                                   : "");
+
+            if (!fileExists(linkFile)) {
+                /* Read file content from NAR accessor */
+                StringSink contentSink;
+                narAccessor->readFile(path, contentSink);
+
+                /* Compress the content */
+                StringSink compressedSink;
+                bool parallel = config.parallelCompression.overridden ? config.parallelCompression.get()
+                                                                      : config.compression.get() == CompressionAlgo::zstd;
+                auto compressionSink = makeCompressionSink(config.compression, compressedSink, parallel, config.compressionLevel);
+                (*compressionSink)(contentSink.s);
+                compressionSink->finish();
+
+                StringSource compressedSource(compressedSink.s);
+                upsertFile(linkFile, compressedSource, "application/octet-stream", compressedSink.s.size());
+
+                auto originalSize = reg->contents.fileSize.value_or(0);
+                auto compressedSize = compressedSink.s.size();
+                auto ratio = originalSize > 0 ? (1.0 - (double)compressedSize / originalSize) * 100.0 : 0.0;
+                printMsg(lvlDebug, "uploaded to %s (%d bytes, %.1f%% compression)",
+                         linkFile, compressedSize, ratio);
+            }
+        }
+        else if (auto * dir = std::get_if<NarListing::Directory>(&node.raw)) {
+            /* Recursively process directory entries */
+            for (auto & [name, child] : dir->entries) {
+                visit(child, path / name);
+            }
+        }
+        /* Symlinks don't need link hashes */
+    };
+
+    visit(listing, CanonPath::root);
+}
+
+bool BinaryCacheStore::allFilesHaveLinkHash(const NarListing & listing)
+{
+    /* Recursively check if all regular files have linkHash */
+    std::function<bool(const NarListing &)> check = [&](const NarListing & node) {
+        if (auto * reg = std::get_if<NarListing::Regular>(&node.raw)) {
+            return reg->contents.linkHash.has_value();
+        }
+        if (auto * dir = std::get_if<NarListing::Directory>(&node.raw)) {
+            for (auto & [_, child] : dir->entries) {
+                if (!check(child))
+                    return false;
+            }
+        }
+        /* Symlinks don't need linkHash */
+        return true;
+    };
+
+    return check(listing);
+}
+
+void BinaryCacheStore::substituteWithLinks(
+    LocalStore & dst,
+    const ValidPathInfo & info,
+    const NarListing & listing)
+{
+    Activity act(
+        *logger,
+        actSubstitute,
+        Logger::Fields{dst.printStorePath(info.path), config.getHumanReadableURI()});
+
+    auto destPath = dst.config->realStoreDir.get() / info.path.to_string();
+
+    /* Ensure parent directory exists */
+    createDirs(destPath.parent_path());
+
+    uint64_t bytesDownloaded = 0;
+    uint64_t bytesReused = 0;
+
+    /* Recursively create the store path from Links */
+    std::function<void(const NarListing &, const std::filesystem::path &)> visit =
+        [&](const NarListing & node, const std::filesystem::path & dest) {
+
+        if (auto * reg = std::get_if<NarListing::Regular>(&node.raw)) {
+            if (!reg->contents.linkHash) {
+                throw Error("regular file missing linkHash in listing");
+            }
+
+            auto & linkHash = *reg->contents.linkHash;
+
+            /* Check if we already have this file in local .links/ */
+            if (dst.hasLinkedFile(linkHash)) {
+                /* Fast path: reuse existing file */
+                dst.hardLinkFromLinks(linkHash, dest, false /* resetPermissions */);
+                bytesReused += reg->contents.fileSize.value_or(0);
+
+                printMsg(lvlDebug, "reused %s from local .links/", dest.filename().string());
+            } else {
+                /* Download from binary cache's .links/ - try with compression extensions */
+                auto linkBase = ".links/" + linkHash.to_string(HashFormat::Nix32, false);
+                std::string linkFile;
+                CompressionAlgo compression = CompressionAlgo::none;
+
+                /* Try each compression format in order of preference */
+                for (auto algo : {CompressionAlgo::zstd, CompressionAlgo::xz, CompressionAlgo::bzip2,
+                                  CompressionAlgo::lz4, CompressionAlgo::brotli, CompressionAlgo::lzip, CompressionAlgo::none}) {
+                    auto ext = (algo == CompressionAlgo::xz       ? ".xz"
+                                : algo == CompressionAlgo::bzip2  ? ".bz2"
+                                : algo == CompressionAlgo::zstd   ? ".zst"
+                                : algo == CompressionAlgo::lzip   ? ".lzip"
+                                : algo == CompressionAlgo::lz4    ? ".lz4"
+                                : algo == CompressionAlgo::brotli ? ".br"
+                                                                  : "");
+                    auto candidate = linkBase + ext;
+                    if (fileExists(candidate)) {
+                        linkFile = candidate;
+                        compression = algo;
+                        break;
+                    }
+                }
+
+                if (linkFile.empty()) {
+                    throw Error("link file not found for hash %s", linkHash.to_string(HashFormat::Nix32, false));
+                }
+
+                /* Download and decompress if needed */
+                StringSink decompressedSink;
+                if (compression != CompressionAlgo::none) {
+                    StringSink compressedSink;
+                    getFile(linkFile, compressedSink);
+
+                    /* Convert CompressionAlgo to string for makeDecompressionSink */
+                    std::string compressionStr =
+                        (compression == CompressionAlgo::xz       ? "xz"
+                         : compression == CompressionAlgo::bzip2  ? "bzip2"
+                         : compression == CompressionAlgo::zstd   ? "zstd"
+                         : compression == CompressionAlgo::lzip   ? "lzip"
+                         : compression == CompressionAlgo::lz4    ? "lz4"
+                         : compression == CompressionAlgo::brotli ? "br"
+                                                                  : "none");
+
+                    auto decompressor = makeDecompressionSink(compressionStr, decompressedSink);
+                    (*decompressor)(compressedSink.s);
+                    decompressor->finish();
+                } else {
+                    getFile(linkFile, decompressedSink);
+                }
+
+                StringSource contentSource(decompressedSink.s);
+
+                /* Add to local .links/ with correct permissions (verifies hash) */
+                dst.addToLinks(linkHash, contentSource, reg->executable);
+
+                /* Hard-link to destination (don't reset permissions yet) */
+                dst.hardLinkFromLinks(linkHash, dest, false /* resetPermissions */);
+
+                bytesDownloaded += reg->contents.fileSize.value_or(0);
+
+                printMsg(lvlInfo, "downloaded %s (%s)",
+                    dest.filename().string(),
+                    renderSize(reg->contents.fileSize.value_or(0)));
+            }
+
+            /* Set executable bit if needed */
+            if (reg->executable) {
+                auto st = lstat(dest);
+                chmod(dest, st.st_mode | S_IXUSR | S_IXGRP | S_IXOTH);
+            }
+        }
+        else if (auto * dir = std::get_if<NarListing::Directory>(&node.raw)) {
+            /* Create directory */
+            createDirs(dest);
+
+            /* Recursively process directory entries */
+            for (auto & [name, child] : dir->entries) {
+                visit(child, dest / name);
+            }
+        }
+        else if (auto * sym = std::get_if<NarListing::Symlink>(&node.raw)) {
+            /* Create symlink */
+            createSymlink(sym->target, dest);
+        }
+    };
+
+    visit(listing, destPath);
+
+    /* Canonicalize permissions and timestamps */
+    CanonicalizePathMetadataOptions options{NIX_WHEN_SUPPORT_ACLS(dst.config->getLocalSettings().ignoredAcls)};
+    canonicalisePathMetaData(destPath, options);
+
+    /* Register the path as valid */
+    dst.registerValidPath(info);
+
+    printMsg(
+        lvlInfo,
+        "links-based substitution complete: %s downloaded, %s reused (%d%% savings)",
+        renderSize(bytesDownloaded),
+        renderSize(bytesReused),
+        bytesReused > 0 ? (int)(100.0 * bytesReused / (bytesDownloaded + bytesReused)) : 0);
+}
+
+bool BinaryCacheStore::tryCopyPathWithLinks(Store & dstStore, const StorePath & storePath)
+{
+    /* Only works when destination is a LocalStore */
+    auto * localStore = dynamic_cast<LocalStore *>(&dstStore);
+    if (!localStore) {
+        return false;
+    }
+
+    /* Try to get .ls file */
+    auto lsPath = storePath.hashPart() + ".ls";
+    std::optional<std::string> lsContent;
+
+    try {
+        lsContent = getFile(lsPath);
+    } catch (...) {
+        debug("no .ls file for %s", printStorePath(storePath));
+        return false;
+    }
+
+    if (!lsContent) {
+        debug("empty .ls file for %s", printStorePath(storePath));
+        return false;
+    }
+
+    /* Parse .ls file */
+    try {
+        auto j = nlohmann::json::parse(*lsContent);
+
+        /* Check version */
+        int version = j.value("version", 1);
+        if (version < 2) {
+            debug(".ls file is version %d, need version 2 for Links", version);
+            return false;
+        }
+
+        /* Parse listing */
+        auto listing = j["root"].get<NarListing>();
+
+        /* Check if all files have linkHash */
+        if (!allFilesHaveLinkHash(listing)) {
+            debug("not all files have linkHash in .ls file");
+            return false;
+        }
+
+        /* Get path info for validation */
+        auto info = queryPathInfo(storePath);
+
+        /* Perform Links-based substitution */
+        substituteWithLinks(*localStore, *info, listing);
+
+        return true;
+
+    } catch (std::exception & e) {
+        debug("failed to parse or use .ls file: %s", e.what());
+        return false;
+    }
+}
+
 ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
     Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo)
 {
@@ -151,6 +467,7 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
     HashSink fileHashSink{HashAlgorithm::SHA256};
     std::shared_ptr<NarAccessor> narAccessor;
     HashSink narHashSink{HashAlgorithm::SHA256};
+    auto narContent = std::make_shared<std::string>();
     {
         FdSink fileSink(fdTemp.get());
         TeeSink teeSinkCompressed{fileSink, fileHashSink};
@@ -159,10 +476,26 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
         auto compressionSink =
             makeCompressionSink(config.compression, teeSinkCompressed, parallel, config.compressionLevel);
         TeeSink teeSinkUncompressed{*compressionSink, narHashSink};
-        TeeSource teeSource{narSource, teeSinkUncompressed};
-        narAccessor = makeNarAccessor(parseNarListing(teeSource));
+
+        /* Also save NAR content for lazy accessor */
+        LambdaSink narContentSink([&](std::string_view data) {
+            narContent->append(data.data(), data.size());
+        });
+        TeeSink narSaveTee{teeSinkUncompressed, narContentSink};
+
+        TeeSource teeSource{narSource, narSaveTee};
+        auto listing = parseNarListing(teeSource);
         compressionSink->finish();
         fileSink.flush();
+
+        /* Create lazy NAR accessor with saved content */
+        narAccessor = makeLazyNarAccessor(
+            std::move(listing),
+            [narContent](uint64_t offset, uint64_t length, Sink & sink) {
+                if (offset + length > narContent->size())
+                    throw Error("NAR byte range out of bounds");
+                sink(std::string_view(narContent->data() + offset, length));
+            });
     }
 
     auto now2 = std::chrono::steady_clock::now();
@@ -207,9 +540,21 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
     /* Optionally write a JSON file containing a listing of the
        contents of the NAR. */
     if (config.writeNARListing) {
+        auto listing = narAccessor->getListing();
+        int version = 1;
+
+        /* Try to add Links support (upload files to .links/ with hashes) */
+        try {
+            uploadToLinks(listing, narAccessor);
+            version = 2;
+        } catch (Error & e) {
+            /* Failed to upload links - continue with v1 format */
+            debug("Links upload failed: %s", e.what());
+        }
+
         nlohmann::json j = {
-            {"version", 1},
-            {"root", narAccessor->getListing()},
+            {"version", version},
+            {"root", listing},
         };
 
         upsertFile(std::string(info.path.hashPart()) + ".ls", j.dump(), "application/json");

@@ -1637,6 +1637,114 @@ std::optional<std::string> LocalStore::getVersion()
     return nixVersion;
 }
 
+
+/* Links-based API for file-level deduplication */
+
+Hash LocalStore::getFileLinkHash(const std::filesystem::path & path)
+{
+    /* Use the same hash calculation as optimisePath_ in optimise-store.cc:160
+       This ensures compatibility between local store optimization and
+       Links-based binary caches. */
+    return hashPath(
+        makeFSSourceAccessor(path),
+        FileSerialisationMethod::NixArchive,
+        HashAlgorithm::SHA256
+    ).hash;
+}
+
+bool LocalStore::hasLinkedFile(const Hash & linkHash)
+{
+    auto linkPath = linksDir / linkHash.to_string(HashFormat::Nix32, false);
+    return pathExists(linkPath);
+}
+
+std::filesystem::path LocalStore::addToLinks(const Hash & linkHash, Source & source, bool executable)
+{
+    auto linkPath = linksDir / linkHash.to_string(HashFormat::Nix32, false);
+
+    /* If the file already exists, just return its path */
+    if (pathExists(linkPath))
+        return linkPath;
+
+    /* Write to a temporary file first for atomicity */
+    auto tempPath = makeTempPath(config->realStoreDir.get(), ".tmp-link");
+    AutoDelete delTempPath(tempPath, true);
+
+    {
+        /* Set mode to 0555 if executable, 0444 otherwise */
+        mode_t mode = executable ? 0555 : 0444;
+        AutoCloseFD fd = open(tempPath.string().c_str(), O_WRONLY | O_CREAT | O_EXCL, mode);
+        if (!fd)
+            throw SysError("creating temporary link file '%s'", PathFmt(tempPath));
+
+        /* Read from source and write to file descriptor */
+        FdSink sink(fd.get());
+        source.drainInto(sink);
+    }
+
+    /* Verify the hash matches what we expect */
+    Hash computed = getFileLinkHash(tempPath);
+    if (computed != linkHash)
+        throw Error(
+            "hash mismatch for .links entry: expected %s, got %s",
+            linkHash.to_string(HashFormat::Nix32, false),
+            computed.to_string(HashFormat::Nix32, false));
+
+    /* Atomically rename to final location */
+    try {
+        std::filesystem::rename(tempPath, linkPath);
+        delTempPath.cancel();
+    } catch (std::filesystem::filesystem_error & e) {
+        if (e.code() == std::errc::file_exists) {
+            /* Race condition: another process created it.
+               This is fine, just return the existing path. */
+            return linkPath;
+        }
+        throw SystemError(e.code(), "renaming '%1%' to '%2%'", PathFmt(tempPath), PathFmt(linkPath));
+    }
+
+    return linkPath;
+}
+
+void LocalStore::hardLinkFromLinks(const Hash & linkHash, const std::filesystem::path & dest, bool resetPermissions)
+{
+    auto linkPath = linksDir / linkHash.to_string(HashFormat::Nix32, false);
+
+    if (!pathExists(linkPath))
+        throw Error(
+            "missing .links entry: %s",
+            linkHash.to_string(HashFormat::Nix32, false));
+
+    /* Ensure parent directory exists and is writable */
+    auto destDir = dest.parent_path();
+    if (!pathExists(destDir))
+        createDirs(destDir);
+
+    /* The destination directory might be read-only (e.g., in the store).
+       We need to temporarily make it writable. */
+    bool mustToggle = destDir != config->realStoreDir.get();
+    if (mustToggle && pathExists(destDir)) {
+        auto st = lstat(destDir);
+        chmod(destDir, st.st_mode | S_IWUSR);
+    }
+
+    /* Create the hard link */
+    try {
+        std::filesystem::create_hard_link(linkPath, dest);
+    } catch (std::filesystem::filesystem_error & e) {
+        throw SystemError(
+            e.code(),
+            "creating hard link from '%1%' to '%2%'",
+            PathFmt(linkPath),
+            PathFmt(dest));
+    }
+
+    /* Reset directory permissions if requested (skip during bulk extraction) */
+    if (resetPermissions && mustToggle && pathExists(destDir))
+        canonicaliseTimestampAndPermissions(destDir.string());
+}
+
+
 static RegisterStoreImplementation<LocalStore::Config> regLocalStore;
 
 } // namespace nix
