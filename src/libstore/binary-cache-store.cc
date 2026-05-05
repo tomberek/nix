@@ -357,8 +357,13 @@ void BinaryCacheStore::substituteWithLinks(
 
     collect(listing, destPath);
 
+    /* Report statistics about reuse vs download */
+    printMsg(lvlInfo, "links-based substitution: %d files to download, %d files to reuse (%s already in store)",
+             toDownload.size(), toReuse.size(), renderSize(bytesReused.load()));
+
     /* Second pass: download files in parallel */
     if (!toDownload.empty()) {
+        printMsg(lvlInfo, "downloading and decompressing %d files in parallel...", toDownload.size());
         ThreadPool threadPool(25);
 
         for (auto & file : toDownload) {
@@ -402,9 +407,13 @@ void BinaryCacheStore::substituteWithLinks(
         }
 
         threadPool.process();
+        printMsg(lvlInfo, "downloads complete, hard-linking files...");
     }
 
     /* Third pass: hard-link everything (both downloaded and reused) */
+    if (!toReuse.empty()) {
+        printMsg(lvlInfo, "hard-linking %d reused files from local .links/...", toReuse.size());
+    }
     for (auto & [linkHash, dest] : toReuse) {
         dst.hardLinkFromLinks(linkHash, dest, false /* resetPermissions */);
     }
