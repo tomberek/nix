@@ -212,6 +212,15 @@ void LocalStore::findTempRoots(Roots & tempRoots, bool censor)
     }
 }
 
+void LocalStore::findRootsWithSnapshot(
+    const std::filesystem::path & path,
+    std::filesystem::file_type type,
+    Roots & roots,
+    const boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> & validHashes)
+{
+    findRootsHelper(path, type, roots, validHashes);
+}
+
 void LocalStore::findRoots(const std::filesystem::path & path, std::filesystem::file_type type, Roots & roots)
 {
     // Load all valid path hashes once at top level
@@ -224,7 +233,7 @@ void LocalStore::findRoots(const std::filesystem::path & path, std::filesystem::
             validHashes.insert(use.getStr(0));
     }
 
-    findRootsHelper(path, type, roots, validHashes);
+    findRootsWithSnapshot(path, type, roots, validHashes);
 }
 
 void LocalStore::findRootsHelper(
@@ -317,9 +326,21 @@ void LocalStore::findRootsHelper(
 
 void LocalStore::findRootsNoTemp(Roots & roots, bool censor)
 {
+    /* Load all valid path hashes once for both gcroots and profiles.
+       With millions of paths, loading takes 2-4 seconds, so sharing
+       the snapshot between calls saves significant time. */
+    boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> validHashes;
+    {
+        SQLiteStmt stmt;
+        stmt.create(_state->lock()->db, "SELECT hash FROM ValidPaths");
+        auto use = stmt.use();
+        while (use.next())
+            validHashes.insert(use.getStr(0));
+    }
+
     /* Process direct roots in {gcroots,profiles}. */
-    findRoots(config->stateDir.get() / gcRootsDir, std::filesystem::file_type::unknown, roots);
-    findRoots(config->stateDir.get() / "profiles", std::filesystem::file_type::unknown, roots);
+    findRootsWithSnapshot(config->stateDir.get() / gcRootsDir, std::filesystem::file_type::unknown, roots, validHashes);
+    findRootsWithSnapshot(config->stateDir.get() / "profiles", std::filesystem::file_type::unknown, roots, validHashes);
 
     /* Add additional roots returned by different platforms-specific
        heuristics.  This is typically used to add running programs to

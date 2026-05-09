@@ -491,6 +491,12 @@ private:
 
     void findRoots(const std::filesystem::path & path, std::filesystem::file_type type, Roots & roots);
 
+    void findRootsWithSnapshot(
+        const std::filesystem::path & path,
+        std::filesystem::file_type type,
+        Roots & roots,
+        const boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> & validHashes);
+
     void findRootsHelper(
         const std::filesystem::path & path,
         std::filesystem::file_type type,
