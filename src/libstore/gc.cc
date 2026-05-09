@@ -598,9 +598,72 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         readFile(*p);
 
     if (options.deleteOldLeafsOnly) {
+        /* Use dedicated trash directory to avoid iterating all store paths on cleanup */
+        auto trashBase = config->realStoreDir.get() / ".gc-trash";
+        createDirs(trashBase);
+
+        /* Clean up any trash from interrupted previous GC runs */
+        try {
+            for (auto & entry : std::filesystem::directory_iterator(trashBase)) {
+                if (entry.is_directory()) {
+                    printInfo("cleaning up interrupted GC trash: %s", entry.path().filename().string());
+                    std::filesystem::remove_all(entry.path());
+                }
+            }
+        } catch (std::filesystem::filesystem_error & e) {
+            logWarning({.msg = HintFmt("failed to clean up old GC trash: %1%", e.what())});
+        }
+
         auto cutoffTime = time(nullptr) - *options.deleteOldLeafsOnly;
         boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> rootHashes;
         for (auto & path : roots) rootHashes.insert(path.hashPart());
+
+        /* Create this GC run's trash directory */
+        auto trashDir = trashBase / std::to_string(getpid());
+        createDirs(trashDir);
+
+        /* Queue for background deletion */
+        Sync<std::vector<std::filesystem::path>> deleteQueue;
+        std::atomic<bool> stopDeleter{false};
+
+        /* Background thread to unlink trashed paths */
+        std::thread deleterThread([&] {
+            while (!stopDeleter) {
+                std::vector<std::filesystem::path> batch;
+                {
+                    auto queue = deleteQueue.lock();
+                    if (queue->empty()) {
+                        queue.wait_for(wakeup, std::chrono::milliseconds(100));
+                        continue;
+                    }
+                    batch.swap(*queue);
+                }
+
+                for (auto & trashedPath : batch) {
+                    uint64_t bytesFreed = 0;
+                    try {
+                        deletePath(trashedPath, bytesFreed);
+                    } catch (SystemError & e) {
+                        if (!config->ignoreGcDeleteFailure)
+                            logError({.msg = HintFmt("background deletion failed: %1%", e.msg())});
+                    }
+                }
+            }
+
+            /* Clean up this run's trash directory */
+            try {
+                std::filesystem::remove_all(trashDir);
+            } catch (...) {
+                ignoreExceptionExceptInterrupt();
+            }
+        });
+
+        Finally stopDeleterThread([&] {
+            stopDeleter = true;
+            wakeup.notify_all();
+            if (deleterThread.joinable())
+                deleterThread.join();
+        });
 
         uint64_t totalDeleted = 0;
         for (int round = 1; ; round++) {
@@ -639,20 +702,32 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     });
 
                     auto realPath = config->realStoreDir.get() / baseNameOf(path);
+                    auto trashPath = trashDir / (hash + "-" + std::to_string(deletedCount));
+
                     printInfo("deleting '%s'", path);
                     results.paths.insert(path);
 
-                    uint64_t bytesFreed = 0;
                     try {
+                        /* Invalidate in DB first - same order as before */
                         invalidatePathChecked(parseStorePath(path));
-                        deleteStorePath(realPath, bytesFreed, true);
-                        if (bytesFreed == 0 && narSize > 0) bytesFreed = narSize;
-                        results.bytesFreed += bytesFreed;
+
+                        /* Atomic move to trash (replaces slow deleteStorePath) */
+                        std::filesystem::rename(realPath, trashPath);
+
+                        /* Queue for background unlink */
+                        deleteQueue.lock()->push_back(trashPath);
+                        wakeup.notify_all();
+
+                        /* Use narSize for byte accounting (same as before when bytesFreed==0) */
+                        if (narSize > 0) results.bytesFreed += narSize;
                         deletedCount++;
                         if (results.bytesFreed >= options.maxFreed) throw GCLimitReached();
-                    } catch (SystemError & e) {
+                    } catch (std::filesystem::filesystem_error & e) {
                         if (!config->ignoreGcDeleteFailure) throw;
-                        logWarning({.msg = HintFmt("ignoring GC failure for %1%", PathFmt(realPath))});
+                        logWarning({.msg = HintFmt("ignoring GC failure for %1%: %2%", PathFmt(realPath), e.what())});
+                    } catch (Error & e) {
+                        if (!config->ignoreGcDeleteFailure) throw;
+                        logWarning({.msg = HintFmt("ignoring GC failure for %1%: %2%", PathFmt(realPath), e.msg())});
                     }
                 }
             } catch (GCLimitReached &) {
