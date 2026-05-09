@@ -214,13 +214,40 @@ void LocalStore::findTempRoots(Roots & tempRoots, bool censor)
 
 void LocalStore::findRoots(const std::filesystem::path & path, std::filesystem::file_type type, Roots & roots)
 {
+    // Load all valid path hashes once at top level
+    boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> validHashes;
+    {
+        SQLiteStmt stmt;
+        stmt.create(_state->lock()->db, "SELECT hash FROM ValidPaths");
+        auto use = stmt.use();
+        while (use.next())
+            validHashes.insert(use.getStr(0));
+    }
+
+    findRootsHelper(path, type, roots, validHashes);
+}
+
+void LocalStore::findRootsHelper(
+    const std::filesystem::path & path,
+    std::filesystem::file_type type,
+    Roots & roots,
+    const boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> & validHashes)
+{
     auto foundRoot = [&](const std::filesystem::path & path, const std::filesystem::path & target) {
         try {
             auto storePath = toStorePath(target.string()).first;
-            if (isValidPath(storePath))
+            if (validHashes.contains(storePath.hashPart())) {
                 roots[std::move(storePath)].emplace(path.string());
-            else
-                printInfo("skipping invalid root from %1% to %2%", PathFmt(path), PathFmt(target));
+            } else {
+                // Path not in snapshot - double-check DB to avoid race where path
+                // became valid after snapshot but before we scanned this root
+                if (isValidPath(storePath)) {
+                    roots[std::move(storePath)].emplace(path.string());
+                    debug("root %1% became valid during scan", PathFmt(path));
+                } else {
+                    printInfo("skipping invalid root from %1% to %2%", PathFmt(path), PathFmt(target));
+                }
+            }
         } catch (BadStorePath &) {
         }
     };
@@ -233,7 +260,7 @@ void LocalStore::findRoots(const std::filesystem::path & path, std::filesystem::
         if (type == std::filesystem::file_type::directory) {
             for (auto & i : DirectoryIterator{path}) {
                 checkInterrupt();
-                findRoots(i.path(), i.symlink_status().type(), roots);
+                findRootsHelper(i.path(), i.symlink_status().type(), roots, validHashes);
             }
         }
 

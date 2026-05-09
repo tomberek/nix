@@ -491,6 +491,12 @@ private:
 
     void findRoots(const std::filesystem::path & path, std::filesystem::file_type type, Roots & roots);
 
+    void findRootsHelper(
+        const std::filesystem::path & path,
+        std::filesystem::file_type type,
+        Roots & roots,
+        const boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> & validHashes);
+
     void findRootsNoTemp(Roots & roots, bool censor);
 
     void findRuntimeRoots(Roots & roots, bool censor);
