@@ -63,6 +63,18 @@ struct GCOptions
     bool ignoreLiveness{false};
 
     /**
+     * If `fastMode` is set, use optimized bulk SQLite query loading
+     * instead of per-path queries. This can provide 10-100x speedup
+     * for GC analysis on stores with many paths.
+     */
+    bool fastMode{false};
+
+    /**
+     * Delete unused leaf paths older than this many seconds using SQL.
+     */
+    std::optional<uint64_t> deleteOldLeafsOnly;
+
+    /**
      * The paths from which to delete.
      */
     using GCPaths = std::variant<WholeStore, SpecificPaths>;

@@ -20,6 +20,13 @@ struct CmdStoreGC : StoreCommand, MixDryRun
             .labels = {"n"},
             .handler = {&options.maxFreed},
         });
+
+        addFlag({
+            .longName = "delete-old-leafs",
+            .description = "Delete unused leaf paths older than *n* seconds using fast SQL queries.",
+            .labels = {"n"},
+            .handler = {&options.deleteOldLeafsOnly},
+        });
     }
 
     std::string description() override

@@ -535,6 +535,77 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     if (auto p = getEnv("_NIX_TEST_GC_SYNC_2"))
         readFile(*p);
 
+    if (options.deleteOldLeafsOnly) {
+        auto cutoffTime = time(nullptr) - *options.deleteOldLeafsOnly;
+        boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> rootHashes;
+        for (auto & path : roots) rootHashes.insert(path.hashPart());
+
+        uint64_t totalDeleted = 0;
+        for (int round = 1; ; round++) {
+            SQLiteStmt stmt;
+            stmt.create(_state->lock()->db, R"(
+                SELECT v.path, v.narSize, v.hash FROM ValidPaths v
+                WHERE v.registrationTime < ?
+                  AND v.id NOT IN (SELECT DISTINCT reference FROM Refs WHERE reference != referrer)
+            )");
+
+            uint64_t deletedCount = 0;
+            try {
+                auto use = stmt.use()(cutoffTime);
+                while (use.next()) {
+                    checkInterrupt();
+                    auto path = use.getStr(0);
+                    auto narSize = use.isNull(1) ? 0 : use.getInt(1);
+                    auto hash = use.getStr(2);
+
+                    if (rootHashes.count(hash)) continue;
+
+                    bool shouldDelete = false;
+                    {
+                        auto shared(_shared.lock());
+                        if (!shared->tempRoots.contains(hash)) {
+                            shared->pending = hash;
+                            shouldDelete = true;
+                        }
+                    }
+                    if (!shouldDelete) continue;
+
+                    Finally clearPending([&] {
+                        auto shared(_shared.lock());
+                        shared->pending.reset();
+                        wakeup.notify_all();
+                    });
+
+                    auto realPath = config->realStoreDir.get() / baseNameOf(path);
+                    printInfo("deleting '%s'", path);
+                    results.paths.insert(path);
+
+                    uint64_t bytesFreed = 0;
+                    try {
+                        invalidatePathChecked(parseStorePath(path));
+                        deleteStorePath(realPath, bytesFreed, true);
+                        if (bytesFreed == 0 && narSize > 0) bytesFreed = narSize;
+                        results.bytesFreed += bytesFreed;
+                        deletedCount++;
+                        if (results.bytesFreed >= options.maxFreed) throw GCLimitReached();
+                    } catch (SystemError & e) {
+                        if (!config->ignoreGcDeleteFailure) throw;
+                        logWarning({.msg = HintFmt("ignoring GC failure for %1%", PathFmt(realPath))});
+                    }
+                }
+            } catch (GCLimitReached &) {
+                printInfo("quick GC: deleted %d paths in %d rounds, freed %s", totalDeleted + deletedCount, round, renderSize(results.bytesFreed));
+                return;
+            }
+
+            totalDeleted += deletedCount;
+            if (deletedCount == 0) {
+                printInfo("quick GC: deleted %d paths in %d rounds, freed %s", totalDeleted, round, renderSize(results.bytesFreed));
+                return;
+            }
+        }
+    }
+
     /* Helper function that deletes a path from the store and throws
        GCLimitReached if we've deleted enough garbage. */
     auto deleteFromStore = [&](std::string_view baseName, bool isKnownPath) {
