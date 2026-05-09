@@ -226,6 +226,13 @@ void LocalStore::findRoots(const std::filesystem::path & path, std::filesystem::
     // Load all valid path hashes once at top level
     boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> validHashes;
     {
+        SQLiteStmt countStmt;
+        countStmt.create(_state->lock()->db, "SELECT COUNT(*) FROM ValidPaths");
+        auto countUse = countStmt.use();
+        if (countUse.next()) {
+            validHashes.reserve(countUse.getInt(0));
+        }
+
         SQLiteStmt stmt;
         stmt.create(_state->lock()->db, "SELECT hash FROM ValidPaths");
         auto use = stmt.use();
@@ -331,6 +338,13 @@ void LocalStore::findRootsNoTemp(Roots & roots, bool censor)
        the snapshot between calls saves significant time. */
     boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> validHashes;
     {
+        SQLiteStmt countStmt;
+        countStmt.create(_state->lock()->db, "SELECT COUNT(*) FROM ValidPaths");
+        auto countUse = countStmt.use();
+        if (countUse.next()) {
+            validHashes.reserve(countUse.getInt(0));
+        }
+
         SQLiteStmt stmt;
         stmt.create(_state->lock()->db, "SELECT hash FROM ValidPaths");
         auto use = stmt.use();
