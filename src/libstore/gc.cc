@@ -521,7 +521,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     if (options.pruneOlderThan) {
         auto trashBase = config->realStoreDir.get() / ".gc-trash";
         if (!std::filesystem::exists(trashBase)) {
-            createDir(trashBase);
+            createDir(trashBase, 0700);
+        } else {
+            chmod(trashBase.c_str(), 0700);
         }
 
         try {
@@ -536,7 +538,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
 
         trashDir = trashBase / std::to_string(getpid());
-        createDir(trashDir);
+        createDir(trashDir, 0700);
 
         deleteQueue = std::make_shared<Sync<std::vector<std::filesystem::path>>>();
         stopDeleter = std::make_shared<std::atomic<bool>>(false);
@@ -562,6 +564,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                         uint64_t bytesFreed = 0;
                         try {
                             deletePath(trashedPath, bytesFreed);
+                        } catch (Interrupted & e) {
+                            break;
                         } catch (SystemError & e) {
                             if (!config->ignoreGcDeleteFailure)
                                 logError({.msg = HintFmt("background deletion failed: %1%", e.msg())});
