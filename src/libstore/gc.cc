@@ -512,6 +512,79 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
 #endif
 
+    /* For fast GC with --prune-older-than, set up background deletion thread */
+    std::optional<std::thread> deleterThread;
+    std::shared_ptr<Sync<std::vector<std::filesystem::path>>> deleteQueue;
+    std::shared_ptr<std::atomic<bool>> stopDeleter;
+    std::filesystem::path trashDir;
+
+    if (options.pruneOlderThan) {
+        auto trashBase = config->realStoreDir.get() / ".gc-trash";
+        if (!std::filesystem::exists(trashBase)) {
+            createDir(trashBase);
+        }
+
+        try {
+            for (auto & entry : std::filesystem::directory_iterator(trashBase)) {
+                if (entry.is_directory()) {
+                    printInfo("cleaning up interrupted GC trash: %s", entry.path().filename().string());
+                    std::filesystem::remove_all(entry.path());
+                }
+            }
+        } catch (std::filesystem::filesystem_error & e) {
+            logWarning({.msg = HintFmt("failed to clean up old GC trash: %1%", e.what())});
+        }
+
+        trashDir = trashBase / std::to_string(getpid());
+        createDir(trashDir);
+
+        deleteQueue = std::make_shared<Sync<std::vector<std::filesystem::path>>>();
+        stopDeleter = std::make_shared<std::atomic<bool>>(false);
+
+        deleterThread.emplace([deleteQueue, stopDeleter, trashDir, config = this->config, &wakeup]() {
+            while (!*stopDeleter) {
+                std::vector<std::filesystem::path> batch;
+                {
+                    auto queue = deleteQueue->lock();
+                    if (queue->empty()) {
+                        queue.wait_for(wakeup, std::chrono::milliseconds(100));
+                    } else {
+                        batch.swap(*queue);
+                    }
+                }
+
+                for (auto & trashedPath : batch) {
+                    if (*stopDeleter)
+                        break;
+                    uint64_t bytesFreed = 0;
+                    try {
+                        deletePath(trashedPath, bytesFreed);
+                    } catch (SystemError & e) {
+                        if (!config->ignoreGcDeleteFailure)
+                            logError({.msg = HintFmt("background deletion failed: %1%", e.msg())});
+                    }
+                }
+            }
+
+            if (!*stopDeleter) {
+                try {
+                    std::filesystem::remove_all(trashDir);
+                } catch (...) {
+                    ignoreExceptionExceptInterrupt();
+                }
+            }
+        });
+    }
+
+    Finally stopDeleterThread([&] {
+        if (stopDeleter) {
+            *stopDeleter = true;
+            wakeup.notify_all();
+            if (deleterThread && deleterThread->joinable())
+                deleterThread->join();
+        }
+    });
+
     /* Find the roots.  Since we've grabbed the GC lock, the set of
        permanent roots cannot increase now. */
     printInfo("finding garbage collector roots...");
@@ -643,6 +716,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     });
 
                     auto realPath = config->realStoreDir.get() / baseNameOf(path);
+                    auto trashPath = trashDir / (hash + "-" + std::to_string(totalDeleted));
 
                     printInfo("deleting '%s'", path);
                     results.paths.insert(path);
@@ -651,17 +725,16 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                         /* Invalidate in DB first */
                         invalidatePathChecked(parseStorePath(path));
 
-                        /* Delete the path */
-                        uint64_t bytesFreed = 0;
-                        deleteStorePath(realPath, bytesFreed, true);
+                        /* Atomic move to trash (replaces slow deleteStorePath) */
+                        std::filesystem::rename(realPath, trashPath);
 
-                        /* Use narSize for byte accounting if deleteStorePath didn't measure */
-                        if (bytesFreed == 0 && narSize > 0) {
+                        /* Queue for background unlink */
+                        deleteQueue->lock()->push_back(trashPath);
+                        wakeup.notify_all();
+
+                        /* Use narSize for byte accounting */
+                        if (narSize > 0)
                             results.bytesFreed += narSize;
-                        } else {
-                            results.bytesFreed += bytesFreed;
-                        }
-
                         roundDeleted++;
                         totalDeleted++;
                         if (results.bytesFreed >= options.maxFreed)
