@@ -337,6 +337,16 @@ void replaceSymlink(const std::filesystem::path & target, const std::filesystem:
 void moveFile(const std::filesystem::path & src, const std::filesystem::path & dst);
 
 /**
+ * Try to create a reflink (copy-on-write clone) from src to dst.
+ *
+ * Returns true if reflink succeeded, false if it should fall back to regular copy.
+ * Uses FICLONE ioctl (Btrfs, XFS, Bcachefs) or copy_file_range (ZFS) on Linux,
+ * or clonefile() on macOS.
+ * Automatically detects if reflinks are unsupported and caches that result.
+ */
+bool tryReflink(const std::filesystem::path & src, const std::filesystem::path & dst);
+
+/**
  * Recursively copy the content of `oldPath` to `newPath`. If `andDelete` is
  * `true`, then also remove `oldPath` (making this equivalent to `moveFile`, but
  * with the guaranty that the destination will be “fresh”, with no stale inode

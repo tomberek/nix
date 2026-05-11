@@ -592,6 +592,18 @@ void copyFile(const std::filesystem::path & from, const std::filesystem::path & 
     }
 
     if (std::filesystem::is_symlink(fromStatus) || std::filesystem::is_regular_file(fromStatus)) {
+        // For regular files (not symlinks), try reflink first for better performance
+        if (std::filesystem::is_regular_file(fromStatus) && !contents) {
+            if (tryReflink(from, to)) {
+                // Reflink succeeded! Clean up source if needed
+                if (andDelete) {
+                    std::filesystem::remove(from);
+                }
+                return;
+            }
+            // Fall through to regular copy if reflink didn't work
+        }
+
         if (contents) {
             std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing);
         } else {
