@@ -346,7 +346,25 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
     Activity act(*logger, actOptimiseStore);
 
     auto paths = queryAllValidPaths();
-    InodeHash inodeHash = loadInodeHash();
+
+    // Check if xattrs are usable by trying to list xattrs on linksDir.
+    // If not usable, we need to pre-load the inode hash as a fallback.
+    InodeHash inodeHash;
+#if NIX_SUPPORT_ACL
+    // Try to list xattrs on linksDir to detect if they're usable
+    ssize_t size = llistxattr(linksDir.string().c_str(), nullptr, 0);
+    if (size < 0) {
+        // Any failure means we can't rely on xattrs for optimization tracking
+        // Load inode hash as fallback to avoid duplicate work
+        debug("cannot use xattrs for optimization tracking (%s), loading inode hash", strerror(errno));
+        inodeHash = loadInodeHash();
+    }
+    // Otherwise: xattrs work (size >= 0)
+    // Start with empty hash - xattr checks will skip already-optimised paths
+#else
+    // Platform doesn't support xattrs at compile time
+    inodeHash = loadInodeHash();
+#endif
 
     act.progress(0, paths.size());
 
