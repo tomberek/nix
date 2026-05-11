@@ -509,7 +509,6 @@ private:
 
     typedef boost::unordered_flat_set<ino_t> InodeHash;
 
-    InodeHash loadInodeHash();
     Strings readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash);
     void optimisePath_(
         Activity * act,

@@ -95,28 +95,6 @@ void LocalStore::markPathOptimised(const std::filesystem::path & path)
 #endif
 }
 
-LocalStore::InodeHash LocalStore::loadInodeHash()
-{
-    debug("loading hash inodes in memory");
-    InodeHash inodeHash;
-
-    AutoCloseDir dir(opendir(linksDir.string().c_str()));
-    if (!dir)
-        throw SysError("opening directory %1%", PathFmt(linksDir));
-
-    struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
-        checkInterrupt();
-        // We don't care if we hit non-hash files, anything goes
-        inodeHash.insert(dirent->d_ino);
-    }
-    if (errno)
-        throw SysError("reading directory %1%", PathFmt(linksDir));
-
-    printMsg(lvlTalkative, "loaded %1% hash inodes", inodeHash.size());
-
-    return inodeHash;
-}
 
 Strings LocalStore::readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash)
 {
@@ -346,7 +324,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
     Activity act(*logger, actOptimiseStore);
 
     auto paths = queryAllValidPaths();
-    InodeHash inodeHash = loadInodeHash();
+    InodeHash inodeHash;  // Start empty - xattr tracking makes pre-loading unnecessary
 
     act.progress(0, paths.size());
 
