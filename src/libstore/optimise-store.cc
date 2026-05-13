@@ -4,17 +4,22 @@
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/base-nix-32.hh"
 
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #ifdef __APPLE__
 #  include <regex>
 #endif
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
 
 #if NIX_SUPPORT_ACL
 #  include <sys/xattr.h>
@@ -95,23 +100,74 @@ void LocalStore::markPathOptimised(const std::filesystem::path & path)
 #endif
 }
 
+AutoCloseFD LocalStore::tryClaimPath(const std::filesystem::path & path)
+{
+#ifndef _WIN32
+    // Open the store path for locking
+    // O_RDONLY works for files and directories
+    // O_NOFOLLOW prevents following symlinks (we want to lock the symlink itself)
+    // O_NONBLOCK prevents blocking on FIFOs
+    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        // Path doesn't exist, is a symlink, or can't be opened - skip it
+        return AutoCloseFD{};
+    }
+
+    // Try to acquire exclusive lock, non-blocking
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        // Successfully locked - return fd to keep lock held
+        return AutoCloseFD{fd};
+    }
+
+    // Lock held by another optimizer (EWOULDBLOCK) or other error
+    close(fd);
+    return AutoCloseFD{};
+#else
+    // Windows doesn't have flock - allow concurrent optimization
+    return AutoCloseFD{-1};
+#endif
+}
+
 LocalStore::InodeHash LocalStore::loadInodeHash()
 {
     debug("loading hash inodes in memory");
     InodeHash inodeHash;
 
-    AutoCloseDir dir(opendir(linksDir.string().c_str()));
-    if (!dir)
-        throw SysError("opening directory %1%", PathFmt(linksDir));
-
-    struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
-        checkInterrupt();
-        // We don't care if we hit non-hash files, anything goes
-        inodeHash.insert(dirent->d_ino);
+    // Load old SHA256 links from .links/ for backward compatibility
+    {
+        AutoCloseDir dir(opendir(linksDir.string().c_str()));
+        if (dir) {
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(dir.get())) {
+                checkInterrupt();
+                inodeHash.insert(dirent->d_ino);
+            }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(linksDir));
+        }
     }
-    if (errno)
-        throw SysError("reading directory %1%", PathFmt(linksDir));
+
+    // Load SHA256 links from .links/sha256/XX/ (sharded layout)
+    for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+        for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+            checkInterrupt();
+            char shard[3] = {BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+            auto shardPath = linksShardedDir / shard;
+
+            AutoCloseDir shardDir(opendir(shardPath.string().c_str()));
+            if (!shardDir) {
+                continue;
+            }
+
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(shardDir.get())) {
+                checkInterrupt();
+                inodeHash.insert(dirent->d_ino);
+            }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(shardPath));
+        }
+    }
 
     printMsg(lvlTalkative, "loaded %1% hash inodes", inodeHash.size());
 
@@ -146,6 +202,17 @@ Strings LocalStore::readDirectoryIgnoringInodes(const std::filesystem::path & pa
     return names;
 }
 
+/* Concurrency model:
+ * - Multiple optimisers can run concurrently (safe by design)
+ * - GC can run concurrently with optimization
+ * - Every syscall handles races without aborting:
+ *     ENOENT    → source/replica GC'd mid-op, skip gracefully
+ *     EEXIST    → concurrent optimiser created replica first, re-inspect and use it
+ *     EMLINK    → replica full (32k links), try next overflow (.001, .002, etc.)
+ *     ENOSPC    → shard directory full (ext4 htree limit), skip this file
+ * - GC safety: GC only unlinks entries with st_nlink == 1, so replicas with
+ *   >1 links are protected from deletion while being used by other optimisers
+ */
 void LocalStore::optimisePath_(
     Activity * act, OptimiseStats & stats, const std::filesystem::path & path, InodeHash & inodeHash, RepairFlag repair)
 {
@@ -205,11 +272,17 @@ void LocalStore::optimisePath_(
        Also note that if `path' is a symlink, then we're hashing the
        contents of the symlink (i.e. the result of readlink()), not
        the contents of the target (which may not even exist). */
-    Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
-    debug("%s has hash '%s'", PathFmt(path), hash.to_string(HashFormat::Nix32, true));
 
-    /* Check if this is a known hash. */
-    std::filesystem::path linkPath = std::filesystem::path{linksDir} / hash.to_string(HashFormat::Nix32, false);
+    Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
+    std::string hashStr = hash.to_string(HashFormat::Nix32, false);
+    debug("%s has hash '%s'", PathFmt(path), hashStr);
+
+    // Sharded link path: .links/sha256/xy/ab12cdef...xyz.000
+    // Use last 2 chars for shard (more uniform distribution than first 2)
+    // All filenames end in .NNN for uniformity (base is .000)
+    std::string shard = hashStr.substr(hashStr.length() - 2, 2);
+    std::filesystem::path shardDir = linksShardedDir / shard;
+    std::filesystem::path linkPath = shardDir / (hashStr + ".000");
 
     /* Stat the link once, if it exists. */
     auto stLink = maybeLstat(linkPath);
@@ -241,19 +314,23 @@ void LocalStore::optimisePath_(
             stLink = st;  // After hardlinking, linkPath has same stat as path
         } catch (std::filesystem::filesystem_error & e) {
             if (e.code() == std::errc::file_exists) {
-                /* Another process created ‘linkPath’ before
-                   we did. */
+                /* Race: another optimiser created ‘linkPath’ before we did.
+                   Re-stat it and continue. */
                 stLink = lstat(linkPath);
                 inodeHash.insert(stLink->st_ino);
             }
 
+            else if (e.code() == std::errc::no_such_file_or_directory) {
+                /* Source was GC’d mid-op - benign skip. */
+                debug("%1% was GC’d during optimization", PathFmt(path));
+                return;
+            }
+
             else if (e.code() == std::errc::no_space_on_device) {
                 /* On ext4, that probably means the directory index is
-                   full.  When that happens, it's fine to ignore it: we
-                   just effectively disable deduplication of this
-                   file.
-                   */
-                printInfo("cannot link %s to '%s': %s", PathFmt(linkPath), PathFmt(path), e.code().message());
+                   full.  When that happens, it’s fine to ignore it: we
+                   just effectively disable deduplication of this file. */
+                printInfo("cannot link %s to ‘%s’: %s", PathFmt(linkPath), PathFmt(path), e.code().message());
                 return;
             }
 
@@ -295,20 +372,76 @@ void LocalStore::optimisePath_(
         }
     });
 
-    try {
-        std::filesystem::create_hard_link(linkPath, tempLink);
-        tempLinkCreated = true;
-        inodeHash.insert(stLink->st_ino);
-    } catch (std::filesystem::filesystem_error & e) {
-        if (e.code() == std::errc::too_many_links) {
-            /* Too many links to the same file (>= 32000 on most file
-               systems).  This is likely to happen with empty files.
-               Just shrug and ignore. */
-            if (st.st_size)
-                printInfo("%1% has maximum number of links", PathFmt(linkPath));
-            return;
+    // Try to create hard link, handling link limit with overflow suffixes
+    auto linkPathStr = linkPath.string();
+    std::string baseLinkPath = linkPathStr.substr(0, linkPathStr.size() - 4);
+
+    for (int seq = 0; seq < 1000; ++seq) {
+        char suffix[8];
+        snprintf(suffix, sizeof(suffix), ".%03d", seq);
+        std::filesystem::path actualLinkPath = std::filesystem::path{baseLinkPath + suffix};
+
+        // Only stat if we don't have valid stLink (seq>0 or after error cleared it)
+        if (!stLink && seq > 0) {
+            stLink = maybeLstat(actualLinkPath);
         }
-        throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(linkPath), PathFmt(tempLink));
+
+        if (!stLink) {
+            // Overflow link doesn't exist - create it (shard dirs pre-created)
+            try {
+                std::filesystem::create_hard_link(path, actualLinkPath);
+                stLink = st;
+            } catch (std::filesystem::filesystem_error & createErr) {
+                if (createErr.code() == std::errc::too_many_links) {
+                    // Can't create more links to path - unlikely but possible
+                    if (st.st_size)
+                        printInfo("%1% has maximum number of links", PathFmt(path));
+                    return;
+                } else if (createErr.code() == std::errc::file_exists) {
+                    // Race: another optimiser created this replica first
+                    // Re-stat it and continue
+                    stLink = maybeLstat(actualLinkPath);
+                    if (!stLink) {
+                        // GC'd between creation and our stat - try next seq
+                        continue;
+                    }
+                } else if (createErr.code() == std::errc::no_such_file_or_directory) {
+                    // Source was GC'd mid-op - skip this file
+                    debug("%1% was GC'd during optimization", PathFmt(path));
+                    return;
+                } else {
+                    throw SystemError(createErr.code(), "creating overflow link %1%", PathFmt(actualLinkPath));
+                }
+            }
+        }
+
+        // Try to link tempLink to this overflow file
+        try {
+            std::filesystem::create_hard_link(actualLinkPath, tempLink);
+            tempLinkCreated = true;
+            // Re-stat to get actual inode (stLink could be stale from races)
+            auto actualSt = lstat(tempLink);
+            inodeHash.insert(actualSt.st_ino);
+            break;
+        } catch (std::filesystem::filesystem_error & e) {
+            if (e.code() == std::errc::too_many_links) {
+                // This overflow file hit 32k link limit - try next sequence
+                stLink.reset(); // Clear to force re-stat on next iteration
+                continue;
+            } else if (e.code() == std::errc::no_such_file_or_directory) {
+                // Replica was GC'd (very unlikely - st_nlink must be 1) or source was GC'd
+                // Try next sequence if it was the replica, return if source
+                stLink.reset(); // Clear to force re-stat on next iteration
+                continue;
+            }
+            throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(actualLinkPath), PathFmt(tempLink));
+        }
+    }
+
+    if (!tempLinkCreated) {
+        if (st.st_size)
+            printInfo("%1% exceeded maximum overflow links (999)", PathFmt(baseLinkPath));
+        return;
     }
 
     /* Atomically replace the old file with the new hard link. */
@@ -322,6 +455,11 @@ void LocalStore::optimisePath_(
                temporarily increases the st_nlink field before
                decreasing it again.) */
             debug("%s has reached maximum number of links", PathFmt(linkPath));
+            return;
+        } else if (e.code() == std::errc::no_such_file_or_directory) {
+            /* Source was GC'd between tempLink creation and rename.
+               Benign skip - tempLink cleanup happens via RAII. */
+            debug("%1% was GC'd during optimization", PathFmt(path));
             return;
         }
         throw SystemError(e.code(), "renaming %1% to %2%", PathFmt(tempLink), PathFmt(path));
@@ -346,6 +484,27 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
     Activity act(*logger, actOptimiseStore);
 
     auto paths = queryAllValidPaths();
+    std::vector<StorePath> pathVec(paths.begin(), paths.end());
+
+    // Use a coprime step size to iterate in a different order than other concurrent optimizers.
+    // This avoids lockstep marching where multiple optimizers process the exact same paths
+    // in the same order. Each optimizer (with different PID) gets a different traversal order.
+    // No shuffle needed - O(1) space, deterministic, and just as effective.
+    size_t n = pathVec.size();
+    size_t step = 1;
+    size_t start = 0;
+
+    if (n > 1) {
+        // Find coprime step size based on PID
+        step = (getpid() % (n - 1)) + 1;  // Start with 1..n-1
+        // Ensure coprime (guarantees visiting all elements exactly once)
+        while (std::gcd(step, n) != 1 && step < n) {
+            step++;
+        }
+        if (step >= n) step = 1;  // Fallback
+
+        start = getpid() % n;
+    }
 
     // Check if xattrs are usable by trying to list xattrs on linksDir.
     // If not usable, we need to pre-load the inode hash as a fallback.
@@ -366,14 +525,17 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
     inodeHash = loadInodeHash();
 #endif
 
-    act.progress(0, paths.size());
+    act.progress(0, pathVec.size());
 
     uint64_t done = 0;
     uint64_t skipped = 0;
 
-    for (auto & i : paths) {
+    // Iterate using coprime step for different traversal order per optimizer
+    for (size_t offset = 0; offset < pathVec.size(); ++offset) {
         checkInterrupt();
 
+        size_t idx = (start + offset * step) % pathVec.size();
+        auto & i = pathVec[idx];
         auto fullPath = config->realStoreDir.get() / i.to_string();
 
         // Check xattr FIRST - if optimised, skip expensive DB operations
@@ -381,7 +543,17 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
             debug("skipping already-optimised path '%s'", printStorePath(i));
             skipped++;
             done++;
-            act.progress(done, paths.size());
+            act.progress(done, pathVec.size());
+            continue;
+        }
+
+        // Try to claim this path for optimization (prevents duplicate work with concurrent optimizers)
+        auto lockFd = tryClaimPath(fullPath);
+        if (!lockFd) {
+            debug("another optimizer is processing '%s', skipping", printStorePath(i));
+            skipped++;
+            done++;
+            act.progress(done, pathVec.size());
             continue;
         }
 
@@ -398,8 +570,10 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         // Mark path as optimised
         markPathOptimised(fullPath);
 
+        // lockFd goes out of scope here, automatically releasing the lock
+
         done++;
-        act.progress(done, paths.size());
+        act.progress(done, pathVec.size());
     }
 
     if (skipped > 0) {

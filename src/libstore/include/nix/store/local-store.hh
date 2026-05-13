@@ -238,6 +238,7 @@ public:
 
     const std::filesystem::path dbDir;
     const std::filesystem::path linksDir;
+    const std::filesystem::path linksShardedDir;
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
     const std::filesystem::path tempRootsDir;
@@ -389,6 +390,13 @@ public:
      * Mark a store path as optimised using xattrs.
      */
     void markPathOptimised(const std::filesystem::path & path);
+
+    /**
+     * Try to claim a path for optimization (prevents duplicate work with concurrent optimizers).
+     * Uses flock() for atomic locking. Lock is automatically released when fd closes or process dies.
+     * Returns file descriptor if claimed (caller must keep it open), empty if another optimizer has it.
+     */
+    AutoCloseFD tryClaimPath(const std::filesystem::path & path);
 
     bool verifyStore(bool checkContents, RepairFlag repair) override;
 

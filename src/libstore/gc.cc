@@ -3,6 +3,7 @@
 #include "nix/store/local-settings.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/path.hh"
+#include "nix/util/base-nix-32.hh"
 #include "nix/util/configuration.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/finally.hh"
@@ -817,34 +818,46 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
         printInfo("deleting unused links...");
 
-        AutoCloseDir dir(opendir(linksDir.string().c_str()));
-        if (!dir)
-            throw SysError("opening directory %1%", PathFmt(linksDir));
-
         int64_t actualSize = 0, unsharedSize = 0;
 
-        struct dirent * dirent;
-        while (errno = 0, dirent = readdir(dir.get())) {
-            checkInterrupt();
-            std::string name = dirent->d_name;
-            if (name == "." || name == "..")
-                continue;
-            auto path = linksDir / name;
+        // Helper to clean up links in a directory
+        auto cleanupLinksDir = [&](const std::filesystem::path & dir) {
+            AutoCloseDir d(opendir(dir.string().c_str()));
+            if (!d) return;  // Directory might not exist
 
-            auto st = lstat(path);
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(d.get())) {
+                checkInterrupt();
+                std::string name = dirent->d_name;
+                if (name == "." || name == "..")
+                    continue;
+                auto path = dir / name;
 
-            if (st.st_nlink != 1) {
-                actualSize += st.st_size;
-                unsharedSize += (st.st_nlink - 1) * st.st_size;
-                continue;
+                auto st = lstat(path);
+
+                if (st.st_nlink != 1) {
+                    actualSize += st.st_size;
+                    unsharedSize += (st.st_nlink - 1) * st.st_size;
+                    continue;
+                }
+
+                printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
+                unlink(path);
             }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(dir));
+        };
 
-            printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
+        // Clean up old SHA256 links in .links/
+        cleanupLinksDir(linksDir);
 
-            unlink(path);
-
-            /* Do not account for deleted file here. Rely on deletePath()
-               accounting.  */
+        // Clean up SHA256 links in .links/sha256/XX/ (all 1024 Nix32 shards)
+        for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+            for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                checkInterrupt();
+                char shard[3] = {BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                cleanupLinksDir(linksShardedDir / shard);
+            }
         }
 
         int64_t overhead =
