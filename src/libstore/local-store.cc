@@ -147,11 +147,14 @@ LocalStore::LocalStore(ref<const Config> config)
     }
     createDirs(linksDir);
     createDirs(linksShardedDir);
-    // Pre-create all 1024 shard directories for Nix32 2-character prefixes
-    for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-        for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-            char shard[3] = {BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-            createDirs(linksShardedDir / shard);
+    // Pre-create all 2048 shard directories for Nix32 3-character prefixes
+    // First character is always '0' or '1' due to Nix32 encoding bias
+    for (size_t first = 0; first < 2; ++first) {
+        for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+            for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                char shard[4] = {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                createDirs(linksShardedDir / shard);
+            }
         }
     }
     auto profilesDir = config->stateDir.get() / "profiles";
@@ -1402,30 +1405,32 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 
         printInfo("checking sharded link hashes...");
 
-        for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-            for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                checkInterrupt();
-                char shard[3] = {BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                auto shardDir = linksShardedDir / shard;
-                if (!std::filesystem::exists(shardDir)) {
-                    continue;
-                }
-                for (auto & link : DirectoryIterator{shardDir}) {
+        for (size_t first = 0; first < 2; ++first) {
+            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
                     checkInterrupt();
-                    auto name = link.path().filename().string();
-                    printMsg(lvlTalkative, "checking contents of %s", PathFmt(link.path()));
-                    std::string hash =
-                        hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
-                            .first.to_string(HashFormat::Nix32, false);
-                    auto expectedHash = name.substr(0, name.find('.'));
-                    if (hash != expectedHash) {
-                        printError(
-                            "link %s was modified! expected hash %s, got '%s'", PathFmt(link.path()), expectedHash, hash);
-                        if (repair) {
-                            unlinkIfExists(link.path());
-                            printInfo("removed link %s", PathFmt(link.path()));
-                        } else {
-                            errors = true;
+                    char shard[4] = {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                    auto shardDir = linksShardedDir / shard;
+                    if (!std::filesystem::exists(shardDir)) {
+                        continue;
+                    }
+                    for (auto & link : DirectoryIterator{shardDir}) {
+                        checkInterrupt();
+                        auto name = link.path().filename().string();
+                        printMsg(lvlTalkative, "checking contents of %s", PathFmt(link.path()));
+                        std::string hash =
+                            hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
+                                .first.to_string(HashFormat::Nix32, false);
+                        auto expectedHash = name.substr(0, name.find('.'));
+                        if (hash != expectedHash) {
+                            printError(
+                                "link %s was modified! expected hash %s, got '%s'", PathFmt(link.path()), expectedHash, hash);
+                            if (repair) {
+                                unlinkIfExists(link.path());
+                                printInfo("removed link %s", PathFmt(link.path()));
+                            } else {
+                                errors = true;
+                            }
                         }
                     }
                 }

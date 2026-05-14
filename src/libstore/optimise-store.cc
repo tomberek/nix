@@ -161,25 +161,27 @@ LocalStore::InodeHash LocalStore::loadInodeHash()
         }
     }
 
-    // Load SHA256 links from .links/sha256/XX/ (sharded layout)
-    for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-        for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-            checkInterrupt();
-            char shard[3] = {BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-            auto shardPath = linksShardedDir / shard;
-
-            AutoCloseDir shardDir(opendir(shardPath.string().c_str()));
-            if (!shardDir) {
-                continue;
-            }
-
-            struct dirent * dirent;
-            while (errno = 0, dirent = readdir(shardDir.get())) {
+    // Load SHA256 links from .links/sha256/XXX/ (sharded layout, 2048 shards)
+    for (size_t first = 0; first < 2; ++first) {
+        for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+            for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
                 checkInterrupt();
-                inodeHash.insert(dirent->d_ino);
+                char shard[4] = {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                auto shardPath = linksShardedDir / shard;
+
+                AutoCloseDir shardDir(opendir(shardPath.string().c_str()));
+                if (!shardDir) {
+                    continue;
+                }
+
+                struct dirent * dirent;
+                while (errno = 0, dirent = readdir(shardDir.get())) {
+                    checkInterrupt();
+                    inodeHash.insert(dirent->d_ino);
+                }
+                if (errno)
+                    throw SysError("reading directory %1%", PathFmt(shardPath));
             }
-            if (errno)
-                throw SysError("reading directory %1%", PathFmt(shardPath));
         }
     }
 
@@ -291,10 +293,10 @@ void LocalStore::optimisePath_(
     std::string hashStr = hash.to_string(HashFormat::Nix32, false);
     debug("%s has hash '%s'", PathFmt(path), hashStr);
 
-    // Sharded link path: .links/sha256/xy/ab12cdef...xyz.000
-    // Use last 2 chars for shard (more uniform distribution than first 2)
+    // Sharded link path: .links/sha256/0ab/0ab12cdef...xyz.000
+    // Use first 3 chars for shard (first char is always '0' or '1', giving 2048 shards)
     // All filenames end in .NNN for uniformity (base is .000)
-    std::string shard = hashStr.substr(hashStr.length() - 2, 2);
+    std::string shard = hashStr.substr(0, 3);
     std::filesystem::path shardDir = linksShardedDir / shard;
     std::filesystem::path linkPath = shardDir / (hashStr + ".000");
 

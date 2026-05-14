@@ -851,12 +851,14 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         // Clean up old SHA256 links in .links/
         cleanupLinksDir(linksDir);
 
-        // Clean up SHA256 links in .links/sha256/XX/ (all 1024 Nix32 shards)
-        for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-            for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                checkInterrupt();
-                char shard[3] = {BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                cleanupLinksDir(linksShardedDir / shard);
+        // Clean up SHA256 links in .links/sha256/XXX/ (all 2048 Nix32 shards)
+        for (size_t first = 0; first < 2; ++first) {
+            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                    checkInterrupt();
+                    char shard[4] = {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                    cleanupLinksDir(linksShardedDir / shard);
+                }
             }
         }
 
