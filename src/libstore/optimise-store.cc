@@ -30,7 +30,11 @@
 namespace nix {
 
 #if NIX_SUPPORT_ACL
-static constexpr const char* XATTR_OPTIMISED = "user.nix.optimised";
+// Use trusted.* namespace:
+// - Works on all file types (including symlinks)
+// - Requires CAP_SYS_ADMIN (nix-daemon has this)
+// - Non-root users can't read it, so they get no optimization (acceptable)
+static constexpr const char* XATTR_OPTIMISED = "trusted.nix.optimised";
 #endif
 
 static void makeWritable(const std::filesystem::path & path)
@@ -75,6 +79,11 @@ bool LocalStore::isPathOptimised(const std::filesystem::path & path) const
             }
             return false;
         }
+        // EPERM/EACCES means trusted.* but no CAP_SYS_ADMIN (non-root user)
+        // Return false so non-root users re-process (slower but correct)
+        if (errno == EPERM || errno == EACCES) {
+            return false;
+        }
         // No xattr (ENODATA/ENOATTR) = not optimised
         return false;
     }
@@ -92,7 +101,9 @@ void LocalStore::markPathOptimised(const std::filesystem::path & path)
 
     if (lsetxattr(path.c_str(), XATTR_OPTIMISED, timestamp.c_str(),
                   timestamp.size(), 0) < 0) {
-        if (errno != ENOTSUP && errno != EOPNOTSUPP && errno != EROFS) {
+        if (errno != ENOTSUP && errno != EOPNOTSUPP && errno != EROFS &&
+            errno != EPERM && errno != EACCES) {
+            // Log unexpected errors, but ignore permission errors (non-root users)
             debug("failed to mark path optimised: %s", strerror(errno));
         }
         // Don't fail optimization if xattr fails
@@ -140,6 +151,9 @@ LocalStore::InodeHash LocalStore::loadInodeHash()
             struct dirent * dirent;
             while (errno = 0, dirent = readdir(dir.get())) {
                 checkInterrupt();
+                std::string name = dirent->d_name;
+                if (name == "." || name == ".." || name == "sha256")
+                    continue;
                 inodeHash.insert(dirent->d_ino);
             }
             if (errno)
@@ -559,8 +573,12 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
 
         // Only do DB operations for paths that need optimization
         addTempRoot(i);
-        if (!isValidPath(i))
-            continue; /* path was GC'ed, probably */
+        if (!isValidPath(i)) {
+            /* path was GC'ed, probably */
+            done++;
+            act.progress(done, pathVec.size());
+            continue;
+        }
 
         {
             Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
