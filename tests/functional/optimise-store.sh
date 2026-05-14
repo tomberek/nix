@@ -65,11 +65,11 @@ if [ "$links_contents" != "sha256" ] && [ -n "$links_contents" ]; then
     exit 1
 fi
 
-# Check that sha256 shard directories are empty after GC
+# Check that sha256 shard and overflow directories are empty after GC
 if [ -d "$NIX_STORE_DIR"/.links/sha256 ]; then
-    for shard in "$NIX_STORE_DIR"/.links/sha256/*/; do
-        if [ -n "$(ls "$shard" 2>/dev/null || true)" ]; then
-            echo ".links/sha256 shard directory not empty after GC: $shard"
+    for dir in "$NIX_STORE_DIR"/.links/sha256/*/; do
+        if [ -n "$(ls "$dir" 2>/dev/null || true)" ]; then
+            echo ".links/sha256 directory not empty after GC: $dir"
             exit 1
         fi
     done

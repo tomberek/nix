@@ -3,7 +3,6 @@
 #include "nix/store/local-settings.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/path.hh"
-#include "nix/util/base-nix-32.hh"
 #include "nix/util/configuration.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/finally.hh"
@@ -851,15 +850,18 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         // Clean up old SHA256 links in .links/
         cleanupLinksDir(linksDir);
 
-        // Clean up SHA256 links in .links/sha256/XXX/ (all 2048 Nix32 shards)
-        for (size_t first = 0; first < 2; ++first) {
-            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                    checkInterrupt();
-                    char shard[4] = {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                    cleanupLinksDir(linksShardedDir / shard);
-                }
+        // Clean up all subdirectories of .links/sha256/ (shards + overflow + any future)
+        AutoCloseDir shardedRoot(opendir(linksShardedDir.string().c_str()));
+        if (shardedRoot) {
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(shardedRoot.get())) {
+                checkInterrupt();
+                std::string name = dirent->d_name;
+                if (name == "." || name == "..") continue;
+                cleanupLinksDir(linksShardedDir / name);
             }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(linksShardedDir));
         }
 
         int64_t overhead =

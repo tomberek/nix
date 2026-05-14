@@ -130,6 +130,7 @@ LocalStore::LocalStore(ref<const Config> config)
     , dbDir(config->stateDir.get() / "db")
     , linksDir(config->realStoreDir.get() / ".links")
     , linksShardedDir(linksDir / "sha256")
+    , linksOverflowDir(linksShardedDir / "overflow")
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -147,6 +148,7 @@ LocalStore::LocalStore(ref<const Config> config)
     }
     createDirs(linksDir);
     createDirs(linksShardedDir);
+    createDirs(linksOverflowDir);
     // Pre-create all 2048 shard directories for Nix32 3-character prefixes
     // First character is always '0' or '1' due to Nix32 encoding bias
     for (size_t first = 0; first < 2; ++first) {
@@ -1405,32 +1407,26 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 
         printInfo("checking sharded link hashes...");
 
-        for (size_t first = 0; first < 2; ++first) {
-            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+        if (std::filesystem::exists(linksShardedDir)) {
+            for (auto & subdir : DirectoryIterator{linksShardedDir}) {
+                checkInterrupt();
+                if (!subdir.is_directory()) continue;
+                for (auto & link : DirectoryIterator{subdir.path()}) {
                     checkInterrupt();
-                    char shard[4] = {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                    auto shardDir = linksShardedDir / shard;
-                    if (!std::filesystem::exists(shardDir)) {
-                        continue;
-                    }
-                    for (auto & link : DirectoryIterator{shardDir}) {
-                        checkInterrupt();
-                        auto name = link.path().filename().string();
-                        printMsg(lvlTalkative, "checking contents of %s", PathFmt(link.path()));
-                        std::string hash =
-                            hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
-                                .first.to_string(HashFormat::Nix32, false);
-                        auto expectedHash = name.substr(0, name.find('.'));
-                        if (hash != expectedHash) {
-                            printError(
-                                "link %s was modified! expected hash %s, got '%s'", PathFmt(link.path()), expectedHash, hash);
-                            if (repair) {
-                                unlinkIfExists(link.path());
-                                printInfo("removed link %s", PathFmt(link.path()));
-                            } else {
-                                errors = true;
-                            }
+                    auto name = link.path().filename().string();
+                    printMsg(lvlTalkative, "checking contents of %s", PathFmt(link.path()));
+                    std::string hash =
+                        hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
+                            .first.to_string(HashFormat::Nix32, false);
+                    auto expectedHash = name.substr(0, name.find('.'));
+                    if (hash != expectedHash) {
+                        printError(
+                            "link %s was modified! expected hash %s, got '%s'", PathFmt(link.path()), expectedHash, hash);
+                        if (repair) {
+                            unlinkIfExists(link.path());
+                            printInfo("removed link %s", PathFmt(link.path()));
+                        } else {
+                            errors = true;
                         }
                     }
                 }

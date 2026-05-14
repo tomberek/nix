@@ -52,9 +52,9 @@ nix-collect-garbage
 if test -e "$outPath/foobar"; then false; fi
 
 # Check that the store is empty.
-# .links/sha256/ subdirectory will still exist (with empty shard directories)
+# .links/sha256/ subdirectory will still exist (with empty shard directories and overflow/)
 if [ -d "$NIX_STORE_DIR/.links/sha256" ]; then
-    # Remove empty shard directories
+    rmdir "$NIX_STORE_DIR/.links/sha256/overflow" 2>/dev/null || true
     rmdir "$NIX_STORE_DIR/.links/sha256"/* 2>/dev/null || true
     rmdir "$NIX_STORE_DIR/.links/sha256"
 fi

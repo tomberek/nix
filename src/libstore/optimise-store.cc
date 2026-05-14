@@ -161,28 +161,30 @@ LocalStore::InodeHash LocalStore::loadInodeHash()
         }
     }
 
-    // Load SHA256 links from .links/sha256/XXX/ (sharded layout, 2048 shards)
-    for (size_t first = 0; first < 2; ++first) {
-        for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-            for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+    // Load all links from .links/sha256/ subdirectories (shards + overflow)
+    AutoCloseDir shardedRoot(opendir(linksShardedDir.string().c_str()));
+    if (shardedRoot) {
+        struct dirent * subdirent;
+        while (errno = 0, subdirent = readdir(shardedRoot.get())) {
+            checkInterrupt();
+            std::string subname = subdirent->d_name;
+            if (subname == "." || subname == "..")
+                continue;
+            auto subPath = linksShardedDir / subname;
+
+            AutoCloseDir subDir(opendir(subPath.string().c_str()));
+            if (!subDir) continue;
+
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(subDir.get())) {
                 checkInterrupt();
-                char shard[4] = {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                auto shardPath = linksShardedDir / shard;
-
-                AutoCloseDir shardDir(opendir(shardPath.string().c_str()));
-                if (!shardDir) {
-                    continue;
-                }
-
-                struct dirent * dirent;
-                while (errno = 0, dirent = readdir(shardDir.get())) {
-                    checkInterrupt();
-                    inodeHash.insert(dirent->d_ino);
-                }
-                if (errno)
-                    throw SysError("reading directory %1%", PathFmt(shardPath));
+                inodeHash.insert(dirent->d_ino);
             }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(subPath));
         }
+        if (errno)
+            throw SysError("reading directory %1%", PathFmt(linksShardedDir));
     }
 
     printMsg(lvlTalkative, "loaded %1% hash inodes", inodeHash.size());
@@ -293,89 +295,12 @@ void LocalStore::optimisePath_(
     std::string hashStr = hash.to_string(HashFormat::Nix32, false);
     debug("%s has hash '%s'", PathFmt(path), hashStr);
 
-    // Sharded link path: .links/sha256/0ab/0ab12cdef...xyz.000
-    // Use first 3 chars for shard (first char is always '0' or '1', giving 2048 shards)
-    // All filenames end in .NNN for uniformity (base is .000)
+    // Sharded link path: .links/sha256/0ab/0ab12cdef...xyz
+    // Use first 3 chars for shard (first char is always ‘0’ or ‘1’, giving 2048 shards)
+    // Overflow replicas go in .links/sha256/overflow/HASH.001, .002, ...
     std::string shard = hashStr.substr(0, 3);
     std::filesystem::path shardDir = linksShardedDir / shard;
-    std::filesystem::path linkPath = shardDir / (hashStr + ".000");
-
-    /* Stat the link once, if it exists. */
-    auto stLink = maybeLstat(linkPath);
-
-    /* Maybe delete the link, if it has been corrupted. */
-    if (stLink) {
-        if (st.st_size != stLink->st_size || (repair && hash != ({
-                                                            hashPath(
-                                                                makeFSSourceAccessor(linkPath),
-                                                                FileSerialisationMethod::NixArchive,
-                                                                HashAlgorithm::SHA256)
-                                                                .hash;
-                                                        }))) {
-            // XXX: Consider overwriting linkPath with our valid version.
-            warn("removing corrupted link %s", PathFmt(linkPath));
-            warn(
-                "There may be more corrupted paths."
-                "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
-            unlinkIfExists(linkPath);
-            stLink.reset();
-        }
-    }
-
-    if (!stLink) {
-        /* Nope, create a hard link in the links directory. */
-        try {
-            std::filesystem::create_hard_link(path, linkPath);
-            inodeHash.insert(st.st_ino);
-            stLink = st;  // After hardlinking, linkPath has same stat as path
-        } catch (std::filesystem::filesystem_error & e) {
-            if (e.code() == std::errc::file_exists) {
-                /* Race: another optimiser created ‘linkPath’ before we did.
-                   Re-stat it and continue. */
-                stLink = lstat(linkPath);
-                inodeHash.insert(stLink->st_ino);
-            }
-
-            else if (e.code() == std::errc::no_such_file_or_directory) {
-                /* Source was GC’d mid-op - benign skip. */
-                debug("%1% was GC’d during optimization", PathFmt(path));
-                return;
-            }
-
-            else if (e.code() == std::errc::no_space_on_device) {
-                /* On ext4, that probably means the directory index is
-                   full.  When that happens, it’s fine to ignore it: we
-                   just effectively disable deduplication of this file. */
-                printInfo("cannot link %s to ‘%s’: %s", PathFmt(linkPath), PathFmt(path), e.code().message());
-                return;
-            }
-
-            else
-                throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(linkPath), PathFmt(path));
-        }
-    }
-
-    /* Yes!  We've seen a file with the same contents.  Replace the
-       current file with a hard link to that file. */
-
-    if (st.st_ino == stLink->st_ino) {
-        debug("%1% is already linked to %2%", PathFmt(path), PathFmt(linkPath));
-        return;
-    }
-
-    printMsg(lvlTalkative, "linking %1% to %2%", PathFmt(path), PathFmt(linkPath));
-
-    /* Make the containing directory writable, but only if it's not
-       the store itself (we don't want or need to mess with its
-       permissions). */
-    const auto dirOfPath = path.parent_path();
-    bool mustToggle = dirOfPath != config->realStoreDir.get();
-    if (mustToggle)
-        makeWritable(dirOfPath);
-
-    /* When we're done, make the directory read-only again and reset
-       its timestamp back to 0. */
-    MakeReadOnly makeReadOnly(mustToggle ? dirOfPath : std::filesystem::path{});
+    std::filesystem::path linkPath = shardDir / hashStr;
 
     std::filesystem::path tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
 
@@ -388,77 +313,96 @@ void LocalStore::optimisePath_(
         }
     });
 
-    // Try to create hard link, handling link limit with overflow suffixes
-    auto linkPathStr = linkPath.string();
-    std::string baseLinkPath = linkPathStr.substr(0, linkPathStr.size() - 4);
-
+    /* Try primary replica first, then overflow slots.
+       For each candidate:
+         1. Try create_hard_link(path, candidate) to ensure replica exists.
+            - EEXIST: fine, already there (possibly from another optimizer)
+            - EMLINK: path itself is full, give up entirely
+            - ENOENT: path was GC’d, give up entirely
+         2. Try create_hard_link(candidate, tempLink).
+            - EMLINK: this replica is full, try next overflow slot
+            - ENOENT: replica GC’d between steps, try next slot
+    */
+    std::optional<std::filesystem::path> replicaPath;
     for (int seq = 0; seq < 1000; ++seq) {
-        char suffix[8];
-        snprintf(suffix, sizeof(suffix), ".%03d", seq);
-        std::filesystem::path actualLinkPath = std::filesystem::path{baseLinkPath + suffix};
+        std::filesystem::path candidatePath = seq == 0
+            ? linkPath
+            : linksOverflowDir / (hashStr + fmt(".%03d", seq));
 
-        // Only stat if we don't have valid stLink (seq>0 or after error cleared it)
-        if (!stLink && seq > 0) {
-            stLink = maybeLstat(actualLinkPath);
-        }
-
-        if (!stLink) {
-            // Overflow link doesn't exist - create it (shard dirs pre-created)
-            try {
-                std::filesystem::create_hard_link(path, actualLinkPath);
-                stLink = st;
-            } catch (std::filesystem::filesystem_error & createErr) {
-                if (createErr.code() == std::errc::too_many_links) {
-                    // Can't create more links to path - unlikely but possible
-                    if (st.st_size)
-                        printInfo("%1% has maximum number of links", PathFmt(path));
-                    return;
-                } else if (createErr.code() == std::errc::file_exists) {
-                    // Race: another optimiser created this replica first
-                    // Re-stat it and continue
-                    stLink = maybeLstat(actualLinkPath);
-                    if (!stLink) {
-                        // GC'd between creation and our stat - try next seq
-                        continue;
-                    }
-                } else if (createErr.code() == std::errc::no_such_file_or_directory) {
-                    // Source was GC'd mid-op - skip this file
-                    debug("%1% was GC'd during optimization", PathFmt(path));
-                    return;
-                } else {
-                    throw SystemError(createErr.code(), "creating overflow link %1%", PathFmt(actualLinkPath));
-                }
+        // Step 1: ensure replica exists.
+        // In repair mode, check if an existing replica is corrupted and remove it.
+        if (repair) {
+            auto stReplica = maybeLstat(candidatePath);
+            if (stReplica && (st.st_size != stReplica->st_size ||
+                hash != hashPath(makeFSSourceAccessor(candidatePath), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash)) {
+                warn("removing corrupted link %s", PathFmt(candidatePath));
+                unlinkIfExists(candidatePath);
             }
         }
 
-        // Try to link tempLink to this overflow file
         try {
-            std::filesystem::create_hard_link(actualLinkPath, tempLink);
+            std::filesystem::create_hard_link(path, candidatePath);
+            inodeHash.insert(st.st_ino);
+        } catch (std::filesystem::filesystem_error & e) {
+            if (e.code() == std::errc::file_exists) {
+                // already exists - fine, proceed to step 2
+            } else if (e.code() == std::errc::too_many_links) {
+                // path itself is full - can’t optimise
+                if (st.st_size)
+                    printInfo("%1% has maximum number of links", PathFmt(path));
+                return;
+            } else if (e.code() == std::errc::no_such_file_or_directory) {
+                debug("%1% was GC’d during optimization", PathFmt(path));
+                return;
+            } else if (e.code() == std::errc::no_space_on_device) {
+                printInfo("cannot link %s to ‘%s’: %s", PathFmt(candidatePath), PathFmt(path), e.code().message());
+                return;
+            } else {
+                throw SystemError(e.code(), "creating link %1%", PathFmt(candidatePath));
+            }
+        }
+
+        // Step 2: link tempLink to replica - if full, try next overflow slot
+        try {
+            std::filesystem::create_hard_link(candidatePath, tempLink);
             tempLinkCreated = true;
-            // Re-stat to get actual inode (stLink could be stale from races)
-            auto actualSt = lstat(tempLink);
-            inodeHash.insert(actualSt.st_ino);
+            auto stTempLink = lstat(tempLink);
+            inodeHash.insert(stTempLink.st_ino);
+            /* Already linked to this replica - nothing to do. */
+            if (st.st_ino == stTempLink.st_ino) {
+                debug("%1% is already linked to %2%", PathFmt(path), PathFmt(candidatePath));
+                return;
+            }
+            replicaPath = candidatePath;
             break;
         } catch (std::filesystem::filesystem_error & e) {
             if (e.code() == std::errc::too_many_links) {
-                // This overflow file hit 32k link limit - try next sequence
-                stLink.reset(); // Clear to force re-stat on next iteration
-                continue;
+                continue; // replica full - try next overflow slot
             } else if (e.code() == std::errc::no_such_file_or_directory) {
-                // Replica was GC'd (very unlikely - st_nlink must be 1) or source was GC'd
-                // Try next sequence if it was the replica, return if source
-                stLink.reset(); // Clear to force re-stat on next iteration
-                continue;
+                continue; // replica GC’d between steps - try next slot
             }
-            throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(actualLinkPath), PathFmt(tempLink));
+            throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(candidatePath), PathFmt(tempLink));
         }
     }
 
-    if (!tempLinkCreated) {
-        if (st.st_size)
-            printInfo("%1% exceeded maximum overflow links (999)", PathFmt(baseLinkPath));
+    if (!replicaPath) {
+        printInfo("%1% exceeded maximum overflow replicas (999)", PathFmt(linkPath));
         return;
     }
+
+    printMsg(lvlTalkative, "linking %1% to %2%", PathFmt(path), PathFmt(*replicaPath));
+
+    /* Make the containing directory writable, but only if it’s not
+       the store itself (we don’t want or need to mess with its
+       permissions). */
+    const auto dirOfPath = path.parent_path();
+    bool mustToggle = dirOfPath != config->realStoreDir.get();
+    if (mustToggle)
+        makeWritable(dirOfPath);
+
+    /* When we’re done, make the directory read-only again and reset
+       its timestamp back to 0. */
+    MakeReadOnly makeReadOnly(mustToggle ? dirOfPath : std::filesystem::path{});
 
     /* Atomically replace the old file with the new hard link. */
     try {
@@ -470,7 +414,7 @@ void LocalStore::optimisePath_(
                rather than on the original link.  (Probably it
                temporarily increases the st_nlink field before
                decreasing it again.) */
-            debug("%s has reached maximum number of links", PathFmt(linkPath));
+            debug("%s has reached maximum number of links", PathFmt(*replicaPath));
             return;
         } else if (e.code() == std::errc::no_such_file_or_directory) {
             /* Source was GC'd between tempLink creation and rename.
@@ -615,8 +559,10 @@ void LocalStore::optimisePath(const std::filesystem::path & path, RepairFlag rep
     OptimiseStats stats;
     InodeHash inodeHash;
 
-    if (config->getLocalSettings().autoOptimiseStore)
+    if (config->getLocalSettings().autoOptimiseStore) {
         optimisePath_(nullptr, stats, path, inodeHash, repair);
+        markPathOptimised(path);
+    }
 }
 
 } // namespace nix
