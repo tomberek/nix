@@ -543,71 +543,39 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         deleteQueue = std::make_shared<Sync<std::vector<std::filesystem::path>>>();
         stopDeleter = std::make_shared<std::atomic<bool>>(false);
 
-        deleterThread.emplace(
-            [deleteQueue, stopDeleter, trashDir, linksDir = this->linksDir, config = this->config, &wakeup]() {
-                AutoCloseDir linksDir_fd(opendir(linksDir.string().c_str()));
-
-                while (!*stopDeleter) {
-                    std::vector<std::filesystem::path> batch;
-                    {
-                        auto queue = deleteQueue->lock();
-                        if (queue->empty()) {
-                            queue.wait_for(wakeup, std::chrono::milliseconds(100));
-                        } else {
-                            batch.swap(*queue);
-                        }
-                    }
-
-                    for (auto & trashedPath : batch) {
-                        if (*stopDeleter)
-                            break;
-                        uint64_t bytesFreed = 0;
-                        try {
-                            deletePath(trashedPath, bytesFreed);
-                        } catch (Interrupted & e) {
-                            break;
-                        } catch (SystemError & e) {
-                            if (!config->ignoreGcDeleteFailure)
-                                logError({.msg = HintFmt("background deletion failed: %1%", e.msg())});
-                        }
-                    }
-
-                    if (!*stopDeleter && batch.empty() && linksDir_fd) {
-                        for (int i = 0; i < 100 && !*stopDeleter; i++) {
-                            errno = 0;
-                            struct dirent * dirent = readdir(linksDir_fd.get());
-                            if (!dirent) {
-                                if (errno == 0) {
-                                    rewinddir(linksDir_fd.get());
-                                }
-                                break;
-                            }
-
-                            std::string name = dirent->d_name;
-                            if (name == "." || name == "..")
-                                continue;
-                            if (name.find('/') != std::string::npos)
-                                continue;
-
-                            auto path = linksDir / name;
-                            try {
-                                auto st = lstat(path);
-                                if (S_ISREG(st.st_mode) && st.st_nlink == 1)
-                                    unlink(path);
-                            } catch (...) {
-                            }
-                        }
+        deleterThread.emplace([deleteQueue, stopDeleter, trashDir, config = this->config, &wakeup]() {
+            while (!*stopDeleter) {
+                std::vector<std::filesystem::path> batch;
+                {
+                    auto queue = deleteQueue->lock();
+                    if (queue->empty()) {
+                        queue.wait_for(wakeup, std::chrono::milliseconds(100));
+                    } else {
+                        batch.swap(*queue);
                     }
                 }
 
-                if (!*stopDeleter) {
+                for (auto & trashedPath : batch) {
+                    if (*stopDeleter)
+                        break;
+                    uint64_t bytesFreed = 0;
                     try {
-                        std::filesystem::remove_all(trashDir);
-                    } catch (...) {
-                        ignoreExceptionExceptInterrupt();
+                        deletePath(trashedPath, bytesFreed);
+                    } catch (Interrupted & e) {
+                        break;
+                    } catch (SystemError & e) {
+                        if (!config->ignoreGcDeleteFailure)
+                            logError({.msg = HintFmt("background deletion failed: %1%", e.msg())});
                     }
                 }
-            });
+            }
+
+            try {
+                std::filesystem::remove_all(trashDir);
+            } catch (...) {
+                ignoreExceptionExceptInterrupt();
+            }
+        });
     }
 
     Finally stopDeleterThread([&] {
@@ -656,26 +624,21 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         for (auto & path : roots)
             rootHashes.insert(std::string(path.hashPart()));
 
-        /* Expand roots by one hop based on keep-* settings.
-           This is cheap (indexed SQL lookups) and sufficient because the main
-           SQL query already protects paths with referrers transitively. We only
-           need to protect immediate neighbors of roots that might be leafs. */
+        /* The leaf SQL query only knows about the Refs edge, so paths kept
+           alive only via deriver/output edges look like leaves to it. Walk
+           the full alive closure under keep-* semantics and add every
+           reachable path to rootHashes. Bounded by alive-set size. */
         if (gcSettings.keepDerivations || gcSettings.keepOutputs) {
-            for (auto & root : roots) {
-                if (gcSettings.keepDerivations) {
-                    /* Protect derivers of rooted outputs (may be leafs with no referrers) */
-                    auto derivers = queryValidDerivers(root);
-                    for (auto & drv : derivers)
-                        rootHashes.insert(std::string(drv.hashPart()));
-                }
-
-                if (gcSettings.keepOutputs && root.isDerivation()) {
-                    /* Protect outputs of rooted derivations (may be leafs with no referrers) */
-                    for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(root))
-                        if (maybeOutPath && isValidPath(*maybeOutPath))
-                            rootHashes.insert(std::string(maybeOutPath->hashPart()));
-                }
-            }
+            StorePathSet rootSet(roots.begin(), roots.end());
+            StorePathSet aliveClosure;
+            computeFSClosure(
+                rootSet,
+                aliveClosure,
+                /* flipDirection */ false,
+                /* includeOutputs */ gcSettings.keepOutputs,
+                /* includeDerivers */ gcSettings.keepDerivations);
+            for (auto & p : aliveClosure)
+                rootHashes.insert(std::string(p.hashPart()));
         }
 
         /* Prepare SQL statement once for both dry-run and actual deletion */
@@ -715,6 +678,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
            Multiple rounds delete deeper dependency chains in one GC run,
            amortizing the expensive root-finding phase. */
         uint64_t totalDeleted = 0;
+        bool limitReached = false;
 
         for (uint64_t round = 1; round <= options.pruneRounds; round++) {
             uint64_t roundDeleted = 0;
