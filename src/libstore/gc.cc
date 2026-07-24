@@ -514,8 +514,16 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
 #endif
 
-    /* For fast GC with --prune-older-than, set up background deletion thread */
-    std::optional<std::thread> deleterThread;
+    /* For fast GC with --prune-older-than, set up a small pool of
+       background deletion threads. Each trashed store path is its own
+       subdir under trashDir, so workers unlink disjoint filesystem
+       subtrees and don't contend on any shared inodes beyond the trashDir
+       parent itself. Sizing: unlink is disk-metadata-bound, and ext4
+       serialises on the containing dir's htree lock, so returns diminish
+       fast. 4 workers is enough to keep the NVMe queue saturated without
+       thrashing. */
+    constexpr size_t deleterThreadCount = 4;
+    std::vector<std::thread> deleterThreads;
     std::shared_ptr<Sync<std::vector<std::filesystem::path>>> deleteQueue;
     std::shared_ptr<std::atomic<bool>> stopDeleter;
     std::filesystem::path trashDir;
@@ -545,47 +553,47 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         deleteQueue = std::make_shared<Sync<std::vector<std::filesystem::path>>>();
         stopDeleter = std::make_shared<std::atomic<bool>>(false);
 
-        deleterThread.emplace([deleteQueue, stopDeleter, trashDir, config = this->config, &wakeup]() {
-            while (!*stopDeleter) {
-                std::vector<std::filesystem::path> batch;
-                {
-                    auto queue = deleteQueue->lock();
-                    if (queue->empty()) {
-                        queue.wait_for(wakeup, std::chrono::milliseconds(100));
-                    } else {
-                        batch.swap(*queue);
+        for (size_t i = 0; i < deleterThreadCount; ++i) {
+            deleterThreads.emplace_back([deleteQueue, stopDeleter, config = this->config, &wakeup]() {
+                while (true) {
+                    std::filesystem::path trashedPath;
+                    {
+                        auto queue = deleteQueue->lock();
+                        while (queue->empty() && !*stopDeleter)
+                            queue.wait_for(wakeup, std::chrono::milliseconds(100));
+                        if (queue->empty() && *stopDeleter)
+                            return;
+                        trashedPath = std::move(queue->back());
+                        queue->pop_back();
                     }
-                }
 
-                for (auto & trashedPath : batch) {
-                    if (*stopDeleter)
-                        break;
                     uint64_t bytesFreed = 0;
                     try {
                         deletePath(trashedPath, bytesFreed);
                     } catch (Interrupted & e) {
-                        break;
+                        return;
                     } catch (SystemError & e) {
                         if (!config->ignoreGcDeleteFailure)
                             logError({.msg = HintFmt("background deletion failed: %1%", e.msg())});
                     }
                 }
-            }
+            });
+        }
+    }
 
+    Finally stopDeleterThreads([&] {
+        if (stopDeleter) {
+            *stopDeleter = true;
+            wakeup.notify_all();
+            for (auto & t : deleterThreads)
+                if (t.joinable())
+                    t.join();
+            /* All workers have finished; safe to remove the (now-empty) trashDir. */
             try {
                 std::filesystem::remove_all(trashDir);
             } catch (...) {
                 ignoreExceptionExceptInterrupt();
             }
-        });
-    }
-
-    Finally stopDeleterThread([&] {
-        if (stopDeleter) {
-            *stopDeleter = true;
-            wakeup.notify_all();
-            if (deleterThread && deleterThread->joinable())
-                deleterThread->join();
         }
     });
 
