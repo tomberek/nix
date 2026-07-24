@@ -15,6 +15,8 @@
 
 #include "store-config-private.hh"
 
+#include <sqlite3.h>
+
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <boost/regex.hpp>
@@ -620,48 +622,93 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
 
         auto cutoffTime = time(nullptr) - *options.pruneOlderThan;
-        boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> rootHashes;
-        for (auto & path : roots)
-            rootHashes.insert(std::string(path.hashPart()));
 
-        /* The leaf SQL query only knows about the Refs edge, so paths kept
-           alive only via deriver/output edges look like leaves to it. Walk
-           the full alive closure under keep-* semantics and add every
-           reachable path to rootHashes. Bounded by alive-set size. */
-        if (gcSettings.keepDerivations || gcSettings.keepOutputs) {
-            StorePathSet rootSet(roots.begin(), roots.end());
-            StorePathSet aliveClosure;
-            computeFSClosure(
-                rootSet,
-                aliveClosure,
-                /* flipDirection */ false,
-                /* includeOutputs */ gcSettings.keepOutputs,
-                /* includeDerivers */ gcSettings.keepDerivations);
-            for (auto & p : aliveClosure)
-                rootHashes.insert(std::string(p.hashPart()));
+        /* Compute the alive-id set inside sqlite via a recursive CTE and
+           materialise it into a temp table for the leaf-selection query
+           to anti-join against. This replaces a C++ computeFSClosure walk
+           that costs ~1 sqlite roundtrip per alive path (millions on a
+           real store) with one B-tree traversal inside the DB.
+
+           Locking discipline matches the rest of this function: extract
+           the connection pointer under the state lock, then use it while
+           holding gc.lock (the process-level flock) for serialisation. */
+        SQLiteStmt stmt;
+        {
+            auto state(_state->lock());
+            sqlite3 * db = state->db;
+
+            auto execSql = [&](const std::string & sql) {
+                if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK)
+                    SQLiteError::throw_(db, "executing SQL '%s'", sql);
+            };
+
+            SQLiteTxn txn(db);
+
+            execSql("drop table if exists temp.AliveGCRoots");
+            execSql("create temp table AliveGCRoots (path text primary key not null)");
+            execSql("drop table if exists temp.AliveGC");
+            execSql("create temp table AliveGC (id integer primary key not null)");
+
+            /* Seed the roots temp table. */
+            {
+                SQLiteStmt insertRoot;
+                insertRoot.create(db, "insert or ignore into AliveGCRoots(path) values (?)");
+                for (auto & p : roots)
+                    insertRoot.use()(printStorePath(p)).exec();
+            }
+
+            /* Build the recursive CTE. Edge branches are only included
+               when the corresponding keep-* setting is on so the query
+               planner isn't asked to consider dead branches. */
+            std::string recursiveBranches =
+                "select r.reference from Refs r join Alive a on r.referrer = a.id";
+            if (gcSettings.keepOutputs)
+                recursiveBranches +=
+                    " union"
+                    " select v.id from Alive a"
+                    "   join DerivationOutputs d on d.drv = a.id"
+                    "   join ValidPaths v on v.path = d.path";
+            if (gcSettings.keepDerivations)
+                recursiveBranches +=
+                    " union"
+                    " select deriv.id from Alive a"
+                    "   join ValidPaths child on child.id = a.id"
+                    "   join ValidPaths deriv on deriv.path = child.deriver"
+                    "   where child.deriver is not null";
+
+            execSql(
+                "insert into AliveGC(id)"
+                " with recursive Alive(id) as ("
+                "   select v.id from ValidPaths v join AliveGCRoots r on v.path = r.path"
+                "   union"
+                "   " + recursiveBranches +
+                " )"
+                " select id from Alive");
+
+            txn.commit();
+
+            /* Prepare the leaf-selection statement under the same lock. */
+            stmt.create(db, R"(
+                SELECT v.path, v.narSize FROM ValidPaths v
+                WHERE v.registrationTime < ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM Refs r
+                    WHERE r.reference = v.id AND r.reference != r.referrer
+                  )
+                  AND v.id NOT IN (SELECT id FROM AliveGC)
+            )");
         }
 
-        /* Prepare SQL statement once for both dry-run and actual deletion */
-        SQLiteStmt stmt;
-        stmt.create(_state->lock()->db, R"(
-            SELECT v.path, v.narSize FROM ValidPaths v
-            WHERE v.registrationTime < ?
-              AND NOT EXISTS (
-                SELECT 1 FROM Refs r
-                WHERE r.reference = v.id AND r.reference != r.referrer
-              )
-        )");
-
-        /* Dry-run mode: just report what would be deleted */
+        /* Dry-run mode: just report what would be deleted. The alive set
+           (permanent + temp roots at GC start, plus their keep-* closure)
+           is already excluded by the SQL query; only temp roots created
+           after the CTE ran need a runtime check. */
         if (options.action == GCOptions::gcReturnDead) {
             auto use = stmt.use()(cutoffTime);
             while (use.next()) {
                 auto path = use.getStr(0);
                 auto narSize = use.isNull(1) ? 0 : use.getInt(1);
                 auto hash = std::string(parseStorePath(path).hashPart());
-
-                if (rootHashes.count(hash))
-                    continue;
 
                 auto shared(_shared.lock());
                 if (shared->tempRoots.contains(hash))
@@ -689,9 +736,6 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     auto path = use.getStr(0);
                     auto narSize = use.isNull(1) ? 0 : use.getInt(1);
                     auto hash = std::string(parseStorePath(path).hashPart());
-
-                    if (rootHashes.count(hash))
-                        continue;
 
                     bool shouldDelete = false;
                     {
