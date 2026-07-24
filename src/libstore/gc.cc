@@ -376,9 +376,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         // ignore suffixes like '.lock', '.chroot' and '.check'.
         boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> tempRoots;
 
-        // Hash part of the store path currently being deleted, if
-        // any.
-        std::optional<std::string> pending;
+        // Hash parts of store paths currently being deleted. Clients trying
+        // to add a temp root for one of these paths must wait until deletion
+        // is complete. A set (rather than a single optional) so that a
+        // batched deletion in fast GC can mark all of its in-flight paths at
+        // once; the traditional GC uses a single-element set.
+        boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>> pending;
     };
 
     Sync<Shared> _shared;
@@ -486,7 +489,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                                    done. FIXME: ideally we would use a
                                    FD for this so we don't block the
                                    poll loop. */
-                                while (shared->pending == hashPart) {
+                                while (shared->pending.contains(hashPart)) {
                                     debug("synchronising with deletion of path '%s'", path);
                                     shared.wait(wakeup);
                                 }
@@ -730,13 +733,107 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
 
         /* Multi-round deletion: delete current leafs in each round.
-           Multiple rounds delete deeper dependency chains in one GC run,
-           amortizing the expensive root-finding phase. */
+           Within a round, invalidations are batched into a single
+           SQLiteTxn to collapse the ~500 individual DELETE transactions
+           into one bulk write. Each individual DELETE otherwise contends
+           on SQLITE_BUSY with concurrent readers (e.g. long-lived
+           nix-daemon connections holding old WAL snapshots), and a
+           single-path retry storm can drop throughput from thousands of
+           writes/s to tens of writes/s. */
+        constexpr size_t invalidateBatchSize = 256;
         uint64_t totalDeleted = 0;
-        bool limitReached = false;
+
+        /* Represents a path selected for deletion in the current batch. */
+        struct Pending
+        {
+            std::string path;
+            std::string hash;
+            std::filesystem::path realPath;
+            std::filesystem::path trashPath;
+            int64_t narSize;
+        };
 
         for (uint64_t round = 1; round <= options.pruneRounds; round++) {
             uint64_t roundDeleted = 0;
+            bool limitReached = false;
+
+            /* Flush a batch: bulk-invalidate in one txn, then move files to
+               trash and enqueue for background unlink. tempRoots-pending
+               entries stay set until this returns. */
+            auto flushBatch = [&](std::vector<Pending> & batch) {
+                if (batch.empty())
+                    return;
+
+                /* Step 1: bulk-invalidate DB in one transaction. On busy,
+                   retrySQLite retries the whole batch. */
+                retrySQLite<void>([&]() {
+                    auto state(_state->lock());
+                    sqlite3 * db = state->db;
+
+                    auto execSql = [&](const std::string & sql) {
+                        if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK)
+                            SQLiteError::throw_(db, "executing SQL '%s'", sql);
+                    };
+
+                    SQLiteTxn txn(db);
+
+                    execSql("drop table if exists temp.InvalidateBatch");
+                    execSql("create temp table InvalidateBatch (path text primary key not null)");
+
+                    {
+                        SQLiteStmt ins;
+                        ins.create(db, "insert into InvalidateBatch(path) values (?)");
+                        for (auto & p : batch)
+                            ins.use()(p.path).exec();
+                    }
+
+                    /* Foreign keys on Refs cascade from ValidPaths on delete,
+                       so this single DELETE cleans up Refs rows too. */
+                    execSql("delete from ValidPaths where path in (select path from InvalidateBatch)");
+                    execSql("drop table temp.InvalidateBatch");
+
+                    txn.commit();
+
+                    for (auto & p : batch)
+                        invalidatePathInfoCacheFor(parseStorePath(p.path));
+                });
+
+                /* Step 2: rename each path to .gc-trash and enqueue for
+                   background unlink. If a rename fails and
+                   ignoreGcDeleteFailure is set, we log and continue —
+                   the DB is already invalidated so the orphan file
+                   just wastes space until the next verify/GC. */
+                for (auto & p : batch) {
+                    try {
+                        std::filesystem::rename(p.realPath, p.trashPath);
+                        deleteQueue->lock()->push_back(p.trashPath);
+                        if (p.narSize > 0)
+                            results.bytesFreed += p.narSize;
+                    } catch (std::filesystem::filesystem_error & e) {
+                        if (!config->ignoreGcDeleteFailure)
+                            throw;
+                        logWarning({.msg = HintFmt("ignoring GC failure for %1%: %2%", PathFmt(p.realPath), e.what())});
+                    }
+                }
+                wakeup.notify_all();
+
+                /* Step 3: clear the pending set (used by build clients to
+                   block until in-flight deletions complete). */
+                {
+                    auto shared(_shared.lock());
+                    for (auto & p : batch)
+                        shared->pending.erase(p.hash);
+                    wakeup.notify_all();
+                }
+
+                roundDeleted += batch.size();
+                totalDeleted += batch.size();
+                batch.clear();
+            };
+
+            std::vector<Pending> batch;
+            batch.reserve(invalidateBatchSize);
+
             try {
                 auto use = stmt.use()(cutoffTime);
                 while (use.next()) {
@@ -745,58 +842,44 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     auto narSize = use.isNull(1) ? 0 : use.getInt(1);
                     auto hash = std::string(parseStorePath(path).hashPart());
 
-                    bool shouldDelete = false;
+                    /* Check tempRoots at batch-collection time and mark
+                       this path as pending so clients trying to add a
+                       temp root for it will wait until we finish. */
                     {
                         auto shared(_shared.lock());
-                        if (!shared->tempRoots.contains(hash)) {
-                            shared->pending = hash;
-                            shouldDelete = true;
-                        }
+                        if (shared->tempRoots.contains(hash))
+                            continue;
+                        shared->pending.insert(hash);
                     }
-                    if (!shouldDelete)
-                        continue;
 
-                    Finally clearPending([&] {
-                        auto shared(_shared.lock());
-                        shared->pending.reset();
-                        wakeup.notify_all();
-                    });
-
-                    auto realPath = config->realStoreDir.get() / baseNameOf(path);
-                    auto trashPath = trashDir / (hash + "-" + std::to_string(totalDeleted));
+                    Pending p{
+                        .path = path,
+                        .hash = hash,
+                        .realPath = config->realStoreDir.get() / baseNameOf(path),
+                        .trashPath = trashDir / (hash + "-" + std::to_string(totalDeleted + batch.size())),
+                        .narSize = narSize,
+                    };
 
                     printInfo("deleting '%s'", path);
                     results.paths.insert(path);
+                    batch.push_back(std::move(p));
 
-                    try {
-                        /* Invalidate in DB first */
-                        invalidatePathChecked(parseStorePath(path));
+                    if (batch.size() >= invalidateBatchSize)
+                        flushBatch(batch);
 
-                        /* Atomic move to trash (replaces slow deleteStorePath) */
-                        std::filesystem::rename(realPath, trashPath);
-
-                        /* Queue for background unlink */
-                        deleteQueue->lock()->push_back(trashPath);
-                        wakeup.notify_all();
-
-                        /* Use narSize for byte accounting */
-                        if (narSize > 0)
-                            results.bytesFreed += narSize;
-                        roundDeleted++;
-                        totalDeleted++;
-                        if (results.bytesFreed >= options.maxFreed)
-                            throw GCLimitReached();
-                    } catch (std::filesystem::filesystem_error & e) {
-                        if (!config->ignoreGcDeleteFailure)
-                            throw;
-                        logWarning({.msg = HintFmt("ignoring GC failure for %1%: %2%", PathFmt(realPath), e.what())});
-                    } catch (Error & e) {
-                        if (!config->ignoreGcDeleteFailure)
-                            throw;
-                        logWarning({.msg = HintFmt("ignoring GC failure for %1%: %2%", PathFmt(realPath), e.msg())});
+                    if (results.bytesFreed >= options.maxFreed) {
+                        limitReached = true;
+                        break;
                     }
                 }
             } catch (GCLimitReached &) {
+                limitReached = true;
+            }
+
+            /* Flush any remaining paths, even if we're bailing out. */
+            flushBatch(batch);
+
+            if (limitReached) {
                 printInfo(
                     "fast GC: round %d/%d: deleted %d paths (limit reached)", round, options.pruneRounds, roundDeleted);
                 printInfo("fast GC: total: deleted %d paths, freed %s", totalDeleted, renderSize(results.bytesFreed));
@@ -865,7 +948,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
            'visited' to finish. */
         Finally releasePending([&]() {
             auto shared(_shared.lock());
-            shared->pending.reset();
+            shared->pending.clear();
             wakeup.notify_all();
         });
 
@@ -950,7 +1033,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     debug("cannot delete '%s' because it's a temporary root", printStorePath(*path));
                     return markAlive();
                 }
-                shared->pending = hashPart;
+                shared->pending.insert(std::string(hashPart));
             }
 
             if (isValidPath(*path)) {
