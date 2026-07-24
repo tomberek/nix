@@ -753,6 +753,23 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             int64_t narSize;
         };
 
+        /* Create the InvalidateBatch temp table up front, before the round
+           loop opens a cursor on ValidPaths. Schema modifications
+           (CREATE/DROP TABLE) fail with SQLITE_LOCKED if another statement
+           on the same connection has an active cursor — so we can't create
+           or drop this table while iterating the leaf query. We reuse the
+           same table across all batches and rounds; each flush truncates
+           it with DELETE. */
+        {
+            auto state(_state->lock());
+            if (sqlite3_exec(
+                    state->db,
+                    "create temp table if not exists InvalidateBatch "
+                    "(path text primary key not null)",
+                    nullptr, nullptr, nullptr) != SQLITE_OK)
+                SQLiteError::throw_(state->db, "creating InvalidateBatch temp table");
+        }
+
         for (uint64_t round = 1; round <= options.pruneRounds; round++) {
             uint64_t roundDeleted = 0;
             bool limitReached = false;
@@ -777,8 +794,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
                     SQLiteTxn txn(db);
 
-                    execSql("drop table if exists temp.InvalidateBatch");
-                    execSql("create temp table InvalidateBatch (path text primary key not null)");
+                    /* Table already exists from the round-setup step; clear
+                       out any leftover rows from a prior failed batch. */
+                    execSql("delete from InvalidateBatch");
 
                     {
                         SQLiteStmt ins;
@@ -790,7 +808,6 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     /* Foreign keys on Refs cascade from ValidPaths on delete,
                        so this single DELETE cleans up Refs rows too. */
                     execSql("delete from ValidPaths where path in (select path from InvalidateBatch)");
-                    execSql("drop table temp.InvalidateBatch");
 
                     txn.commit();
 
