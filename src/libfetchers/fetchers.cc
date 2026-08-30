@@ -301,21 +301,28 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessor(const Settings & settin
     }
 }
 
-std::pair<ref<SourceAccessor>, Input> Input::substituteFromStore(const Settings & settings, Store & store) const
+std::optional<FinalInput> Input::asFinal() const
 {
-    assert(isFinal() && getNarHash());
+    if (!isFinal())
+        return std::nullopt;
+    if (auto narHash = getNarHash())
+        return FinalInput{*this, *narHash};
+    return std::nullopt;
+}
 
-    auto storePath = computeStorePath(store);
+std::pair<ref<SourceAccessor>, Input> FinalInput::substituteFromStore(const Settings & settings, Store & store) const
+{
+    auto storePath = input.computeStorePath(store);
 
     store.addTempRoot(storePath);
 
     store.getBuilder()->ensurePath(storePath);
 
-    debug("using substituted/cached input '%s' in '%s'", to_string(), store.printStorePath(storePath));
+    debug("using substituted/cached input '%s' in '%s'", input.to_string(), store.printStorePath(storePath));
 
     auto accessor = store.requireStoreObjectAccessor(storePath);
 
-    accessor->fingerprint = getFingerprint(store);
+    accessor->fingerprint = input.getFingerprint(store);
 
     // Store a cache entry for the substituted tree so later fetches
     // can reuse the existing nar instead of copying the unpacked
@@ -327,9 +334,9 @@ std::pair<ref<SourceAccessor>, Input> Input::substituteFromStore(const Settings 
             {{"hash", store.queryPathInfo(storePath)->narHash.to_string(HashFormat::SRI, true)}});
     }
 
-    accessor->setPathDisplay("«" + to_string() + "»");
+    accessor->setPathDisplay("«" + input.to_string() + "»");
 
-    return {accessor, *this};
+    return {accessor, input};
 }
 
 std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings & settings, Store & store) const
@@ -346,24 +353,22 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
 
        FIXME: add a setting to disable this.
     */
-    if (isFinal()) {
-        if (auto narHash = getNarHash()) {
-            try {
-                /* An already-valid store path is a free win, so it
-                   always takes priority over the scheme's own cache. */
-                std::optional<std::pair<ref<SourceAccessor>, Input>> r;
-                if (store.isValidPath(computeStorePath(store)))
-                    r = substituteFromStore(settings, store);
-                else
-                    r = scheme->tryRealizeLocally(*this, *narHash, settings, store);
-                if (r) {
-                    if (!r->first->fingerprint)
-                        r->first->fingerprint = getFingerprint(store);
-                    return *r;
-                }
-            } catch (Error & e) {
-                debug("tryRealizeLocally for input '%s' failed: %s", to_string(), e.what());
+    if (auto final = asFinal()) {
+        try {
+            /* An already-valid store path is a free win, so it
+               always takes priority over the scheme's own cache. */
+            std::optional<std::pair<ref<SourceAccessor>, Input>> r;
+            if (store.isValidPath(computeStorePath(store)))
+                r = final->substituteFromStore(settings, store);
+            else
+                r = scheme->tryRealizeLocally(*final, settings, store);
+            if (r) {
+                if (!r->first->fingerprint)
+                    r->first->fingerprint = getFingerprint(store);
+                return *r;
             }
+        } catch (Error & e) {
+            debug("tryRealizeLocally for input '%s' failed: %s", to_string(), e.what());
         }
     }
 

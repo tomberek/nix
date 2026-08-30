@@ -517,14 +517,14 @@ struct TarballInputScheme : CurlInputScheme
         return {result.accessor, input};
     }
 
-    std::optional<std::pair<ref<SourceAccessor>, Input>> tryRealizeLocally(
-        const Input & input, const Hash & narHash, const Settings & settings, Store & store) const override
+    std::optional<std::pair<ref<SourceAccessor>, Input>>
+    tryRealizeLocally(const FinalInput & final, const Settings & settings, Store & store) const override
     {
         /* --refresh (tarball-ttl 0) means always re-verify against the source. */
         if (settings.tarballTtl.get() == 0)
             return std::nullopt;
 
-        auto cached = settings.getCache()->lookupExpired(tarballCacheKey(getStrAttr(input.attrs, "url")));
+        auto cached = settings.getCache()->lookupExpired(tarballCacheKey(getStrAttr(final.input.attrs, "url")));
         if (!cached)
             return std::nullopt;
 
@@ -532,13 +532,13 @@ struct TarballInputScheme : CurlInputScheme
         if (!settings.getTarballCache()->hasObject(treeHash))
             return std::nullopt;
 
-        if (settings.getTarballCache()->treeHashToNarHash(settings, treeHash) != narHash)
+        if (settings.getTarballCache()->treeHashToNarHash(settings, treeHash) != final.narHash)
             /* Stale entry; let getAccessor() do a real fetch. */
             return std::nullopt;
 
-        auto accessor = settings.getTarballCache()->getAccessor(treeHash, {}, "«" + input.to_string() + "»");
+        auto accessor = settings.getTarballCache()->getAccessor(treeHash, {}, "«" + final.input.to_string() + "»");
 
-        return std::make_pair(accessor, input);
+        return std::make_pair(accessor, final.input);
     }
 
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
