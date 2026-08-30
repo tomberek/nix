@@ -135,6 +135,17 @@ public:
      */
     std::pair<ref<SourceAccessor>, Input> getAccessor(const Settings & settings, Store & store) const;
 
+    /**
+     * Realize this input via a locally-valid store path or
+     * substitution, without invoking the scheme's fetcher at all.
+     *
+     * Precondition: `isFinal() && getNarHash()` (asserted).
+     *
+     * Throws on failure (e.g. no substituter has this path); callers
+     * that want to fall back to fetching should catch `Error`.
+     */
+    std::pair<ref<SourceAccessor>, Input> substituteFromStore(const Settings & settings, Store & store) const;
+
 private:
 
     std::pair<ref<SourceAccessor>, Input> getAccessorUnchecked(const Settings & settings, Store & store) const;
@@ -241,6 +252,24 @@ struct InputScheme
 
     virtual std::pair<ref<SourceAccessor>, Input>
     getAccessor(const Settings & settings, Store & store, const Input & input) const = 0;
+
+    /**
+     * Called when `input.isFinal()`, before `getAccessor()`. Gives the
+     * scheme a chance to realize `input` more cheaply than a full
+     * fetch, e.g. via store substitution or the scheme's own cache.
+     * `narHash` is `input.getNarHash()`, already unwrapped.
+     *
+     * The default always tries store substitution.
+     *
+     * May throw; the caller treats that like `std::nullopt` and falls
+     * through to `getAccessor()`. If the result has no `fingerprint`
+     * set, the caller fills one in.
+     */
+    virtual std::optional<std::pair<ref<SourceAccessor>, Input>>
+    tryRealizeLocally(const Input & input, const Hash & narHash, const Settings & settings, Store & store) const
+    {
+        return input.substituteFromStore(settings, store);
+    }
 
     /**
      * Is this `InputScheme` part of an experimental feature?

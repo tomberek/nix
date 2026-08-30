@@ -301,6 +301,37 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessor(const Settings & settin
     }
 }
 
+std::pair<ref<SourceAccessor>, Input> Input::substituteFromStore(const Settings & settings, Store & store) const
+{
+    assert(isFinal() && getNarHash());
+
+    auto storePath = computeStorePath(store);
+
+    store.addTempRoot(storePath);
+
+    store.getBuilder()->ensurePath(storePath);
+
+    debug("using substituted/cached input '%s' in '%s'", to_string(), store.printStorePath(storePath));
+
+    auto accessor = store.requireStoreObjectAccessor(storePath);
+
+    accessor->fingerprint = getFingerprint(store);
+
+    // Store a cache entry for the substituted tree so later fetches
+    // can reuse the existing nar instead of copying the unpacked
+    // input back into the store on every evaluation.
+    if (accessor->fingerprint) {
+        settings.getCache()->upsert(
+            makeSourcePathToHashCacheKey(
+                *accessor->fingerprint, ContentAddressMethod::Raw::NixArchive, CanonPath::root),
+            {{"hash", store.queryPathInfo(storePath)->narHash.to_string(HashFormat::SRI, true)}});
+    }
+
+    accessor->setPathDisplay("«" + to_string() + "»");
+
+    return {accessor, *this};
+}
+
 std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings & settings, Store & store) const
 {
     // FIXME: cache the accessor
@@ -308,46 +339,31 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
     if (!scheme)
         throw Error("cannot fetch unsupported input '%s'", attrsToJSON(toAttrs()));
 
-    /* The tree may already be in the Nix store, or it could be
-       substituted (which is often faster than fetching from the
-       original source). So check that. We only do this for final
-       inputs, otherwise there is a risk that we don't return the
-       same attributes (like `lastModified`) that the "real" fetcher
-       would return.
+    /* The tree may already be in the store, substitutable, or cached
+       by the scheme some other way. Only do this for final inputs, or
+       we risk not returning the same attributes (like `lastModified`)
+       the "real" fetcher would.
 
        FIXME: add a setting to disable this.
-       FIXME: substituting may be slower than fetching normally,
-       e.g. for fetchers like Git that are incremental!
     */
-    if (isFinal() && getNarHash()) {
-        try {
-            auto storePath = computeStorePath(store);
-
-            store.addTempRoot(storePath);
-
-            store.getBuilder()->ensurePath(storePath);
-
-            debug("using substituted/cached input '%s' in '%s'", to_string(), store.printStorePath(storePath));
-
-            auto accessor = store.requireStoreObjectAccessor(storePath);
-
-            accessor->fingerprint = getFingerprint(store);
-
-            // Store a cache entry for the substituted tree so later fetches
-            // can reuse the existing nar instead of copying the unpacked
-            // input back into the store on every evaluation.
-            if (accessor->fingerprint) {
-                settings.getCache()->upsert(
-                    makeSourcePathToHashCacheKey(
-                        *accessor->fingerprint, ContentAddressMethod::Raw::NixArchive, CanonPath::root),
-                    {{"hash", store.queryPathInfo(storePath)->narHash.to_string(HashFormat::SRI, true)}});
+    if (isFinal()) {
+        if (auto narHash = getNarHash()) {
+            try {
+                /* An already-valid store path is a free win, so it
+                   always takes priority over the scheme's own cache. */
+                std::optional<std::pair<ref<SourceAccessor>, Input>> r;
+                if (store.isValidPath(computeStorePath(store)))
+                    r = substituteFromStore(settings, store);
+                else
+                    r = scheme->tryRealizeLocally(*this, *narHash, settings, store);
+                if (r) {
+                    if (!r->first->fingerprint)
+                        r->first->fingerprint = getFingerprint(store);
+                    return *r;
+                }
+            } catch (Error & e) {
+                debug("tryRealizeLocally for input '%s' failed: %s", to_string(), e.what());
             }
-
-            accessor->setPathDisplay("«" + to_string() + "»");
-
-            return {accessor, *this};
-        } catch (Error & e) {
-            debug("substitution of input '%s' failed: %s", to_string(), e.what());
         }
     }
 

@@ -104,6 +104,11 @@ DownloadFileResult downloadFile(
     };
 }
 
+static Cache::Key tarballCacheKey(const std::string & url)
+{
+    return Cache::Key{"tarball", {{"url", url}}};
+}
+
 static DownloadTarballResult downloadTarball_(
     const Settings & settings, const std::string & urlS, const Headers & headers, const std::string & displayPrefix)
 {
@@ -133,7 +138,7 @@ static DownloadTarballResult downloadTarball_(
         }
     }
 
-    Cache::Key cacheKey{"tarball", {{"url", urlS}}};
+    Cache::Key cacheKey = tarballCacheKey(urlS);
 
     auto cached = settings.getCache()->lookupExpired(cacheKey);
 
@@ -510,6 +515,30 @@ struct TarballInputScheme : CurlInputScheme
             settings.getTarballCache()->treeHashToNarHash(settings, result.treeHash).to_string(HashFormat::SRI, true));
 
         return {result.accessor, input};
+    }
+
+    std::optional<std::pair<ref<SourceAccessor>, Input>> tryRealizeLocally(
+        const Input & input, const Hash & narHash, const Settings & settings, Store & store) const override
+    {
+        /* --refresh (tarball-ttl 0) means always re-verify against the source. */
+        if (settings.tarballTtl.get() == 0)
+            return std::nullopt;
+
+        auto cached = settings.getCache()->lookupExpired(tarballCacheKey(getStrAttr(input.attrs, "url")));
+        if (!cached)
+            return std::nullopt;
+
+        auto treeHash = getRevAttr(cached->value, "treeHash");
+        if (!settings.getTarballCache()->hasObject(treeHash))
+            return std::nullopt;
+
+        if (settings.getTarballCache()->treeHashToNarHash(settings, treeHash) != narHash)
+            /* Stale entry; let getAccessor() do a real fetch. */
+            return std::nullopt;
+
+        auto accessor = settings.getTarballCache()->getAccessor(treeHash, {}, "«" + input.to_string() + "»");
+
+        return std::make_pair(accessor, input);
     }
 
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
