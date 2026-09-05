@@ -7,6 +7,7 @@
 #include "nix/util/os-string.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/signals.hh"
+#include "nix/util/strings.hh"
 #include "nix/util/users.hh"
 #include "nix/util/fs-sink.hh"
 #include "nix/util/sync.hh"
@@ -769,7 +770,11 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
     ref<GitFileSystemObjectSink> getFileSystemObjectSink() override;
 
-    void fetch(const std::string & url, const std::string & refspec, bool shallow) override
+    void fetch(
+        const std::string & url,
+        const std::string & refspec,
+        bool shallow,
+        std::optional<std::filesystem::path> reference) override
     {
         Activity act(*logger, lvlTalkative, actFetchTree, fmt("fetching Git repository '%s'", url));
 
@@ -783,18 +788,62 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         // from running. Note that we already have a repository-wide `PathLock` (see git.cc), so this is safe.
         tryUnlink(dir / "shallow.lock");
 
+        auto alternatesFile = dir / "objects" / "info" / "alternates";
+        std::vector<std::string> negotiationTips;
+
+        if (reference) {
+            auto referenceObjects = *reference / "objects";
+            createDirs(dir / "objects" / "info");
+            writeFile(alternatesFile, referenceObjects.string() + "\n");
+
+            ObjectDb odb;
+            if (git_repository_odb(Setter(odb), repo.get()))
+                throw GitError("getting Git object database");
+            if (git_odb_add_disk_alternate(odb.get(), referenceObjects.string().c_str()))
+                throw GitError("adding alternate object directory '%s'", PathFmt(referenceObjects));
+
+            /* By default, `git fetch` discovers and walks every ref in every
+               alternate to negotiate with the server, which is prohibitively
+               slow when the reference is a large full clone. We disable that
+               below and instead negotiate only from the reference's own ref
+               tips, plus (for a rev-pinned fetch, which has no matching ref)
+               the target rev itself, if the reference already has it. */
+            auto referenceRefs = runProgram(
+                "git", true, {OS_STR("-C"), reference->native(), OS_STR("for-each-ref"), OS_STR("--format=%(objectname)")});
+            negotiationTips = splitString<std::vector<std::string>>(referenceRefs, "\n");
+
+            if (refspec.find(':') == refspec.npos
+                && statusOk(runProgram(
+                               {.program = "git",
+                                .args = {OS_STR("-C"), reference->native(), OS_STR("cat-file"), OS_STR("-e"), string_to_os_string(refspec)}})
+                               .first))
+                negotiationTips.push_back(refspec);
+        } else {
+            tryUnlink(alternatesFile);
+        }
+
         OsStrings gitArgs = {
             OS_STR("-C"),
             dir.native(),
             OS_STR("--git-dir"),
             OS_STR("."),
-            OS_STR("fetch"),
-            OS_STR("--progress"),
-            OS_STR("--force"),
         };
+        if (reference) {
+            gitArgs.push_back(OS_STR("-c"));
+            gitArgs.push_back(OS_STR("core.alternateRefsCommand=: #"));
+        }
+        gitArgs.push_back(OS_STR("fetch"));
+        gitArgs.push_back(OS_STR("--progress"));
+        gitArgs.push_back(OS_STR("--force"));
         if (shallow) {
             gitArgs.push_back(OS_STR("--depth"));
             gitArgs.push_back(OS_STR("1"));
+        }
+        for (auto & rev : negotiationTips) {
+            if (rev.empty())
+                continue;
+            gitArgs.push_back(OS_STR("--negotiation-tip"));
+            gitArgs.push_back(string_to_os_string(rev));
         }
         gitArgs.push_back(OS_STR("--"));
         gitArgs.push_back(string_to_os_string(url));
