@@ -7,7 +7,6 @@
 #include "nix/util/os-string.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/signals.hh"
-#include "nix/util/strings.hh"
 #include "nix/util/users.hh"
 #include "nix/util/fs-sink.hh"
 #include "nix/util/sync.hh"
@@ -139,6 +138,7 @@ typedef std::unique_ptr<git_blob, Deleter<git_blob_free>> Blob;
 typedef std::unique_ptr<git_object, Deleter<git_object_free>> Object;
 typedef std::unique_ptr<git_commit, Deleter<git_commit_free>> Commit;
 typedef std::unique_ptr<git_reference, Deleter<git_reference_free>> Reference;
+typedef std::unique_ptr<git_reference_iterator, Deleter<git_reference_iterator_free>> ReferenceIterator;
 typedef std::unique_ptr<git_describe_result, Deleter<git_describe_result_free>> DescribeResult;
 typedef std::unique_ptr<git_status_list, Deleter<git_status_list_free>> StatusList;
 typedef std::unique_ptr<git_remote, Deleter<git_remote_free>> Remote;
@@ -808,16 +808,29 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
                below and instead negotiate only from the reference's own ref
                tips, plus (for a rev-pinned fetch, which has no matching ref)
                the target rev itself, if the reference already has it. */
-            auto referenceRefs = runProgram(
-                "git", true, {OS_STR("-C"), reference->native(), OS_STR("for-each-ref"), OS_STR("--format=%(objectname)")});
-            negotiationTips = splitString<std::vector<std::string>>(referenceRefs, "\n");
+            Repository referenceRepo;
+            if (git_repository_open(Setter(referenceRepo), reference->string().c_str()))
+                throw GitError("opening reference Git repository '%s'", PathFmt(*reference));
 
-            if (refspec.find(':') == refspec.npos
-                && statusOk(runProgram(
-                               {.program = "git",
-                                .args = {OS_STR("-C"), reference->native(), OS_STR("cat-file"), OS_STR("-e"), string_to_os_string(refspec)}})
-                               .first))
-                negotiationTips.push_back(refspec);
+            ReferenceIterator iter;
+            if (git_reference_iterator_new(Setter(iter), referenceRepo.get()))
+                throw GitError("iterating references of '%s'", PathFmt(*reference));
+
+            git_oid oid;
+            int iterErr;
+            const char * refName;
+            while ((iterErr = git_reference_next_name(&refName, iter.get())) == 0) {
+                if (!git_reference_name_to_id(&oid, referenceRepo.get(), refName))
+                    negotiationTips.push_back(toHash(oid).gitRev());
+            }
+            if (iterErr != GIT_ITEROVER)
+                throw GitError("iterating references of '%s'", PathFmt(*reference));
+
+            if (refspec.find(':') == refspec.npos) {
+                Object obj;
+                if (!git_revparse_single(Setter(obj), referenceRepo.get(), refspec.c_str()))
+                    negotiationTips.push_back(refspec);
+            }
         } else {
             tryUnlink(alternatesFile);
         }
