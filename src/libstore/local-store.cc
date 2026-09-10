@@ -130,6 +130,7 @@ LocalStore::LocalStore(ref<const Config> config)
     , dbDir(config->stateDir.get() / "db")
     , linksDir(config->realStoreDir.get() / ".links")
     , linksShardedDir(linksDir / "sha256")
+    , linksOverflowDir(linksShardedDir / "overflow")
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -147,6 +148,7 @@ LocalStore::LocalStore(ref<const Config> config)
     }
     createDirs(linksDir);
     createDirs(linksShardedDir);
+    createDirs(linksOverflowDir);
     // Pre-create all 2048 shard directories for Nix32 3-character prefixes
     // First character is always '0' or '1' due to Nix32 encoding bias
     for (size_t first = 0; first < 2; ++first) {

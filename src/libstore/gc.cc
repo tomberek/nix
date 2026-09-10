@@ -850,7 +850,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         // Clean up old SHA256 links in .links/
         cleanupLinksDir(linksDir);
 
-        // Clean up all subdirectories of .links/sha256/ (shards and any future additions)
+        // Clean up all subdirectories of .links/sha256/ (shards + overflow + any future)
         AutoCloseDir shardedRoot(opendir(linksShardedDir.string().c_str()));
         if (shardedRoot) {
             struct dirent * dirent;
