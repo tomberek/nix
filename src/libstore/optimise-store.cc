@@ -4,6 +4,7 @@
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/base-nix-32.hh"
 
 #include <cstdlib>
 #include <cstring>
@@ -127,18 +128,48 @@ LocalStore::InodeHash LocalStore::loadInodeHash()
     debug("loading hash inodes in memory");
     InodeHash inodeHash;
 
-    AutoCloseDir dir(opendir(linksDir.string().c_str()));
-    if (!dir)
-        throw SysError("opening directory %1%", PathFmt(linksDir));
-
-    struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
-        checkInterrupt();
-        // We don't care if we hit non-hash files, anything goes
-        inodeHash.insert(dirent->d_ino);
+    // Load old SHA256 links from .links/ for backward compatibility
+    {
+        AutoCloseDir dir(opendir(linksDir.string().c_str()));
+        if (dir) {
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(dir.get())) {
+                checkInterrupt();
+                std::string name = dirent->d_name;
+                if (name == "." || name == ".." || name == "sha256")
+                    continue;
+                inodeHash.insert(dirent->d_ino);
+            }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(linksDir));
+        }
     }
-    if (errno)
-        throw SysError("reading directory %1%", PathFmt(linksDir));
+
+    // Load all links from .links/sha256/ subdirectories (shards)
+    AutoCloseDir shardedRoot(opendir(linksShardedDir.string().c_str()));
+    if (shardedRoot) {
+        struct dirent * subdirent;
+        while (errno = 0, subdirent = readdir(shardedRoot.get())) {
+            checkInterrupt();
+            std::string subname = subdirent->d_name;
+            if (subname == "." || subname == "..")
+                continue;
+            auto subPath = linksShardedDir / subname;
+
+            AutoCloseDir subDir(opendir(subPath.string().c_str()));
+            if (!subDir) continue;
+
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(subDir.get())) {
+                checkInterrupt();
+                inodeHash.insert(dirent->d_ino);
+            }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(subPath));
+        }
+        if (errno)
+            throw SysError("reading directory %1%", PathFmt(linksShardedDir));
+    }
 
     printMsg(lvlTalkative, "loaded %1% hash inodes", inodeHash.size());
 
@@ -233,10 +264,14 @@ void LocalStore::optimisePath_(
        contents of the symlink (i.e. the result of readlink()), not
        the contents of the target (which may not even exist). */
     Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
-    debug("%s has hash '%s'", PathFmt(path), hash.to_string(HashFormat::Nix32, true));
+    std::string hashStr = hash.to_string(HashFormat::Nix32, false);
+    debug("%s has hash '%s'", PathFmt(path), hashStr);
 
-    /* Check if this is a known hash. */
-    std::filesystem::path linkPath = std::filesystem::path{linksDir} / hash.to_string(HashFormat::Nix32, false);
+    // Sharded link path: .links/sha256/XXX/HASH
+    // Use first 3 chars for shard (first char is always '0' or '1', giving 2048 shards)
+    std::string shard = hashStr.substr(0, 3);
+    std::filesystem::path shardDir = linksShardedDir / shard;
+    std::filesystem::path linkPath = shardDir / hashStr;
 
     /* Stat the link once, if it exists. */
     auto stLink = maybeLstat(linkPath);

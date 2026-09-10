@@ -817,34 +817,51 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
         printInfo("deleting unused links...");
 
-        AutoCloseDir dir(opendir(linksDir.string().c_str()));
-        if (!dir)
-            throw SysError("opening directory %1%", PathFmt(linksDir));
-
         int64_t actualSize = 0, unsharedSize = 0;
 
-        struct dirent * dirent;
-        while (errno = 0, dirent = readdir(dir.get())) {
-            checkInterrupt();
-            std::string name = dirent->d_name;
-            if (name == "." || name == "..")
-                continue;
-            auto path = linksDir / name;
+        // Helper to clean up links in a directory
+        auto cleanupLinksDir = [&](const std::filesystem::path & dir) {
+            AutoCloseDir d(opendir(dir.string().c_str()));
+            if (!d) return;  // Directory might not exist
 
-            auto st = lstat(path);
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(d.get())) {
+                checkInterrupt();
+                std::string name = dirent->d_name;
+                if (name == "." || name == "..")
+                    continue;
+                auto path = dir / name;
 
-            if (st.st_nlink != 1) {
-                actualSize += st.st_size;
-                unsharedSize += (st.st_nlink - 1) * st.st_size;
-                continue;
+                auto st = lstat(path);
+
+                if (st.st_nlink != 1) {
+                    actualSize += st.st_size;
+                    unsharedSize += (st.st_nlink - 1) * st.st_size;
+                    continue;
+                }
+
+                printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
+                unlink(path);
             }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(dir));
+        };
 
-            printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
+        // Clean up old SHA256 links in .links/
+        cleanupLinksDir(linksDir);
 
-            unlink(path);
-
-            /* Do not account for deleted file here. Rely on deletePath()
-               accounting.  */
+        // Clean up all subdirectories of .links/sha256/ (shards and any future additions)
+        AutoCloseDir shardedRoot(opendir(linksShardedDir.string().c_str()));
+        if (shardedRoot) {
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(shardedRoot.get())) {
+                checkInterrupt();
+                std::string name = dirent->d_name;
+                if (name == "." || name == "..") continue;
+                cleanupLinksDir(linksShardedDir / name);
+            }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(linksShardedDir));
         }
 
         int64_t overhead =
