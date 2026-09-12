@@ -927,12 +927,18 @@ void LocalStore::markPathOptimised(const StorePath & path, const std::string & n
 
 void LocalStore::deleteStaleOptimisedPaths()
 {
-    if (!optimisedDbAttached)
+    if (!optimisedDbAttached || config->readOnly)
         return;
-    retrySQLite<void>([&]() {
-        auto state(_state->lock());
-        state->stmts->DeleteStaleOptimisedPaths.use().exec();
-    });
+    try {
+        retrySQLite<void>([&]() {
+            auto state(_state->lock());
+            state->stmts->DeleteStaleOptimisedPaths.use().exec();
+        });
+    } catch (SQLiteError & e) {
+        // Same reasoning as markPathOptimised(): a bookkeeping write
+        // failing shouldn't fail GC or optimiseStore().
+        debug("failed to prune stale OptimisedPaths rows: %s", e.msg());
+    }
 }
 
 void LocalStore::queryReferrers(State & state, const StorePath & path, StorePathSet & referrers)

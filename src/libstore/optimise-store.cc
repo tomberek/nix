@@ -5,6 +5,7 @@
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/base-nix-32.hh"
+#include "nix/util/url.hh"
 
 #include <cstdlib>
 #include <cstring>
@@ -71,28 +72,58 @@ struct MakeReadOnly
    optimisedDbAttached stays false and every path is always treated as
    unoptimised, i.e. optimise-store falls back to full-rescan behaviour,
    same degradation the xattr design had for filesystems without xattr
-   support. */
+   support.
+
+   On a read-only store (config->readOnly), the sidecar is attached
+   with the SQLite URI `mode=ro` so the connection itself refuses
+   writes, rather than relying only on the caller never issuing one -
+   this matches how the main db.sqlite connection is opened with
+   SQLiteOpenMode::Immutable in that case. If the sidecar file doesn't
+   exist yet, the read-only attach fails (SQLite can't create a file in
+   mode=ro), which is caught below and degrades to the same "tracking
+   disabled" fallback as any other attach failure - a read-only store
+   was never going to be able to create the sidecar anyway. */
 void LocalStore::attachOptimisedDb(State & state)
 {
-    if (config->readOnly)
-        return;
-
     try {
         retrySQLite<void>([&]() {
             auto optimisedDbPath = dbDir / "optimised.sqlite";
             {
                 SQLiteStmt attachStmt;
                 attachStmt.create(state.db, "attach database ? as opt");
-                attachStmt.use()(optimisedDbPath.string()).exec();
+                std::string attachUri = config->readOnly
+                    ? "file:" + percentEncode(optimisedDbPath.string()) + "?mode=ro"
+                    : optimisedDbPath.string();
+                attachStmt.use()(attachUri).exec();
             }
-            state.db.exec("pragma opt.journal_mode = wal");
-            state.db.exec(
-                "create table if not exists opt.OptimisedPaths ("
-                "path text primary key not null, "
-                "narHash text not null, "
-                "optimisedTime integer not null"
-                ")");
+            if (!config->readOnly) {
+                state.db.exec("pragma opt.journal_mode = wal");
+                state.db.exec(
+                    "create table if not exists opt.OptimisedPaths ("
+                    "path text primary key not null, "
+                    "narHash text not null, "
+                    "optimisedTime integer not null"
+                    ")");
+            }
         });
+
+        if (config->readOnly) {
+            // Can't CREATE TABLE IF NOT EXISTS through a read-only
+            // attach, so confirm the table is actually there before
+            // trusting it - an empty/corrupted/pre-feature sidecar
+            // attached read-only would otherwise cause the prepared
+            // statements below (which reference opt.OptimisedPaths)
+            // to fail at prepare time, outside this try/catch.
+            SQLiteStmt checkTable;
+            checkTable.create(
+                state.db, "select 1 from opt.sqlite_master where type = 'table' and name = 'OptimisedPaths'");
+            if (!checkTable.use().next()) {
+                debug("optimised-paths sidecar database has no OptimisedPaths table, optimisation tracking disabled");
+                state.db.exec("detach database opt");
+                return;
+            }
+        }
+
         optimisedDbAttached = true;
     } catch (SQLiteError & e) {
         // Read-only directory, out of space, corrupted sidecar file,
