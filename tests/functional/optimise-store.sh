@@ -74,3 +74,49 @@ if [ -d "$NIX_STORE_DIR"/.links/sha256 ]; then
         fi
     done
 fi
+
+# Test the optimised-paths sidecar database (skip-tracking mechanism)
+if [ -n "$(type -p sqlite3)" ]; then
+    clearStoreIfPossible
+
+    # shellcheck disable=SC2016
+    outPath4=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "foo4"; builder = builtins.toFile "builder" "mkdir $out; echo hello > $out/foo"; }' | nix-build - --no-out-link)
+    # shellcheck disable=SC2016
+    outPath5=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "foo5"; builder = builtins.toFile "builder" "mkdir $out; echo hello > $out/foo"; }' | nix-build - --no-out-link)
+
+    if [ ! -f "$NIX_STATE_DIR"/db/optimised.sqlite ]; then
+        echo "optimised.sqlite sidecar database was not created"
+        exit 1
+    fi
+
+    NIX_REMOTE="" nix-store --optimise
+
+    for p in "$outPath4" "$outPath5"; do
+        if ! sqlite3 "$NIX_STATE_DIR"/db/optimised.sqlite "select 1 from OptimisedPaths where path = '$p'" | grep -q 1; then
+            echo "no OptimisedPaths row for '$p' after optimising"
+            exit 1
+        fi
+    done
+
+    # A second run should be a complete no-op: every path already has a
+    # matching (path, narHash) row, so the anti-join finds nothing to do.
+    secondRunOutput=$(NIX_REMOTE="" nix-store --optimise 2>&1)
+    if [ "$secondRunOutput" != "0.0 KiB freed by hard-linking 0 files" ]; then
+        echo "second optimise run was not a no-op: $secondRunOutput"
+        exit 1
+    fi
+
+    # GC should prune the OptimisedPaths row for a path it deletes,
+    # while leaving other rows (e.g. the surviving path) untouched.
+    nix-store --delete "$outPath4"
+
+    if sqlite3 "$NIX_STATE_DIR"/db/optimised.sqlite "select 1 from OptimisedPaths where path = '$outPath4'" | grep -q 1; then
+        echo "deleted path's OptimisedPaths row was not pruned by GC"
+        exit 1
+    fi
+
+    if ! sqlite3 "$NIX_STATE_DIR"/db/optimised.sqlite "select 1 from OptimisedPaths where path = '$outPath5'" | grep -q 1; then
+        echo "surviving path's OptimisedPaths row was incorrectly removed"
+        exit 1
+    fi
+fi

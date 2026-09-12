@@ -120,6 +120,9 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryRealisedOutput;
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
+    SQLiteStmt QueryUnoptimisedPaths;
+    SQLiteStmt MarkPathOptimised;
+    SQLiteStmt DeleteStaleOptimisedPaths;
 };
 
 LocalStore::LocalStore(ref<const Config> config)
@@ -349,6 +352,8 @@ LocalStore::LocalStore(ref<const Config> config)
 
     upgradeDBSchema(*state);
 
+    attachOptimisedDb(*state);
+
     /* Prepare SQL statements. */
     state->stmts->RegisterValidPath.create(
         state->db,
@@ -374,6 +379,29 @@ LocalStore::LocalStore(ref<const Config> config)
     // ensure efficient lookup.
     state->stmts->QueryPathFromHashPart.create(state->db, "select path from ValidPaths where path >= ? limit 1;");
     state->stmts->QueryValidPaths.create(state->db, "select path from ValidPaths");
+    if (optimisedDbAttached) {
+        // Anti-join: every valid path whose optimised-tracking entry is
+        // missing, or whose recorded narHash no longer matches the
+        // path's current hash (i.e. it was rebuilt/repaired since it was
+        // last optimised).
+        state->stmts->QueryUnoptimisedPaths.create(
+            state->db,
+            R"(
+                select v.path, v.hash from main.ValidPaths v
+                left join opt.OptimisedPaths o on o.path = v.path and o.narHash = v.hash
+                where o.path is null
+                ;
+            )");
+        state->stmts->MarkPathOptimised.create(
+            state->db,
+            R"(
+                insert into opt.OptimisedPaths (path, narHash, optimisedTime) values (?, ?, ?)
+                on conflict (path) do update set narHash = excluded.narHash, optimisedTime = excluded.optimisedTime
+                ;
+            )");
+        state->stmts->DeleteStaleOptimisedPaths.create(
+            state->db, "delete from opt.OptimisedPaths where path not in (select path from main.ValidPaths);");
+    }
     if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
         state->stmts->RegisterRealisedOutput.create(
             state->db,
@@ -868,6 +896,45 @@ StorePathSet LocalStore::queryAllValidPaths()
     });
 }
 
+std::vector<std::pair<StorePath, std::string>> LocalStore::queryUnoptimisedPaths()
+{
+    return retrySQLite<std::vector<std::pair<StorePath, std::string>>>([&]() {
+        auto state(_state->lock());
+        auto use(state->stmts->QueryUnoptimisedPaths.use());
+        std::vector<std::pair<StorePath, std::string>> res;
+        while (use.next())
+            res.emplace_back(parseStorePath(use.getStr(0)), use.getStr(1));
+        return res;
+    });
+}
+
+void LocalStore::markPathOptimised(const StorePath & path, const std::string & narHashBase16)
+{
+    if (!optimisedDbAttached)
+        return;
+    try {
+        retrySQLite<void>([&]() {
+            auto state(_state->lock());
+            state->stmts->MarkPathOptimised.use()(printStorePath(path))(narHashBase16)(time(nullptr)).exec();
+        });
+    } catch (SQLiteError & e) {
+        // Don't fail optimisation over a bookkeeping write failing (e.g.
+        // sidecar db went read-only mid-run); the path just gets
+        // re-optimised next time, same as any never-tracked path.
+        debug("failed to mark path '%s' optimised: %s", printStorePath(path), e.msg());
+    }
+}
+
+void LocalStore::deleteStaleOptimisedPaths()
+{
+    if (!optimisedDbAttached)
+        return;
+    retrySQLite<void>([&]() {
+        auto state(_state->lock());
+        state->stmts->DeleteStaleOptimisedPaths.use().exec();
+    });
+}
+
 void LocalStore::queryReferrers(State & state, const StorePath & path, StorePathSet & referrers)
 {
     auto useQueryReferrers(state.stmts->QueryReferrers.use()(printStorePath(path)));
@@ -1137,7 +1204,7 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
 
                 canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(config->getLocalSettings().ignoredAcls)});
 
-                optimisePath(realPath, repair); // FIXME: combine with hashPath()
+                optimisePath(realPath, repair, info.path, info.narHash); // FIXME: combine with hashPath()
 
                 if (config->getLocalSettings().fsyncStorePaths) {
                     recursiveSync(realPath);
@@ -1302,7 +1369,7 @@ StorePath LocalStore::addToStoreFromDump(
             canonicalisePathMetaData(
                 realPath, {NIX_WHEN_SUPPORT_ACLS(localSettings.ignoredAcls)}); // FIXME: merge into restorePath
 
-            optimisePath(realPath, repair);
+            optimisePath(realPath, repair, dstPath, narHash.hash);
 
             if (localSettings.fsyncStorePaths) {
                 recursiveSync(realPath);
