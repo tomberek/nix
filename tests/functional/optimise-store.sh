@@ -74,3 +74,62 @@ if [ -d "$NIX_STORE_DIR"/.links/sha256 ]; then
         fi
     done
 fi
+
+# Test BLAKE3-based deduplication (blake3-links experimental feature)
+clearStoreIfPossible
+
+export NIX_CONFIG="extra-experimental-features = blake3-links"
+
+# shellcheck disable=SC2016
+outPath1b3=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "foo1"; builder = builtins.toFile "builder" "mkdir $out; echo hello > $out/foo"; }' | nix-build - --no-out-link)
+# shellcheck disable=SC2016
+outPath2b3=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "foo2"; builder = builtins.toFile "builder" "mkdir $out; echo hello > $out/foo"; }' | nix-build - --no-out-link)
+
+# Check that .links/blake3 directory structure was created
+if [ ! -d "$NIX_STORE_DIR"/.links/blake3 ]; then
+    echo ".links/blake3 directory was not created"
+    exit 1
+fi
+
+NIX_REMOTE="" nix-store --optimise
+
+inode1b3="$(stat --format=%i "$outPath1b3"/foo)"
+inode2b3="$(stat --format=%i "$outPath2b3"/foo)"
+if [ "$inode1b3" != "$inode2b3" ]; then
+    echo "inodes do not match after blake3 optimise: $inode1b3 vs $inode2b3"
+    exit 1
+fi
+
+nlinkb3="$(stat --format=%h "$outPath1b3"/foo)"
+if [ "$nlinkb3" != 3 ]; then
+    echo "link count incorrect for blake3 links: expected 3, got $nlinkb3"
+    exit 1
+fi
+
+replica_count_b3=$(find "$NIX_STORE_DIR"/.links/blake3/ -type f | wc -l)
+if [ "$replica_count_b3" -lt 1 ]; then
+    echo "no replicas found in .links/blake3/"
+    exit 1
+fi
+
+# The sha256 tree should not have gained a replica for this content -
+# blake3-links replaces sha256 as the hash algorithm entirely, it
+# doesn't hash twice.
+if [ -d "$NIX_STORE_DIR"/.links/sha256 ]; then
+    sha256_replica_count=$(find "$NIX_STORE_DIR"/.links/sha256/ -type f | wc -l)
+    if [ "$sha256_replica_count" -ne 0 ]; then
+        echo "unexpected sha256 replicas found while blake3-links is enabled: $sha256_replica_count"
+        exit 1
+    fi
+fi
+
+nix-store --gc
+
+if [ -d "$NIX_STORE_DIR"/.links/blake3 ]; then
+    for dir in "$NIX_STORE_DIR"/.links/blake3/*/; do
+        if [ -n "$(ls "$dir" 2>/dev/null || true)" ]; then
+            echo ".links/blake3 directory not empty after GC: $dir"
+            exit 1
+        fi
+    done
+fi

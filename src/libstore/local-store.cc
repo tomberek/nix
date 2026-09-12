@@ -131,6 +131,8 @@ LocalStore::LocalStore(ref<const Config> config)
     , linksDir(config->realStoreDir.get() / ".links")
     , linksShardedDir(linksDir / "sha256")
     , linksOverflowDir(linksShardedDir / "overflow")
+    , linksBlake3ShardedDir(linksDir / "blake3")
+    , linksBlake3OverflowDir(linksBlake3ShardedDir / "overflow")
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -151,13 +153,22 @@ LocalStore::LocalStore(ref<const Config> config)
     createDirs(linksOverflowDir);
     // Pre-create all 2048 shard directories for Nix32 3-character prefixes
     // First character is always '0' or '1' due to Nix32 encoding bias
-    for (size_t first = 0; first < 2; ++first) {
-        for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-            for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                char shard[4] = {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                createDirs(linksShardedDir / shard);
+    auto createShardDirs = [](const std::filesystem::path & shardedDir) {
+        for (size_t first = 0; first < 2; ++first) {
+            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                    char shard[4] =
+                        {BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                    createDirs(shardedDir / shard);
+                }
             }
         }
+    };
+    createShardDirs(linksShardedDir);
+    if (experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links)) {
+        createDirs(linksBlake3ShardedDir);
+        createDirs(linksBlake3OverflowDir);
+        createShardDirs(linksBlake3ShardedDir);
     }
     auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
@@ -1407,8 +1418,10 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 
         printInfo("checking sharded link hashes...");
 
-        if (std::filesystem::exists(linksShardedDir)) {
-            for (auto & subdir : DirectoryIterator{linksShardedDir}) {
+        auto checkShardedLinks = [&](const std::filesystem::path & shardedDir, HashAlgorithm hashAlgo) {
+            if (!std::filesystem::exists(shardedDir))
+                return;
+            for (auto & subdir : DirectoryIterator{shardedDir}) {
                 checkInterrupt();
                 if (!subdir.is_directory()) continue;
                 for (auto & link : DirectoryIterator{subdir.path()}) {
@@ -1416,7 +1429,7 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                     auto name = link.path().filename().string();
                     printMsg(lvlTalkative, "checking contents of %s", PathFmt(link.path()));
                     std::string hash =
-                        hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
+                        hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, hashAlgo)
                             .first.to_string(HashFormat::Nix32, false);
                     auto expectedHash = name.substr(0, name.find('.'));
                     if (hash != expectedHash) {
@@ -1431,6 +1444,12 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                     }
                 }
             }
+        };
+
+        checkShardedLinks(linksShardedDir, HashAlgorithm::SHA256);
+        if (experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links)) {
+            printInfo("checking BLAKE3 sharded link hashes...");
+            checkShardedLinks(linksBlake3ShardedDir, HashAlgorithm::BLAKE3);
         }
 
         printInfo("checking store hashes...");

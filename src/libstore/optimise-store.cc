@@ -168,7 +168,7 @@ LocalStore::InodeHash LocalStore::loadInodeHash()
             while (errno = 0, dirent = readdir(dir.get())) {
                 checkInterrupt();
                 std::string name = dirent->d_name;
-                if (name == "." || name == ".." || name == "sha256")
+                if (name == "." || name == ".." || name == "sha256" || name == "blake3")
                     continue;
                 inodeHash.insert(dirent->d_ino);
             }
@@ -177,31 +177,37 @@ LocalStore::InodeHash LocalStore::loadInodeHash()
         }
     }
 
-    // Load all links from .links/sha256/ subdirectories (shards + overflow)
-    AutoCloseDir shardedRoot(opendir(linksShardedDir.string().c_str()));
-    if (shardedRoot) {
-        struct dirent * subdirent;
-        while (errno = 0, subdirent = readdir(shardedRoot.get())) {
-            checkInterrupt();
-            std::string subname = subdirent->d_name;
-            if (subname == "." || subname == "..")
-                continue;
-            auto subPath = linksShardedDir / subname;
-
-            AutoCloseDir subDir(opendir(subPath.string().c_str()));
-            if (!subDir) continue;
-
-            struct dirent * dirent;
-            while (errno = 0, dirent = readdir(subDir.get())) {
+    // Load all links from a sharded links directory's subdirectories
+    // (shards + overflow)
+    auto loadShardedDir = [&](const std::filesystem::path & shardedDir) {
+        AutoCloseDir shardedRoot(opendir(shardedDir.string().c_str()));
+        if (shardedRoot) {
+            struct dirent * subdirent;
+            while (errno = 0, subdirent = readdir(shardedRoot.get())) {
                 checkInterrupt();
-                inodeHash.insert(dirent->d_ino);
+                std::string subname = subdirent->d_name;
+                if (subname == "." || subname == "..")
+                    continue;
+                auto subPath = shardedDir / subname;
+
+                AutoCloseDir subDir(opendir(subPath.string().c_str()));
+                if (!subDir) continue;
+
+                struct dirent * dirent;
+                while (errno = 0, dirent = readdir(subDir.get())) {
+                    checkInterrupt();
+                    inodeHash.insert(dirent->d_ino);
+                }
+                if (errno)
+                    throw SysError("reading directory %1%", PathFmt(subPath));
             }
             if (errno)
-                throw SysError("reading directory %1%", PathFmt(subPath));
+                throw SysError("reading directory %1%", PathFmt(shardedDir));
         }
-        if (errno)
-            throw SysError("reading directory %1%", PathFmt(linksShardedDir));
-    }
+    };
+
+    loadShardedDir(linksShardedDir);
+    loadShardedDir(linksBlake3ShardedDir);
 
     printMsg(lvlTalkative, "loaded %1% hash inodes", inodeHash.size());
 
@@ -305,17 +311,29 @@ void LocalStore::optimisePath_(
 
        Also note that if `path' is a symlink, then we're hashing the
        contents of the symlink (i.e. the result of readlink()), not
-       the contents of the target (which may not even exist). */
+       the contents of the target (which may not even exist).
 
-    Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
+       When the blake3-links experimental feature is enabled, BLAKE3
+       replaces SHA-256 as the hash algorithm, and replicas go into a
+       separate .links/blake3/ tree (sharded and overflow-handled the
+       same way). Since we still hash the NAR serialisation rather than
+       flat file content, the execute-bit/symlink distinction above is
+       preserved automatically - no separate mode-suffix encoding is
+       needed the way it would be for a flat-content hash. */
+    bool useBlake3 = experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links);
+    HashAlgorithm hashAlgo = useBlake3 ? HashAlgorithm::BLAKE3 : HashAlgorithm::SHA256;
+    const std::filesystem::path & shardedDir = useBlake3 ? linksBlake3ShardedDir : linksShardedDir;
+    const std::filesystem::path & overflowDir = useBlake3 ? linksBlake3OverflowDir : linksOverflowDir;
+
+    Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, hashAlgo).hash;
     std::string hashStr = hash.to_string(HashFormat::Nix32, false);
     debug("%s has hash '%s'", PathFmt(path), hashStr);
 
-    // Sharded link path: .links/sha256/0ab/0ab12cdef...xyz
+    // Sharded link path: .links/{sha256,blake3}/0ab/0ab12cdef...xyz
     // Use first 3 chars for shard (first char is always ‘0’ or ‘1’, giving 2048 shards)
-    // Overflow replicas go in .links/sha256/overflow/HASH.001, .002, ...
+    // Overflow replicas go in .links/{sha256,blake3}/overflow/HASH.001, .002, ...
     std::string shard = hashStr.substr(0, 3);
-    std::filesystem::path shardDir = linksShardedDir / shard;
+    std::filesystem::path shardDir = shardedDir / shard;
     std::filesystem::path linkPath = shardDir / hashStr;
 
     std::filesystem::path tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
@@ -343,14 +361,14 @@ void LocalStore::optimisePath_(
     for (int seq = 0; seq < 1000; ++seq) {
         std::filesystem::path candidatePath = seq == 0
             ? linkPath
-            : linksOverflowDir / (hashStr + fmt(".%03d", seq));
+            : overflowDir / (hashStr + fmt(".%03d", seq));
 
         // Step 1: ensure replica exists.
         // In repair mode, check if an existing replica is corrupted and remove it.
         if (repair) {
             auto stReplica = maybeLstat(candidatePath);
             if (stReplica && (st.st_size != stReplica->st_size ||
-                hash != hashPath(makeFSSourceAccessor(candidatePath), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash)) {
+                hash != hashPath(makeFSSourceAccessor(candidatePath), FileSerialisationMethod::NixArchive, hashAlgo).hash)) {
                 warn("removing corrupted link %s", PathFmt(candidatePath));
                 unlinkIfExists(candidatePath);
             }

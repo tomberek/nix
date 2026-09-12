@@ -241,6 +241,8 @@ public:
     const std::filesystem::path linksDir;
     const std::filesystem::path linksShardedDir;
     const std::filesystem::path linksOverflowDir;
+    const std::filesystem::path linksBlake3ShardedDir;
+    const std::filesystem::path linksBlake3OverflowDir;
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
     const std::filesystem::path tempRootsDir;

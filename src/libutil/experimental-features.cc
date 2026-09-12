@@ -25,7 +25,7 @@ struct ExperimentalFeatureDetails
  * feature, we either have no issue at all if few features are not added
  * at the end of the list, or a proper merge conflict if they are.
  */
-constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BLAKE3Hashes);
+constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BLAKE3Links);
 
 constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails = {{
     {
@@ -276,6 +276,24 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
         .name = "blake3-hashes",
         .description = R"(
             Enables support for BLAKE3 hashes.
+        )",
+        .trackingUrl = "https://github.com/NixOS/nix/milestone/60",
+    },
+    {
+        .tag = Xp::BLAKE3Links,
+        .name = "blake3-links",
+        .description = R"(
+            Use BLAKE3 instead of SHA-256 to hash file contents for
+            [`nix-store --optimise`](@docroot@/command-ref/nix-store/optimise.md)'s
+            hardlink farm.
+
+            When enabled, new replicas are written under `.links/blake3/`
+            (sharded and overflow-handled the same way as the default
+            `.links/sha256/` tree) instead of `.links/sha256/`. Implies
+            `blake3-hashes`. Existing SHA-256 replicas are left as-is;
+            switching this on does not migrate or invalidate them, so a
+            store can accumulate both trees if the setting is toggled
+            over time.
         )",
         .trackingUrl = "https://github.com/NixOS/nix/milestone/60",
     },

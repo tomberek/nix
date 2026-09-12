@@ -850,19 +850,25 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         // Clean up old SHA256 links in .links/
         cleanupLinksDir(linksDir);
 
-        // Clean up all subdirectories of .links/sha256/ (shards + overflow + any future)
-        AutoCloseDir shardedRoot(opendir(linksShardedDir.string().c_str()));
-        if (shardedRoot) {
-            struct dirent * dirent;
-            while (errno = 0, dirent = readdir(shardedRoot.get())) {
-                checkInterrupt();
-                std::string name = dirent->d_name;
-                if (name == "." || name == "..") continue;
-                cleanupLinksDir(linksShardedDir / name);
+        // Clean up all subdirectories of a sharded links directory
+        // (shards + overflow + any future additions)
+        auto cleanupShardedLinksDir = [&](const std::filesystem::path & shardedDir) {
+            AutoCloseDir shardedRoot(opendir(shardedDir.string().c_str()));
+            if (shardedRoot) {
+                struct dirent * dirent;
+                while (errno = 0, dirent = readdir(shardedRoot.get())) {
+                    checkInterrupt();
+                    std::string name = dirent->d_name;
+                    if (name == "." || name == "..") continue;
+                    cleanupLinksDir(shardedDir / name);
+                }
+                if (errno)
+                    throw SysError("reading directory %1%", PathFmt(shardedDir));
             }
-            if (errno)
-                throw SysError("reading directory %1%", PathFmt(linksShardedDir));
-        }
+        };
+
+        cleanupShardedLinksDir(linksShardedDir);
+        cleanupShardedLinksDir(linksBlake3ShardedDir);
 
         int64_t overhead =
 #ifdef _WIN32
