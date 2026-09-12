@@ -119,4 +119,24 @@ if [ -n "$(type -p sqlite3)" ]; then
         echo "surviving path's OptimisedPaths row was incorrectly removed"
         exit 1
     fi
+
+    # Regression test: a store root containing a single quote must not
+    # break the sidecar database's ATTACH statement (which used to be
+    # built via raw string concatenation instead of a bound parameter).
+    quoteRoot="$TEST_ROOT/store with'quote"
+    rm -rf "$quoteRoot"
+    mkdir -p "$quoteRoot"
+    quoteOutput=$(nix-store --store "local?root=$quoteRoot" --add-fixed sha256 "$config_nix" 2>&1)
+    if echo "$quoteOutput" | grepQuiet "cannot attach optimised-paths database"; then
+        echo "sidecar database failed to attach for a store root containing a quote: $quoteOutput"
+        exit 1
+    fi
+    if [ ! -f "$quoteRoot"/nix/var/nix/db/optimised.sqlite ]; then
+        echo "optimised.sqlite was not created for a store root containing a quote"
+        exit 1
+    fi
+    if [ "$(sqlite3 "$quoteRoot"/nix/var/nix/db/optimised.sqlite 'pragma journal_mode;')" != "wal" ]; then
+        echo "sidecar database for a quoted store root is not in WAL mode"
+        exit 1
+    fi
 fi

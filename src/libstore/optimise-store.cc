@@ -78,20 +78,29 @@ void LocalStore::attachOptimisedDb(State & state)
         return;
 
     try {
-        auto optimisedDbPath = dbDir / "optimised.sqlite";
-        state.db.exec("attach database '" + optimisedDbPath.string() + "' as opt");
-        state.db.exec(
-            "create table if not exists opt.OptimisedPaths ("
-            "path text primary key not null, "
-            "narHash text not null, "
-            "optimisedTime integer not null"
-            ")");
+        retrySQLite<void>([&]() {
+            auto optimisedDbPath = dbDir / "optimised.sqlite";
+            {
+                SQLiteStmt attachStmt;
+                attachStmt.create(state.db, "attach database ? as opt");
+                attachStmt.use()(optimisedDbPath.string()).exec();
+            }
+            state.db.exec("pragma opt.journal_mode = wal");
+            state.db.exec(
+                "create table if not exists opt.OptimisedPaths ("
+                "path text primary key not null, "
+                "narHash text not null, "
+                "optimisedTime integer not null"
+                ")");
+        });
         optimisedDbAttached = true;
     } catch (SQLiteError & e) {
         // Read-only directory, out of space, corrupted sidecar file,
         // etc. Don't fail store opening over an optimisation nicety -
         // optimisedDbAttached stays false, and optimiseStore() falls
-        // back to treating every path as unoptimised.
+        // back to treating every path as unoptimised. retrySQLite()
+        // above already retried transparently on SQLITE_BUSY, so
+        // reaching here means the failure wasn't transient.
         printError("cannot attach optimised-paths database, optimisation tracking disabled: %s", e.msg());
     }
 }
