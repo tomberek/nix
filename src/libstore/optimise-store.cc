@@ -5,6 +5,7 @@
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/base-nix-32.hh"
+#include "nix/util/url.hh"
 
 #include <cstdlib>
 #include <cstring>
@@ -21,21 +22,9 @@
 #include <signal.h>
 #include <fcntl.h>
 
-#if NIX_SUPPORT_ACL
-#  include <sys/xattr.h>
-#endif
-
 #include "store-config-private.hh"
 
 namespace nix {
-
-#if NIX_SUPPORT_ACL
-// Use trusted.* namespace:
-// - Works on all file types (including symlinks)
-// - Requires CAP_SYS_ADMIN (nix-daemon has this)
-// - Non-root users can't read it, so they get no optimization (acceptable)
-static constexpr const char* XATTR_OPTIMISED = "trusted.nix.optimised";
-#endif
 
 static void makeWritable(const std::filesystem::path & path)
 {
@@ -64,67 +53,104 @@ struct MakeReadOnly
     }
 };
 
-bool LocalStore::isPathOptimised(const std::filesystem::path & path) const
+/* Attach the optimised-paths sidecar database to `state.db` as `opt`,
+   creating it (and its one table) if it doesn't exist yet.
+
+   Design: rather than a boolean marker, OptimisedPaths.narHash records
+   the ValidPaths.hash that was current when the path was optimised.
+   This gives automatic invalidation for free - if a path is later
+   rebuilt or repaired, its ValidPaths.hash changes, the join condition
+   in QueryUnoptimisedPaths stops matching, and the path is treated as
+   unoptimised again - without any explicit "clear the marker" call
+   anywhere in registerValidPath()/addToStore().
+
+   Kept in its own file (never migrated into the main db.sqlite schema
+   or nixSchemaVersion) so a corrupted or missing sidecar can never
+   affect the store's core validity data - on any failure below,
+   optimisedDbAttached stays false and optimise-store falls back to
+   full-rescan behaviour.
+
+   On a read-only store, the sidecar is attached with the SQLite URI
+   `mode=ro` so the connection itself refuses writes, matching how the
+   main db.sqlite connection is opened with SQLiteOpenMode::Immutable
+   in that case.
+
+   ATTACH is issued once, outside retrySQLite(): re-attaching an alias
+   already bound on this connection fails with a plain SQLITE_ERROR
+   ("database opt is already in use"), not SQLITE_BUSY, so retrying
+   the whole ATTACH+PRAGMA+CREATE-TABLE sequence as one unit would turn
+   a transient busy error on the later statements into a permanent
+   failure. Only those later, genuinely retryable statements are
+   wrapped in retrySQLite().
+
+   `create table if not exists` is a silent no-op against a
+   pre-existing same-named table with different columns (e.g. a future
+   incompatible version), so the actual column shape is verified via
+   `pragma table_info` before the table is trusted - otherwise the
+   prepared statements below, which reference specific columns, would
+   throw at prepare time outside this function's try/catch. */
+static bool hasExpectedOptimisedPathsColumns(SQLite & db)
 {
-#if NIX_SUPPORT_ACL
-    if (xattrsUnsupported.load(std::memory_order_relaxed))
-        return false;
-
-    char buf[32];
-    ssize_t size = lgetxattr(path.c_str(), XATTR_OPTIMISED, buf, sizeof(buf));
-
-    if (size < 0) {
-        if (errno == ENOTSUP || errno == EOPNOTSUPP) {
-            // Filesystem doesn't support xattrs - disable further attempts
-            // for the lifetime of this store, so we don't retry a syscall
-            // that's known to fail on every remaining path.
-            if (!xattrsUnsupported.exchange(true, std::memory_order_relaxed)) {
-                debug("filesystem at %s doesn't support extended attributes, optimization tracking disabled", path.string());
-            }
-            return false;
-        }
-        // EPERM/EACCES means trusted.* but no CAP_SYS_ADMIN (non-root user).
-        // Our credentials won't change for the lifetime of this process,
-        // so this is just as permanent as ENOTSUP - cache it the same way.
-        if (errno == EPERM || errno == EACCES) {
-            if (!xattrsUnsupported.exchange(true, std::memory_order_relaxed)) {
-                debug("no permission to read extended attributes at %s, optimization tracking disabled", path.string());
-            }
-            return false;
-        }
-        // No xattr (ENODATA/ENOATTR) = not optimised
-        return false;
-    }
-
-    return true;  // xattr exists = already optimised
-#else
-    return false;  // Platform doesn't support xattrs: always re-optimize
-#endif
+    // pragma table_info (not the newer pragma_table_info() table-valued
+    // function, which needs SQLite 3.16+ vs this project's 3.6.19 floor).
+    // Column name is result column 1 (0 is the `cid` index).
+    SQLiteStmt columnsStmt;
+    columnsStmt.create(db, "pragma opt.table_info(OptimisedPaths)");
+    StringSet columns;
+    auto use(columnsStmt.use());
+    while (use.next())
+        columns.insert(use.getStr(1));
+    return columns == StringSet{"path", "narHash", "optimisedTime"};
 }
 
-void LocalStore::markPathOptimised(const std::filesystem::path & path)
+void LocalStore::attachOptimisedDb(State & state)
 {
-#if NIX_SUPPORT_ACL
-    if (xattrsUnsupported.load(std::memory_order_relaxed))
-        return;
-
-    std::string timestamp = std::to_string(time(nullptr));
-
-    if (lsetxattr(path.c_str(), XATTR_OPTIMISED, timestamp.c_str(),
-                  timestamp.size(), 0) < 0) {
-        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM || errno == EACCES) {
-            // Same permanent conditions as isPathOptimised() - stop retrying.
-            xattrsUnsupported.store(true, std::memory_order_relaxed);
-        } else if (errno != EROFS) {
-            // Log unexpected errors, but ignore read-only filesystem
-            // (also permanent, but not worth a dedicated flag - EROFS
-            // only matters for markPathOptimised, and failing silently
-            // there is already the correct behaviour).
-            debug("failed to mark path optimised: %s", strerror(errno));
+    try {
+        auto optimisedDbPath = dbDir / "optimised.sqlite";
+        {
+            SQLiteStmt attachStmt;
+            attachStmt.create(state.db, "attach database ? as opt");
+            std::string attachUri = config->readOnly
+                ? "file:" + percentEncode(optimisedDbPath.string()) + "?mode=ro"
+                : optimisedDbPath.string();
+            attachStmt.use()(attachUri).exec();
         }
-        // Don't fail optimization if xattr fails
+
+        bool ready = retrySQLite<bool>([&]() {
+            if (!config->readOnly) {
+                state.db.exec("pragma opt.journal_mode = wal");
+                state.db.exec(
+                    "create table if not exists opt.OptimisedPaths ("
+                    "path text primary key not null, "
+                    "narHash text not null, "
+                    "optimisedTime integer not null"
+                    ")");
+            }
+            return hasExpectedOptimisedPathsColumns(state.db);
+        });
+
+        if (!ready) {
+            debug("optimised-paths sidecar database has no usable OptimisedPaths table, optimisation tracking disabled");
+            state.db.exec("detach database opt");
+            return;
+        }
+
+        optimisedDbAttached = true;
+    } catch (SQLiteError & e) {
+        // Read-only directory, out of space, corrupted sidecar file,
+        // etc. Don't fail store opening over an optimisation nicety -
+        // optimisedDbAttached stays false, and optimiseStore() falls
+        // back to treating every path as unoptimised.
+        printError("cannot attach optimised-paths database, optimisation tracking disabled: %s", e.msg());
+        // ATTACH may have succeeded even though a later statement
+        // threw; detach so we don't leave a half-initialised 'opt'
+        // bound for the rest of this process's lifetime. Ignore
+        // failure (e.g. ATTACH itself never succeeded).
+        try {
+            state.db.exec("detach database opt");
+        } catch (SQLiteError &) {
+        }
     }
-#endif
 }
 
 AutoCloseFD LocalStore::tryClaimPath(const std::filesystem::path & path)
@@ -459,8 +485,25 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
 {
     Activity act(*logger, actOptimiseStore);
 
-    auto paths = queryAllValidPaths();
-    std::vector<StorePath> pathVec(paths.begin(), paths.end());
+    // Instead of iterating over every valid path and checking a
+    // per-path marker (as the xattr design does), get the exact set of
+    // paths that need optimising in a single query: any path with no
+    // OptimisedPaths row, or whose OptimisedPaths.narHash no longer
+    // matches its current ValidPaths.hash (i.e. rebuilt/repaired since
+    // last optimised). If the sidecar isn't attached, fall back to
+    // treating every valid path as unoptimised - same behaviour as the
+    // full-rescan path this feature exists to avoid needing.
+    std::vector<StorePath> pathVec;
+    std::vector<std::string> pathHashes;
+    if (optimisedDbAttached) {
+        for (auto & [path, narHashBase16] : queryUnoptimisedPaths()) {
+            pathVec.push_back(path);
+            pathHashes.push_back(narHashBase16);
+        }
+    } else {
+        auto paths = queryAllValidPaths();
+        pathVec.assign(paths.begin(), paths.end());
+    }
 
     // Use a coprime step size to iterate in a different order than other concurrent optimizers.
     // This avoids lockstep marching where multiple optimizers process the exact same paths
@@ -482,32 +525,17 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         start = getpid() % n;
     }
 
-    // Check if xattrs are usable by trying to list xattrs on linksDir.
-    // If not usable, we need to pre-load the inode hash as a fallback,
-    // and can skip the per-path isPathOptimised()/markPathOptimised()
-    // syscalls entirely for the rest of this run.
     InodeHash inodeHash;
-#if NIX_SUPPORT_ACL
-    // Try to list xattrs on linksDir to detect if they're usable
-    ssize_t size = llistxattr(linksDir.string().c_str(), nullptr, 0);
-    if (size < 0) {
-        // Any failure means we can't rely on xattrs for optimization tracking
-        // Load inode hash as fallback to avoid duplicate work
-        debug("cannot use xattrs for optimization tracking (%s), loading inode hash", strerror(errno));
+    if (!optimisedDbAttached) {
+        // No way to skip already-linked files cheaply without the
+        // sidecar - pre-load known inodes so we don't duplicate
+        // hardlinking work within this run at least.
         inodeHash = loadInodeHash();
-        xattrsUnsupported.store(true, std::memory_order_relaxed);
     }
-    // Otherwise: xattrs work (size >= 0)
-    // Start with empty hash - xattr checks will skip already-optimised paths
-#else
-    // Platform doesn't support xattrs at compile time
-    inodeHash = loadInodeHash();
-#endif
 
     act.progress(0, pathVec.size());
 
     uint64_t done = 0;
-    uint64_t skipped = 0;
 
     // Iterate using coprime step for different traversal order per optimizer
     for (size_t offset = 0; offset < pathVec.size(); ++offset) {
@@ -517,26 +545,15 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         auto & i = pathVec[idx];
         auto fullPath = config->realStoreDir.get() / i.to_string();
 
-        // Check xattr FIRST - if optimised, skip expensive DB operations
-        if (isPathOptimised(fullPath)) {
-            debug("skipping already-optimised path '%s'", printStorePath(i));
-            skipped++;
-            done++;
-            act.progress(done, pathVec.size());
-            continue;
-        }
-
         // Try to claim this path for optimization (prevents duplicate work with concurrent optimizers)
         auto lockFd = tryClaimPath(fullPath);
         if (!lockFd) {
             debug("another optimizer is processing '%s', skipping", printStorePath(i));
-            skipped++;
             done++;
             act.progress(done, pathVec.size());
             continue;
         }
 
-        // Only do DB operations for paths that need optimization
         addTempRoot(i);
         if (!isValidPath(i)) {
             /* path was GC'ed, probably */
@@ -550,8 +567,14 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
             optimisePath_(&act, stats, fullPath, inodeHash, NoRepair);
         }
 
-        // Mark path as optimised
-        markPathOptimised(fullPath);
+        // Note: marks the whole path even though optimisePath_() may
+        // have silently skipped an individual file via one of its
+        // non-fatal early returns (suspicious writable file, full
+        // shard dir, overflow exhaustion) - pre-existing behaviour,
+        // not introduced by the sidecar.
+        if (optimisedDbAttached) {
+            markPathOptimised(i, pathHashes[idx]);
+        }
 
         // lockFd goes out of scope here, automatically releasing the lock
 
@@ -559,9 +582,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         act.progress(done, pathVec.size());
     }
 
-    if (skipped > 0) {
-        printInfo("skipped %d already-optimised paths", skipped);
-    }
+    deleteStaleOptimisedPaths();
 }
 
 void LocalStore::optimiseStore()
@@ -573,14 +594,17 @@ void LocalStore::optimiseStore()
     printInfo("%s freed by hard-linking %d files", renderSize(stats.bytesFreed), stats.filesLinked);
 }
 
-void LocalStore::optimisePath(const std::filesystem::path & path, RepairFlag repair)
+void LocalStore::optimisePath(
+    const std::filesystem::path & path, RepairFlag repair, std::optional<StorePath> storePath, std::optional<Hash> narHash)
 {
     OptimiseStats stats;
     InodeHash inodeHash;
 
     if (config->getLocalSettings().autoOptimiseStore) {
         optimisePath_(nullptr, stats, path, inodeHash, repair);
-        markPathOptimised(path);
+        if (optimisedDbAttached && storePath && narHash) {
+            markPathOptimised(*storePath, narHash->to_string(HashFormat::Base16, true));
+        }
     }
 }
 

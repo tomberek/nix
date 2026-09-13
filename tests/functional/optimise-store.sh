@@ -74,3 +74,139 @@ if [ -d "$NIX_STORE_DIR"/.links/sha256 ]; then
         fi
     done
 fi
+
+# Test the optimised-paths sidecar database (skip-tracking mechanism)
+if [ -n "$(type -p sqlite3)" ]; then
+    clearStoreIfPossible
+
+    # shellcheck disable=SC2016
+    outPath4=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "foo4"; builder = builtins.toFile "builder" "mkdir $out; echo hello > $out/foo"; }' | nix-build - --no-out-link)
+    # shellcheck disable=SC2016
+    outPath5=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "foo5"; builder = builtins.toFile "builder" "mkdir $out; echo hello > $out/foo"; }' | nix-build - --no-out-link)
+
+    if [ ! -f "$NIX_STATE_DIR"/db/optimised.sqlite ]; then
+        echo "optimised.sqlite sidecar database was not created"
+        exit 1
+    fi
+
+    NIX_REMOTE="" nix-store --optimise
+
+    for p in "$outPath4" "$outPath5"; do
+        if ! sqlite3 "$NIX_STATE_DIR"/db/optimised.sqlite "select 1 from OptimisedPaths where path = '$p'" | grep -q 1; then
+            echo "no OptimisedPaths row for '$p' after optimising"
+            exit 1
+        fi
+    done
+
+    # A second run should be a complete no-op: every path already has a
+    # matching (path, narHash) row, so the anti-join finds nothing to do.
+    secondRunOutput=$(NIX_REMOTE="" nix-store --optimise 2>&1)
+    if [ "$secondRunOutput" != "0.0 KiB freed by hard-linking 0 files" ]; then
+        echo "second optimise run was not a no-op: $secondRunOutput"
+        exit 1
+    fi
+
+    # GC should prune the OptimisedPaths row for a path it deletes,
+    # while leaving other rows (e.g. the surviving path) untouched.
+    nix-store --delete "$outPath4"
+
+    if sqlite3 "$NIX_STATE_DIR"/db/optimised.sqlite "select 1 from OptimisedPaths where path = '$outPath4'" | grep -q 1; then
+        echo "deleted path's OptimisedPaths row was not pruned by GC"
+        exit 1
+    fi
+
+    if ! sqlite3 "$NIX_STATE_DIR"/db/optimised.sqlite "select 1 from OptimisedPaths where path = '$outPath5'" | grep -q 1; then
+        echo "surviving path's OptimisedPaths row was incorrectly removed"
+        exit 1
+    fi
+
+    # Regression tests: a corrupted or malformed sidecar database must
+    # degrade gracefully (fall back to full-rescan) instead of crashing
+    # the store. Each case seeds a store root's optimised.sqlite before
+    # the store is ever opened, then runs a trivial command against it.
+    checkSidecarDegradesGracefully () {
+        local root="$1" expectedMessage="$2"
+        shift 2
+        local output
+        output=$(nix-store --store "local?root=$root" --add-fixed sha256 "$config_nix" "$@" 2>&1)
+        if [ $? != 0 ]; then
+            echo "nix-store failed against $root: $output"
+            exit 1
+        fi
+        if ! echo "$output" | grepQuiet "$expectedMessage"; then
+            echo "expected '$expectedMessage' for $root, got: $output"
+            exit 1
+        fi
+    }
+
+    # A store root containing a single quote must not break the
+    # sidecar's ATTACH statement (previously built via raw string
+    # concatenation instead of a bound parameter).
+    quoteRoot="$TEST_ROOT/store with'quote"
+    rm -rf "$quoteRoot"
+    mkdir -p "$quoteRoot"
+    nix-store --store "local?root=$quoteRoot" --add-fixed sha256 "$config_nix" > /dev/null
+    if [ ! -f "$quoteRoot"/nix/var/nix/db/optimised.sqlite ]; then
+        echo "optimised.sqlite was not created for a store root containing a quote"
+        exit 1
+    fi
+    if [ "$(sqlite3 "$quoteRoot"/nix/var/nix/db/optimised.sqlite 'pragma journal_mode;')" != "wal" ]; then
+        echo "sidecar database for a quoted store root is not in WAL mode"
+        exit 1
+    fi
+
+    # A genuinely corrupted (non-SQLite) sidecar file.
+    corruptRoot="$TEST_ROOT/store-corrupt-sidecar"
+    rm -rf "$corruptRoot"
+    mkdir -p "$corruptRoot"/nix/var/nix/db
+    echo "not a sqlite database" > "$corruptRoot"/nix/var/nix/db/optimised.sqlite
+    checkSidecarDegradesGracefully "$corruptRoot" "cannot attach optimised-paths database"
+
+    # A pre-existing OptimisedPaths table with the wrong columns (e.g.
+    # from an incompatible version): CREATE TABLE IF NOT EXISTS
+    # silently no-ops against it, so the column shape must be checked
+    # explicitly. -vvv is needed since this logs at debug level (it's
+    # detected after a successful ATTACH, not an ATTACH failure).
+    wrongSchemaRoot="$TEST_ROOT/store-wrong-schema-sidecar"
+    rm -rf "$wrongSchemaRoot"
+    mkdir -p "$wrongSchemaRoot"/nix/var/nix/db
+    sqlite3 "$wrongSchemaRoot"/nix/var/nix/db/optimised.sqlite \
+        "create table OptimisedPaths (path text primary key, done boolean);"
+    checkSidecarDegradesGracefully "$wrongSchemaRoot" "no usable OptimisedPaths table" -vvv
+    if [ "$(sqlite3 "$wrongSchemaRoot"/nix/var/nix/db/optimised.sqlite 'select count(*) from OptimisedPaths')" != 0 ]; then
+        echo "wrong-schema sidecar table was unexpectedly written to"
+        exit 1
+    fi
+
+    # Regression test: the anti-join invalidation mechanism must
+    # actually re-select a path whose narHash has gone stale relative
+    # to ValidPaths.hash and update its row (the ON CONFLICT DO UPDATE
+    # branch, not just the plain INSERT branch exercised above). We
+    # can't easily force a genuine non-deterministic rebuild in this
+    # suite, so directly rewrite ValidPaths.hash to simulate a rebuild.
+    clearStoreIfPossible
+
+    # shellcheck disable=SC2016
+    outPath6=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "foo6"; builder = builtins.toFile "builder" "mkdir $out; echo hello > $out/foo"; }' | nix-build - --no-out-link)
+
+    NIX_REMOTE="" nix-store --optimise
+
+    staleHash="sha256:0000000000000000000000000000000000000000000000000000000000000"
+    sqlite3 "$NIX_STATE_DIR"/db/db.sqlite "update ValidPaths set hash = '$staleHash' where path = '$outPath6'"
+
+    NIX_REMOTE="" nix-store --optimise
+
+    newHash=$(sqlite3 "$NIX_STATE_DIR"/db/optimised.sqlite "select narHash from OptimisedPaths where path = '$outPath6'")
+    if [ "$newHash" != "$staleHash" ]; then
+        echo "OptimisedPaths.narHash was not updated to match the new ValidPaths.hash: got '$newHash'"
+        exit 1
+    fi
+
+    # A further run should now be a no-op again, confirming the anti-join
+    # sees a fresh match.
+    fourthRunOutput=$(NIX_REMOTE="" nix-store --optimise 2>&1)
+    if [ "$fourthRunOutput" != "0.0 KiB freed by hard-linking 0 files" ]; then
+        echo "optimise run was not a no-op after narHash was updated: $fourthRunOutput"
+        exit 1
+    fi
+fi

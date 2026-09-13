@@ -34,6 +34,21 @@ expectStderr 1 nix-store --store local?read-only=true --add eval.nix | grepQuiet
 # Test a few operations that should work with the read-only store in its current state
 happy
 
+## Testing the optimised-paths sidecar database's read-only behaviour
+
+# --optimise against a logically-read-only store (the store dir itself is
+# still writable here, before we chmod it below) should succeed and must
+# never write to the optimised-paths sidecar database.
+nix-store --store local?read-only=true --optimise
+
+if [ -n "$(type -p sqlite3)" ] && [ -f "$NIX_STATE_DIR"/db/optimised.sqlite ]; then
+    if sqlite3 "file:$NIX_STATE_DIR/db/optimised.sqlite?mode=ro" \
+        "insert into OptimisedPaths values ('x', 'y', 1)" 2>/dev/null; then
+        echo "optimised.sqlite sidecar accepted a write while store is read-only"
+        exit 1
+    fi
+fi
+
 ## Testing read-only mode with an underlying store that is actually read-only
 
 # Ensure store is actually read-only

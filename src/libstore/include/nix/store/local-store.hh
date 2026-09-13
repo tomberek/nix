@@ -11,7 +11,6 @@
 #include <chrono>
 #include <future>
 #include <string>
-#include <atomic>
 #include <boost/unordered/unordered_flat_set.hpp>
 
 namespace nix {
@@ -380,18 +379,20 @@ public:
     /**
      * Optimise a single store path. Optionally, test the encountered
      * symlinks for corruption.
+     *
+     * @param storePath The logical store path, used as the key into
+     * the optimised-paths sidecar database. Along with `narHash`, if
+     * both are provided, the path is recorded as optimised so a later
+     * full `optimiseStore()` pass can skip it. If either is omitted,
+     * tracking is skipped for this call (the path will simply be
+     * re-optimised on the next full pass, same as any never-tracked
+     * path).
      */
-    void optimisePath(const std::filesystem::path & path, RepairFlag repair);
-
-    /**
-     * Check if a store path has been optimised using xattrs.
-     */
-    bool isPathOptimised(const std::filesystem::path & path) const;
-
-    /**
-     * Mark a store path as optimised using xattrs.
-     */
-    void markPathOptimised(const std::filesystem::path & path);
+    void optimisePath(
+        const std::filesystem::path & path,
+        RepairFlag repair,
+        std::optional<StorePath> storePath = {},
+        std::optional<Hash> narHash = {});
 
     /**
      * Try to claim a path for optimization (prevents duplicate work with concurrent optimizers).
@@ -492,6 +493,13 @@ private:
 
     void upgradeDBSchema(State & state);
 
+    /**
+     * Attach the sidecar `optimised.sqlite` database (see
+     * optimisedDbAttached) used to track which store paths have
+     * already been optimised.
+     */
+    void attachOptimisedDb(State & state);
+
     void makeStoreWritable();
 
     uint64_t queryValidPathId(State & state, const StorePath & path);
@@ -520,15 +528,43 @@ private:
     typedef boost::unordered_flat_set<ino_t> InodeHash;
 
     /**
-     * Cached result of whether xattrs are usable for optimisation
-     * tracking on this store (see isPathOptimised()/markPathOptimised()).
-     * Starts optimistic (false = "not known to be unsupported"); once a
-     * permanent failure (ENOTSUP/EOPNOTSUPP/EPERM/EACCES) is observed on
-     * any path, flips to true for the remaining lifetime of this
-     * LocalStore, so subsequent calls short-circuit without issuing a
-     * syscall that's known to fail again.
+     * Whether the optimised-paths sidecar database (see
+     * optimisedDbAttached) is usable. Set once in the constructor;
+     * false if ATTACH or CREATE TABLE failed (e.g. read-only
+     * filesystem without a pre-existing sidecar file), in which case
+     * every path is always treated as unoptimised - the same
+     * degrade-gracefully behaviour the xattr design used for
+     * unsupported filesystems.
      */
-    mutable std::atomic<bool> xattrsUnsupported{false};
+    bool optimisedDbAttached = false;
+
+    /**
+     * Record that `path` has been optimised, keyed to `narHashBase16`
+     * (as stored in `ValidPaths.hash`, i.e. `HashFormat::Base16` with
+     * algorithm prefix). A later mismatch between this value and the
+     * path's current `ValidPaths.hash` - e.g. after a rebuild or
+     * repair - causes the path to be treated as unoptimised again.
+     * No-op (logs and returns) if optimisedDbAttached is false or the
+     * write fails; optimisation itself never fails over a bookkeeping
+     * write.
+     */
+    void markPathOptimised(const StorePath & path, const std::string & narHashBase16);
+
+    /**
+     * Query the set of valid paths that need optimising: those with no
+     * OptimisedPaths row, or whose recorded narHash no longer matches
+     * their current ValidPaths.hash. Pairs each path with the narHash
+     * string to pass back to markPathOptimised() once it's been
+     * optimised, so the caller never needs a second lookup.
+     * optimisedDbAttached must be true before calling this.
+     */
+    std::vector<std::pair<StorePath, std::string>> queryUnoptimisedPaths();
+
+    /**
+     * Delete OptimisedPaths rows for paths no longer in ValidPaths.
+     * No-op if optimisedDbAttached is false.
+     */
+    void deleteStaleOptimisedPaths();
 
     InodeHash loadInodeHash();
     Strings readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash);

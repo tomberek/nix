@@ -876,6 +876,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             ;
 
         printInfo("note: hard linking is currently saving %s", renderSize(unsharedSize - actualSize - overhead));
+
+        // Prune OptimisedPaths rows for paths that no longer exist, so
+        // the sidecar db doesn't grow unbounded as paths churn.
+        deleteStaleOptimisedPaths();
     }
 
     /* While we're at it, vacuum the database. */
