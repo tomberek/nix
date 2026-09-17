@@ -11,6 +11,7 @@
 #include <chrono>
 #include <future>
 #include <string>
+#include <vector>
 #include <boost/unordered/unordered_flat_set.hpp>
 
 namespace nix {
@@ -320,6 +321,15 @@ public:
         bool filterReferences);
 
     void addTempRoot(const StorePath & path) override;
+
+    /**
+     * Batch-register temp roots for `paths`, holding the GC lock once
+     * for the whole batch instead of once per path (same safety
+     * guarantee as `addTempRoot()`, called per-path, but amortised).
+     * Falls back to calling `addTempRoot()` per path if the GC lock is
+     * currently held by a running collector.
+     */
+    void addTempRootsBatch(const std::vector<StorePath> & paths);
 
 private:
 

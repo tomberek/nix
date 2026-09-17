@@ -158,6 +158,47 @@ restart:
     writeFull(_fdTempRoots.lock()->get(), s);
 }
 
+void LocalStore::addTempRootsBatch(const std::vector<StorePath> & paths)
+{
+    if (config->readOnly) {
+        debug(
+            "Read-only store doesn't support creating lock files for temp roots, but nothing can be deleted anyways.");
+        return;
+    }
+
+    createTempRootsFile();
+
+    {
+        auto fdGCLock(_fdGCLock.lock());
+        if (!*fdGCLock)
+            *fdGCLock = openGCLock();
+    }
+
+    /* Hold one shared GC lock across the whole batch instead of
+       acquiring and releasing it per path: GC's exclusive lock
+       acquire (collectGarbage()'s ltWrite) can't proceed until this
+       is released, so all N writes below are still made visible to
+       findTempRoots() before GC could possibly start - same guarantee
+       addTempRoot() gives per-call, just amortised. If GC is already
+       running (lock contended), fall through to the existing
+       per-path addTempRoot(), which handles the socket-notify path;
+       that per-path cost is only paid in the already-rare contended
+       case, not on every call. */
+    FdLock gcLock(_fdGCLock.lock()->get(), ltRead, false, "");
+
+    if (!gcLock.acquired) {
+        for (auto & path : paths)
+            addTempRoot(path);
+        return;
+    }
+
+    auto fdTempRoots(_fdTempRoots.lock());
+    for (auto & path : paths) {
+        auto s = printStorePath(path) + '\0';
+        writeFull(fdTempRoots->get(), s);
+    }
+}
+
 static std::string censored = "{censored}";
 
 void LocalStore::findTempRoots(Roots & tempRoots, bool censor)
