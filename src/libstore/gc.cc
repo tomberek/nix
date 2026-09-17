@@ -897,12 +897,20 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
         printInfo("deleting unused links...");
 
-        int64_t actualSize = 0, unsharedSize = 0;
+        int64_t actualSize = 0, unsharedSize = 0, overhead = 0;
 
         auto cleanupLinksDir = [&](const std::filesystem::path & dir) {
             AutoCloseDir d(opendir(dir.string().c_str()));
             if (!d)
                 return;
+
+#ifndef _WIN32
+            /* Directory block overhead, folded into the same walk that
+               already visits .links, every sha256 shard + overflow,
+               and (if ever enabled) every b3 mode/shard + overflow -
+               a single stat(linksDir) missed all but one of these. */
+            overhead += stat(dir).st_blocks * 512ULL;
+#endif
 
             struct dirent * dirent;
             while (errno = 0, dirent = readdir(d.get())) {
@@ -952,16 +960,26 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
         cleanupLinksDir(shardedLinksOverflowDir);
 
-        int64_t overhead =
-#ifdef _WIN32
-            0
-#else
-            [&] {
-                auto st = stat(linksDir);
-                return st.st_blocks * 512ULL;
-            }()
-#endif
-            ;
+        /* .hardlinks/b3's three mode-keyed shard trees (present only
+           if blake3-links was ever enabled - the directories are
+           created lazily on first LocalStore construction with the
+           feature on, not unconditionally like .hardlinks/sha256) get
+           the same treatment. cleanupLinksDir() already no-ops on a
+           directory that doesn't exist. */
+        for (auto modeDir : {"r", "x", "s"}) {
+            auto dir = b3LinksDir / modeDir;
+            for (size_t first = 0; first < 2; ++first) {
+                for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                    for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                        checkInterrupt();
+                        char shard[4] = {
+                            BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                        cleanupLinksDir(dir / shard);
+                    }
+                }
+            }
+            cleanupLinksDir(dir / "overflow");
+        }
 
         printInfo("note: hard linking is currently saving %s", renderSize(unsharedSize - actualSize - overhead));
     }

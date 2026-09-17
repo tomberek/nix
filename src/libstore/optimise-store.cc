@@ -157,47 +157,6 @@ void LocalStore::optimisePath_(
         return;
     }
 
-    /* Hash the file.  Note that hashPath() returns the hash over the
-       NAR serialisation, which includes the execute bit on the file.
-       Thus, executable and non-executable files with the same
-       contents *won't* be linked (which is good because otherwise the
-       permissions would be screwed up).
-
-       Also note that if `path' is a symlink, then we're hashing the
-       contents of the symlink (i.e. the result of readlink()), not
-       the contents of the target (which may not even exist). */
-    Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
-    std::string hashStr = hash.to_string(HashFormat::Nix32, false);
-    debug("%s has hash '%s'", PathFmt(path), hash.to_string(HashFormat::Nix32, true));
-
-    /* Check the old flat .links/<hash> location first - this is where
-       every pre-sharding link still lives, and stays valid forever.
-       New links are never written here anymore; only the sharded farm
-       below (.hardlinks/sha256/<prefix>/<hash>, falling through to
-       numbered overflow replicas once a hash's primary replica hits
-       the ~32000-hardlink ceiling) receives new writes. */
-    std::filesystem::path linkPath = linksDir / hashStr;
-    bool foundInFlatLinks = pathExists(linkPath);
-
-    if (foundInFlatLinks) {
-        auto stLink = lstat(linkPath);
-        if (st.st_size != stLink.st_size || (repair && hash != ({
-                                                             hashPath(
-                                                                 makeFSSourceAccessor(linkPath),
-                                                                 FileSerialisationMethod::NixArchive,
-                                                                 HashAlgorithm::SHA256)
-                                                                 .hash;
-                                                         }))) {
-            // XXX: Consider overwriting linkPath with our valid version.
-            warn("removing corrupted link %s", PathFmt(linkPath));
-            warn(
-                "There may be more corrupted paths."
-                "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
-            unlinkIfExists(linkPath);
-            foundInFlatLinks = false;
-        }
-    }
-
     /* Attempt to replace `path` with a hard link to `candidatePath`
        (already confirmed to hold the same content). Returns true on
        success (including the "already linked" case) or if the caller
@@ -277,6 +236,133 @@ void LocalStore::optimisePath_(
             );
         return true;
     };
+
+    if (experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links)) {
+        /* BLAKE3 hashes flat content, not the NAR serialisation, so
+           executable-bit and symlink-vs-regular-file distinctions have
+           to be encoded separately: hash the symlink target's bytes
+           for a symlink, the file's raw bytes otherwise, and route
+           into one of three independent mode-keyed shard trees
+           (.hardlinks/b3/<r|x|s>/<prefix>/<hash>) rather than relying
+           on the hash itself to disambiguate. This is an alternative
+           dedup backend, not an addition to the sha256 path below: a
+           file is deduped via exactly one of the two farms per
+           optimisePath_() call, controlled by whether blake3-links is
+           enabled when this call happens to run - checked first, so a
+           store with blake3-links enabled never pays for the SHA-256
+           NAR-hash pass below at all. */
+        bool isSymlink = S_ISLNK(st.st_mode);
+        Hash b3Hash = isSymlink ? hashString(HashAlgorithm::BLAKE3, readLink(path).string())
+                                 : hashFile(HashAlgorithm::BLAKE3, path);
+        std::string b3HashStr = b3Hash.to_string(HashFormat::Nix32, false);
+        debug("%s has BLAKE3 hash '%s'", PathFmt(path), b3Hash.to_string(HashFormat::Nix32, true));
+
+        auto modeDir = b3LinksDir / std::string(linkModeDirName(st.st_mode));
+        std::string shard = b3HashStr.substr(0, 3);
+        std::filesystem::path primaryPath = modeDir / shard / b3HashStr;
+
+        auto hashCandidate = [&](const std::filesystem::path & candidatePath, mode_t candidateMode) {
+            return S_ISLNK(candidateMode) ? hashString(HashAlgorithm::BLAKE3, readLink(candidatePath).string())
+                                           : hashFile(HashAlgorithm::BLAKE3, candidatePath);
+        };
+
+        for (int seq = 0; seq < 1000; ++seq) {
+            std::filesystem::path candidatePath =
+                seq == 0 ? primaryPath : modeDir / "overflow" / (b3HashStr + fmt(".%03d", seq));
+
+            if (!pathExists(candidatePath)) {
+                try {
+                    std::filesystem::create_hard_link(path, candidatePath);
+                    inodeHash.insert(st.st_ino);
+                } catch (std::filesystem::filesystem_error & e) {
+                    if (e.code() == std::errc::file_exists) {
+                        /* Lost a race with a concurrent optimiser; fall
+                           through to inspect what's there now. */
+                    } else if (e.code() == std::errc::too_many_links) {
+                        if (st.st_size)
+                            printInfo("%1% has maximum number of links", PathFmt(path));
+                        return;
+                    } else if (e.code() == std::errc::no_space_on_device) {
+                        printInfo(
+                            "cannot link %s to '%s': %s", PathFmt(candidatePath), PathFmt(path), e.code().message());
+                        return;
+                    } else {
+                        throw SystemError(
+                            e.code(), "creating hard link from %1% to %2%", PathFmt(candidatePath), PathFmt(path));
+                    }
+                }
+            }
+
+            auto stCandidate = maybeLstat(candidatePath);
+            if (!stCandidate)
+                continue; /* Concurrently GC'd; try the next slot. */
+
+            /* Same unconditional-size/repair-gated-hash corruption
+               check as the sha256 path, plus a mode check: a
+               same-hash-prefix collision landing in the wrong mode's
+               shard tree would be a real bug elsewhere, not something
+               that should be silently accepted here. */
+            if (st.st_size != stCandidate->st_size
+                || (st.st_mode & linkModeMask) != (stCandidate->st_mode & linkModeMask)
+                || (repair && b3Hash != hashCandidate(candidatePath, stCandidate->st_mode))) {
+                warn("removing corrupted link %s", PathFmt(candidatePath));
+                warn(
+                    "There may be more corrupted paths."
+                    "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
+                unlinkIfExists(candidatePath);
+                continue;
+            }
+
+            if (tryLinkTo(candidatePath, *stCandidate))
+                return;
+            /* candidatePath itself turned out to be full; try the next
+               overflow slot. */
+        }
+
+        printInfo("%1% exceeded maximum overflow replicas (999)", PathFmt(primaryPath));
+        return;
+    }
+
+    /* Hash the file.  Note that hashPath() returns the hash over the
+       NAR serialisation, which includes the execute bit on the file.
+       Thus, executable and non-executable files with the same
+       contents *won't* be linked (which is good because otherwise the
+       permissions would be screwed up).
+
+       Also note that if `path' is a symlink, then we're hashing the
+       contents of the symlink (i.e. the result of readlink()), not
+       the contents of the target (which may not even exist). */
+    Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
+    std::string hashStr = hash.to_string(HashFormat::Nix32, false);
+    debug("%s has hash '%s'", PathFmt(path), hash.to_string(HashFormat::Nix32, true));
+
+    /* Check the old flat .links/<hash> location first - this is where
+       every pre-sharding link still lives, and stays valid forever.
+       New links are never written here anymore; only the sharded farm
+       below (.hardlinks/sha256/<prefix>/<hash>, falling through to
+       numbered overflow replicas once a hash's primary replica hits
+       the ~32000-hardlink ceiling) receives new writes. */
+    std::filesystem::path linkPath = linksDir / hashStr;
+    bool foundInFlatLinks = pathExists(linkPath);
+
+    if (foundInFlatLinks) {
+        auto stLink = lstat(linkPath);
+        if (st.st_size != stLink.st_size || (repair && hash != ({
+                                                             hashPath(
+                                                                 makeFSSourceAccessor(linkPath),
+                                                                 FileSerialisationMethod::NixArchive,
+                                                                 HashAlgorithm::SHA256)
+                                                                 .hash;
+                                                         }))) {
+            // XXX: Consider overwriting linkPath with our valid version.
+            warn("removing corrupted link %s", PathFmt(linkPath));
+            warn(
+                "There may be more corrupted paths."
+                "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
+            unlinkIfExists(linkPath);
+            foundInFlatLinks = false;
+        }
+    }
 
     if (foundInFlatLinks) {
         auto stLink = maybeLstat(linkPath);

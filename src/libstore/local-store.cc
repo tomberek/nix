@@ -134,6 +134,7 @@ LocalStore::LocalStore(ref<const Config> config)
     , trackingDir(hardlinksDir / "tracking")
     , shardedLinksDir(hardlinksDir / "sha256")
     , shardedLinksOverflowDir(shardedLinksDir / "overflow")
+    , b3LinksDir(hardlinksDir / "b3")
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -175,6 +176,33 @@ LocalStore::LocalStore(ref<const Config> config)
                         char shard[4] = {
                             BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
                         createDirs(shardedLinksDir / shard);
+                    }
+                }
+            }
+        }
+
+        /* Same shard/overflow layout as .hardlinks/sha256, but three
+           independent copies - one per mode subdirectory (r/x/s) -
+           since flat BLAKE3 hashing can't distinguish an executable
+           file, a non-executable file, and a symlink with identical
+           bytes the way the NAR-serialization hash sha256 uses can.
+           Only created if blake3-links is enabled: unlike sha256's
+           farm, this isn't on by default, so most stores never pay
+           for these 3 * 2048 = 6144 directories at all. */
+        if (experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links) && !pathExists(b3LinksDir / "r" / "000")) {
+            for (auto modeDir : {"r", "x", "s"}) {
+                auto dir = b3LinksDir / modeDir;
+                createDirs(dir / "overflow");
+                for (size_t first = 0; first < 2; ++first) {
+                    for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                        for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                            char shard[4] = {
+                                BaseNix32::characters[first],
+                                BaseNix32::characters[i],
+                                BaseNix32::characters[j],
+                                '\0'};
+                            createDirs(dir / shard);
+                        }
                     }
                 }
             }
@@ -1561,6 +1589,72 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
             }
         }
         checkShardedLinksDir(shardedLinksOverflowDir);
+
+        if (experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links)) {
+            printInfo("checking BLAKE3 link hashes...");
+
+            auto checkB3LinksDir = [&](const std::filesystem::path & dir, mode_t expectedMode) {
+                if (!pathExists(dir))
+                    return;
+                for (auto & link : DirectoryIterator{dir}) {
+                    checkInterrupt();
+                    auto name = link.path().filename().string();
+                    auto expectedHash = name.substr(0, name.find('.'));
+                    printMsg(lvlTalkative, "checking contents of %s", PathFmt(link.path()));
+
+                    auto st = lstat(link.path());
+                    bool corrupt = false;
+                    if ((st.st_mode & linkModeMask) != expectedMode) {
+                        printError(
+                            "link %s has mode 0%o but lives under the 0%o shard tree!",
+                            PathFmt(link.path()),
+                            st.st_mode & linkModeMask,
+                            expectedMode);
+                        corrupt = true;
+                    } else {
+                        std::string hash = (S_ISLNK(st.st_mode) ? hashString(HashAlgorithm::BLAKE3, readLink(link.path()).string())
+                                                                 : hashFile(HashAlgorithm::BLAKE3, link.path()))
+                                                .to_string(HashFormat::Nix32, false);
+                        if (hash != expectedHash) {
+                            printError(
+                                "link %s was modified! expected hash %s, got '%s'",
+                                PathFmt(link.path()),
+                                expectedHash,
+                                hash);
+                            corrupt = true;
+                        }
+                    }
+
+                    if (corrupt) {
+                        if (repair) {
+                            unlinkIfExists(link.path());
+                            printInfo("removed link %s", PathFmt(link.path()));
+                        } else {
+                            errors = true;
+                        }
+                    }
+                }
+            };
+
+            for (auto [modeDirName, expectedMode] :
+                 {std::pair{"r", linkModeR}, std::pair{"x", linkModeX}, std::pair{"s", linkModeS}}) {
+                auto dir = b3LinksDir / modeDirName;
+                for (size_t first = 0; first < 2; ++first) {
+                    for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                        for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                            checkInterrupt();
+                            char shard[4] = {
+                                BaseNix32::characters[first],
+                                BaseNix32::characters[i],
+                                BaseNix32::characters[j],
+                                '\0'};
+                            checkB3LinksDir(dir / shard, expectedMode);
+                        }
+                    }
+                }
+                checkB3LinksDir(dir / "overflow", expectedMode);
+            }
+        }
 
         printInfo("checking store hashes...");
 
