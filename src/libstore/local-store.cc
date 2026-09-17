@@ -129,6 +129,8 @@ LocalStore::LocalStore(ref<const Config> config)
     , _state(make_ref<Sync<State>>())
     , dbDir(config->stateDir.get() / "db")
     , linksDir(config->realStoreDir.get() / ".links")
+    , hardlinksDir(config->realStoreDir.get() / ".hardlinks")
+    , trackingDir(hardlinksDir / "tracking")
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -145,6 +147,8 @@ LocalStore::LocalStore(ref<const Config> config)
         makeStoreWritable();
     }
     createDirs(linksDir);
+    if (!config->readOnly)
+        createDirs(trackingDir);
     auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
     createDirs(tempRootsDir);
@@ -436,6 +440,17 @@ void LocalStore::deleteStorePath(const std::filesystem::path & path, uint64_t & 
                 PathFmt(path));
             throw;
         }
+        return;
+    }
+
+    /* Whenever a StorePath is deleted, also remove its
+       `.hardlinks/tracking` mark subtree, if any, as part of the same
+       deletion. Harmless (and a no-op) for garbage that never had a
+       mark. Best-effort: this must never itself throw and abort the
+       caller's GC pass. */
+    try {
+        std::filesystem::remove_all(trackingDir / path.filename());
+    } catch (std::filesystem::filesystem_error &) {
     }
 }
 

@@ -808,11 +808,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     unreachable. We don't use readDirectory() here so that
                     GCing can start faster. */
                     auto linksName = linksDir.filename();
+                    auto hardlinksName = hardlinksDir.filename();
                     struct dirent * dirent;
                     while (errno = 0, dirent = readdir(dir.get())) {
                         checkInterrupt();
                         std::string name = dirent->d_name;
-                        if (name == "." || name == ".." || name == linksName)
+                        if (name == "." || name == ".." || name == linksName || name == hardlinksName)
                             continue;
 
                         if (auto storePath = maybeParseStorePath(storeDir + "/" + name))
@@ -836,6 +837,40 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         for (auto & i : dead)
             results.paths.insert(printStorePath(i));
         return;
+    }
+
+    /* Backstop for orphaned `.hardlinks/tracking` marks whose
+       deletion-time cleanup (LocalStore::deleteStorePath) didn't run -
+       a crash, or an old binary deleting a path with no knowledge of
+       `.hardlinks/tracking`. Must run before the "deleting unused
+       links" loop below: dropping an orphaned mark's hardlink is what
+       brings a dead hash's nlink down to where that loop will delete
+       it. */
+    if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
+        try {
+            for (auto & entry : DirectoryIterator{trackingDir}) {
+                checkInterrupt();
+                auto name = entry.path().filename();
+
+                /* Not atomic with a concurrent writer (addToStore()
+                   writes a mark before registering the path as valid),
+                   so tolerate ENOENT/ENOTEMPTY the same way
+                   writeOptimiseMark tolerates the symmetric race. */
+                try {
+                    bool stillValid;
+                    try {
+                        stillValid = isValidPath(StorePath{name.string()});
+                    } catch (BadStorePath &) {
+                        stillValid = false;
+                    }
+                    if (!stillValid)
+                        std::filesystem::remove_all(trackingDir / name);
+                } catch (std::filesystem::filesystem_error &) {
+                }
+            }
+        } catch (SystemError &) {
+            /* trackingDir doesn't exist (e.g. read-only store): nothing to sweep. */
+        }
     }
 
     /* Unlink all files in /nix/store/.links that have a link count of 1,
