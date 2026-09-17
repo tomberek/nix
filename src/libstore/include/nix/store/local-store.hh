@@ -243,6 +243,8 @@ public:
     const std::filesystem::path linksDir;
     const std::filesystem::path hardlinksDir;
     const std::filesystem::path trackingDir;
+    const std::filesystem::path shardedLinksDir;
+    const std::filesystem::path shardedLinksOverflowDir;
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
     const std::filesystem::path tempRootsDir;

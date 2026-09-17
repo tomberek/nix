@@ -12,6 +12,7 @@
 #include "nix/util/util.hh"
 #include "nix/util/file-system.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
+#include "nix/util/base-nix-32.hh"
 
 #include "store-config-private.hh"
 
@@ -887,43 +888,69 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
     }
 
-    /* Unlink all files in /nix/store/.links that have a link count of 1,
-       which indicates that there are no other links and so they can be
+    /* Unlink all files in /nix/store/.links (and the sharded
+       .hardlinks/sha256 farm) that have a link count of 1, which
+       indicates that there are no other links and so they can be
        safely deleted.  FIXME: race condition with optimisePath(): we
        might see a link count of 1 just before optimisePath() increases
        the link count. */
     if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
         printInfo("deleting unused links...");
 
-        AutoCloseDir dir(opendir(linksDir.string().c_str()));
-        if (!dir)
-            throw SysError("opening directory %1%", PathFmt(linksDir));
-
         int64_t actualSize = 0, unsharedSize = 0;
 
-        struct dirent * dirent;
-        while (errno = 0, dirent = readdir(dir.get())) {
-            checkInterrupt();
-            std::string name = dirent->d_name;
-            if (name == "." || name == "..")
-                continue;
-            auto path = linksDir / name;
+        auto cleanupLinksDir = [&](const std::filesystem::path & dir) {
+            AutoCloseDir d(opendir(dir.string().c_str()));
+            if (!d)
+                return;
 
-            auto st = lstat(path);
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(d.get())) {
+                checkInterrupt();
+                std::string name = dirent->d_name;
+                if (name == "." || name == "..")
+                    continue;
+                auto path = dir / name;
 
-            if (st.st_nlink != 1) {
-                actualSize += st.st_size;
-                unsharedSize += (st.st_nlink - 1) * st.st_size;
-                continue;
+                auto st = lstat(path);
+
+                if (st.st_nlink != 1) {
+                    actualSize += st.st_size;
+                    unsharedSize += (st.st_nlink - 1) * st.st_size;
+                    continue;
+                }
+
+                printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
+
+                unlink(path);
+
+                /* Do not account for deleted file here. Rely on deletePath()
+                   accounting.  */
             }
+        };
 
-            printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
-
-            unlink(path);
-
-            /* Do not account for deleted file here. Rely on deletePath()
-               accounting.  */
+        {
+            AutoCloseDir dir(opendir(linksDir.string().c_str()));
+            if (!dir)
+                throw SysError("opening directory %1%", PathFmt(linksDir));
         }
+        cleanupLinksDir(linksDir);
+
+        /* .hardlinks/sha256's shard directories and its overflow
+           directory hold the same kind of content-hash-named entries
+           as .links, so the same nlink==1 reclaim logic applies -
+           enumerate every pre-created shard plus overflow. */
+        for (size_t first = 0; first < 2; ++first) {
+            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                    checkInterrupt();
+                    char shard[4] = {
+                        BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                    cleanupLinksDir(shardedLinksDir / shard);
+                }
+            }
+        }
+        cleanupLinksDir(shardedLinksOverflowDir);
 
         int64_t overhead =
 #ifdef _WIN32

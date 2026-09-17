@@ -18,6 +18,7 @@
 #include "nix/store/keys.hh"
 #include "nix/util/users.hh"
 #include "nix/store/store-registration.hh"
+#include "nix/util/base-nix-32.hh"
 
 #include <algorithm>
 #include <cstring>
@@ -131,6 +132,8 @@ LocalStore::LocalStore(ref<const Config> config)
     , linksDir(config->realStoreDir.get() / ".links")
     , hardlinksDir(config->realStoreDir.get() / ".hardlinks")
     , trackingDir(hardlinksDir / "tracking")
+    , shardedLinksDir(hardlinksDir / "sha256")
+    , shardedLinksOverflowDir(shardedLinksDir / "overflow")
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -149,6 +152,34 @@ LocalStore::LocalStore(ref<const Config> config)
     createDirs(linksDir);
     if (!config->readOnly)
         createDirs(trackingDir);
+    if (!config->readOnly) {
+        /* Pre-create all 2048 shard directories for Nix32 3-character
+           prefixes of a SHA-256 hash (first character is always '0' or
+           '1' due to Nix32 encoding bias for a 256-bit hash, so this is
+           2 * 32 * 32 = 2048 directories, not 32^3). New content-hash
+           links go here (.hardlinks/sha256/<prefix>/<hash>); the old
+           flat .links/<hash> layout stays valid forever for existing
+           entries but is never written to again.
+
+           This runs on every LocalStore construction, i.e. every nix
+           invocation, not just --optimise - so once the tree exists,
+           skip straight past the 2048-directory loop (a few ms of
+           create_directories() calls even when every directory is
+           already there) via one cheap existence check on a sentinel
+           shard instead. */
+        if (!pathExists(shardedLinksDir / "000")) {
+            createDirs(shardedLinksOverflowDir);
+            for (size_t first = 0; first < 2; ++first) {
+                for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                    for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                        char shard[4] = {
+                            BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                        createDirs(shardedLinksDir / shard);
+                    }
+                }
+            }
+        }
+    }
     auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
     createDirs(tempRootsDir);
@@ -1485,6 +1516,51 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                 }
             }
         }
+
+        printInfo("checking sharded link hashes...");
+
+        auto checkShardedLinksDir = [&](const std::filesystem::path & dir) {
+            if (!pathExists(dir))
+                return;
+            for (auto & link : DirectoryIterator{dir}) {
+                checkInterrupt();
+                auto name = link.path().filename().string();
+                /* Overflow replicas are named <hash>.NNN; strip the
+                   suffix before comparing against the computed hash. */
+                auto expectedHash = name.substr(0, name.find('.'));
+                printMsg(lvlTalkative, "checking contents of %s", PathFmt(link.path()));
+                std::string hash = hashPath(
+                                        makeFSSourceAccessor(link.path()),
+                                        FileIngestionMethod::NixArchive,
+                                        HashAlgorithm::SHA256)
+                                        .first.to_string(HashFormat::Nix32, false);
+                if (hash != expectedHash) {
+                    printError(
+                        "link %s was modified! expected hash %s, got '%s'",
+                        PathFmt(link.path()),
+                        expectedHash,
+                        hash);
+                    if (repair) {
+                        unlinkIfExists(link.path());
+                        printInfo("removed link %s", PathFmt(link.path()));
+                    } else {
+                        errors = true;
+                    }
+                }
+            }
+        };
+
+        for (size_t first = 0; first < 2; ++first) {
+            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                    checkInterrupt();
+                    char shard[4] = {
+                        BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                    checkShardedLinksDir(shardedLinksDir / shard);
+                }
+            }
+        }
+        checkShardedLinksDir(shardedLinksOverflowDir);
 
         printInfo("checking store hashes...");
 
