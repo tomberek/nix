@@ -198,12 +198,92 @@ void LocalStore::optimisePath_(
         }
     }
 
-    std::filesystem::path targetPath;
-    std::optional<PosixStat> stTarget;
+    /* Attempt to replace `path` with a hard link to `candidatePath`
+       (already confirmed to hold the same content). Returns true on
+       success (including the "already linked" case) or if the caller
+       should give up on this file entirely (EMLINK on `path` itself,
+       ENOSPC, or a concurrent GC race) - in all of those cases
+       markRelPath is set or the function has already returned, so the
+       caller should return immediately either way. Returns false only
+       when `candidatePath` itself turns out to be full (EMLINK linking
+       *into* it or during the rename) - the only case where trying a
+       different candidate (the next overflow slot) can help. */
+    auto tryLinkTo = [&](const std::filesystem::path & candidatePath, const PosixStat & stCandidate) -> bool {
+        if (st.st_ino == stCandidate.st_ino) {
+            debug("%1% is already linked to %2%", PathFmt(path), PathFmt(candidatePath));
+            markRelPath = relPath;
+            return true;
+        }
+
+        printMsg(lvlTalkative, "linking %1% to %2%", PathFmt(path), PathFmt(candidatePath));
+
+        const auto dirOfPath = path.parent_path();
+        bool mustToggle = dirOfPath != config->realStoreDir.get();
+        if (mustToggle)
+            makeWritable(dirOfPath);
+        MakeReadOnly makeReadOnly(mustToggle ? dirOfPath : std::filesystem::path{});
+
+        std::filesystem::path tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
+
+        try {
+            std::filesystem::create_hard_link(candidatePath, tempLink);
+            inodeHash.insert(st.st_ino);
+        } catch (std::filesystem::filesystem_error & e) {
+            if (e.code() == std::errc::too_many_links) {
+                /* This candidate is full - the caller should try a
+                   different one (an overflow slot) if it has one. */
+                return false;
+            }
+            if (e.code() == std::errc::no_such_file_or_directory) {
+                /* A concurrent garbage collection removed the
+                   candidate. Skip optimising this path; a later pass
+                   will dedup it. */
+                return true;
+            }
+            throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(candidatePath), PathFmt(tempLink));
+        }
+
+        try {
+            std::filesystem::rename(tempLink, path);
+        } catch (std::filesystem::filesystem_error & e) {
+            {
+                std::error_code ec;
+                remove(tempLink, ec); /* Clean up after ourselves. */
+                if (ec)
+                    printError("unable to unlink %1%: %2%", PathFmt(tempLink), ec.message());
+            }
+            if (e.code() == std::errc::too_many_links) {
+                /* Some filesystems generate too many links on the
+                   rename, rather than on the original link. (Probably
+                   it temporarily increases the st_nlink field before
+                   decreasing it again.) Same "try another candidate"
+                   outcome as the create_hard_link case above. */
+                return false;
+            }
+            throw SystemError(e.code(), "renaming %1% to %2%", PathFmt(tempLink), PathFmt(path));
+        }
+
+        markRelPath = relPath;
+        stats.filesLinked++;
+        stats.bytesFreed += st.st_size;
+        if (act)
+            act->result(
+                resFileLinked,
+                st.st_size
+#ifndef _WIN32
+                ,
+                st.st_blocks
+#endif
+            );
+        return true;
+    };
 
     if (foundInFlatLinks) {
-        targetPath = linkPath;
-        stTarget = lstat(linkPath);
+        auto stLink = maybeLstat(linkPath);
+        if (!stLink)
+            return; /* Concurrent GC race; a later pass will dedup it. */
+        tryLinkTo(linkPath, *stLink);
+        return;
     } else {
         /* Not in the old flat layout (or it was just removed above as
            corrupted) - use the sharded farm. Shard prefix is the first
@@ -211,7 +291,12 @@ void LocalStore::optimisePath_(
            character always '0' or '1'); once the primary replica in
            that shard hits the hardlink ceiling, fall through to
            numbered overflow replicas (.hardlinks/sha256/overflow/<hash>.NNN,
-           up to 999) rather than giving up on deduplicating this file. */
+           up to 999) rather than giving up on deduplicating this file.
+           A candidate slot can also turn out to be full only once
+           tryLinkTo() actually attempts to link into it (EMLINK on the
+           create_hard_link or the rename); that's handled by simply
+           continuing this same loop to the next slot, exactly like the
+           "already full at selection time" case below. */
         std::string shard = hashStr.substr(0, 3);
         std::filesystem::path primaryPath = shardedLinksDir / shard / hashStr;
 
@@ -274,103 +359,15 @@ void LocalStore::optimisePath_(
                 continue; /* Recreate this slot on the next pass. */
             }
 
-            targetPath = candidatePath;
-            stTarget = *stCandidate;
-            break;
+            if (tryLinkTo(candidatePath, *stCandidate))
+                return;
+            /* candidatePath itself turned out to be full; try the next
+               overflow slot. */
         }
 
-        if (targetPath.empty()) {
-            printInfo("%1% exceeded maximum overflow replicas (999)", PathFmt(primaryPath));
-            return;
-        }
-    }
-
-    /* A concurrent garbage collection may have removed the link
-       between the existence check above and now. Skip optimising this
-       path; a later pass will dedup it. */
-    if (!stTarget)
-        return;
-
-    /* Yes!  We've seen a file with the same contents.  Replace the
-       current file with a hard link to that file. */
-    if (st.st_ino == stTarget->st_ino) {
-        debug("%1% is already linked to %2%", PathFmt(path), PathFmt(targetPath));
-        markRelPath = relPath;
+        printInfo("%1% exceeded maximum overflow replicas (999)", PathFmt(primaryPath));
         return;
     }
-
-    printMsg(lvlTalkative, "linking %1% to %2%", PathFmt(path), PathFmt(targetPath));
-
-    /* Make the containing directory writable, but only if it's not
-       the store itself (we don't want or need to mess with its
-       permissions). */
-    const auto dirOfPath = path.parent_path();
-    bool mustToggle = dirOfPath != config->realStoreDir.get();
-    if (mustToggle)
-        makeWritable(dirOfPath);
-
-    /* When we're done, make the directory read-only again and reset
-       its timestamp back to 0. */
-    MakeReadOnly makeReadOnly(mustToggle ? dirOfPath : std::filesystem::path{});
-
-    std::filesystem::path tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
-
-    try {
-        std::filesystem::create_hard_link(targetPath, tempLink);
-        inodeHash.insert(st.st_ino);
-    } catch (std::filesystem::filesystem_error & e) {
-        if (e.code() == std::errc::too_many_links) {
-            /* Too many links to the same file (>= 32000 on most file
-               systems).  This is likely to happen with empty files.
-               Just shrug and ignore. */
-            if (st.st_size)
-                printInfo("%1% has maximum number of links", PathFmt(targetPath));
-            return;
-        }
-        if (e.code() == std::errc::no_such_file_or_directory) {
-            /* A concurrent garbage collection removed the link in the
-               links directory. Skip optimising this path; a later pass
-               will dedup it. */
-            return;
-        }
-        throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(targetPath), PathFmt(tempLink));
-    }
-
-    /* Atomically replace the old file with the new hard link. */
-    try {
-        std::filesystem::rename(tempLink, path);
-    } catch (std::filesystem::filesystem_error & e) {
-        {
-            std::error_code ec;
-            remove(tempLink, ec); /* Clean up after ourselves. */
-            if (ec)
-                printError("unable to unlink %1%: %2%", PathFmt(tempLink), ec.message());
-        }
-        if (e.code() == std::errc::too_many_links) {
-            /* Some filesystems generate too many links on the rename,
-               rather than on the original link.  (Probably it
-               temporarily increases the st_nlink field before
-               decreasing it again.) */
-            debug("%s has reached maximum number of links", PathFmt(targetPath));
-            return;
-        }
-        throw SystemError(e.code(), "renaming %1% to %2%", PathFmt(tempLink), PathFmt(path));
-    }
-
-    markRelPath = relPath;
-
-    stats.filesLinked++;
-    stats.bytesFreed += st.st_size;
-
-    if (act)
-        act->result(
-            resFileLinked,
-            st.st_size
-#ifndef _WIN32
-            ,
-            st.st_blocks
-#endif
-        );
 }
 
 /* Sentinel mark filename for the empty-relPath case (single-file
