@@ -167,73 +167,139 @@ void LocalStore::optimisePath_(
        contents of the symlink (i.e. the result of readlink()), not
        the contents of the target (which may not even exist). */
     Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
+    std::string hashStr = hash.to_string(HashFormat::Nix32, false);
     debug("%s has hash '%s'", PathFmt(path), hash.to_string(HashFormat::Nix32, true));
 
-    /* Check if this is a known hash. */
-    std::filesystem::path linkPath = std::filesystem::path{linksDir} / hash.to_string(HashFormat::Nix32, false);
+    /* Check the old flat .links/<hash> location first - this is where
+       every pre-sharding link still lives, and stays valid forever.
+       New links are never written here anymore; only the sharded farm
+       below (.hardlinks/sha256/<prefix>/<hash>, falling through to
+       numbered overflow replicas once a hash's primary replica hits
+       the ~32000-hardlink ceiling) receives new writes. */
+    std::filesystem::path linkPath = linksDir / hashStr;
+    bool foundInFlatLinks = pathExists(linkPath);
 
-    /* Maybe delete the link, if it has been corrupted. */
-    if (pathExists(linkPath)) {
+    if (foundInFlatLinks) {
         auto stLink = lstat(linkPath);
         if (st.st_size != stLink.st_size || (repair && hash != ({
-                                                           hashPath(
-                                                               makeFSSourceAccessor(linkPath),
-                                                               FileSerialisationMethod::NixArchive,
-                                                               HashAlgorithm::SHA256)
-                                                               .hash;
-                                                       }))) {
+                                                             hashPath(
+                                                                 makeFSSourceAccessor(linkPath),
+                                                                 FileSerialisationMethod::NixArchive,
+                                                                 HashAlgorithm::SHA256)
+                                                                 .hash;
+                                                         }))) {
             // XXX: Consider overwriting linkPath with our valid version.
             warn("removing corrupted link %s", PathFmt(linkPath));
             warn(
                 "There may be more corrupted paths."
                 "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
             unlinkIfExists(linkPath);
+            foundInFlatLinks = false;
         }
     }
 
-    if (!pathExists(linkPath)) {
-        /* Nope, create a hard link in the links directory. */
-        try {
-            std::filesystem::create_hard_link(path, linkPath);
-            inodeHash.insert(st.st_ino);
-        } catch (std::filesystem::filesystem_error & e) {
-            if (e.code() == std::errc::file_exists) {
-                /* Fall through if another process created ‘linkPath’ before
-                   we did. */
+    std::filesystem::path targetPath;
+    std::optional<PosixStat> stTarget;
+
+    if (foundInFlatLinks) {
+        targetPath = linkPath;
+        stTarget = lstat(linkPath);
+    } else {
+        /* Not in the old flat layout (or it was just removed above as
+           corrupted) - use the sharded farm. Shard prefix is the first
+           3 characters of the Nix32-encoded hash (2048 shards, first
+           character always '0' or '1'); once the primary replica in
+           that shard hits the hardlink ceiling, fall through to
+           numbered overflow replicas (.hardlinks/sha256/overflow/<hash>.NNN,
+           up to 999) rather than giving up on deduplicating this file. */
+        std::string shard = hashStr.substr(0, 3);
+        std::filesystem::path primaryPath = shardedLinksDir / shard / hashStr;
+
+        for (int seq = 0; seq < 1000; ++seq) {
+            std::filesystem::path candidatePath =
+                seq == 0 ? primaryPath : shardedLinksOverflowDir / (hashStr + fmt(".%03d", seq));
+
+            if (!pathExists(candidatePath)) {
+                /* Nope, create a hard link at this candidate slot. */
+                try {
+                    std::filesystem::create_hard_link(path, candidatePath);
+                    inodeHash.insert(st.st_ino);
+                } catch (std::filesystem::filesystem_error & e) {
+                    if (e.code() == std::errc::file_exists) {
+                        /* Lost a race with a concurrent optimiser; fall
+                           through to inspect what's there now. */
+                    } else if (e.code() == std::errc::too_many_links) {
+                        /* `path` itself already has the maximum number
+                           of links - unrelated to which slot we're
+                           trying, no point trying another. */
+                        if (st.st_size)
+                            printInfo("%1% has maximum number of links", PathFmt(path));
+                        return;
+                    } else if (e.code() == std::errc::no_space_on_device) {
+                        printInfo(
+                            "cannot link %s to '%s': %s", PathFmt(candidatePath), PathFmt(path), e.code().message());
+                        return;
+                    } else {
+                        throw SystemError(
+                            e.code(), "creating hard link from %1% to %2%", PathFmt(candidatePath), PathFmt(path));
+                    }
+                }
             }
 
-            else if (e.code() == std::errc::no_space_on_device) {
-                /* On ext4, that probably means the directory index is
-                   full.  When that happens, it's fine to ignore it: we
-                   just effectively disable deduplication of this
-                   file.
-                   */
-                printInfo("cannot link %s to '%s': %s", PathFmt(linkPath), PathFmt(path), e.code().message());
-                return;
+            auto stCandidate = maybeLstat(candidatePath);
+            if (!stCandidate)
+                continue; /* Concurrently GC'd; try the next slot. */
+
+            /* A size mismatch is corruption regardless of repair mode
+               (mirrors the flat .links check above) - only the more
+               expensive full-content hash check is gated on repair.
+               Checking size unconditionally, but hash only under
+               repair, matters here: without it, a size-mismatched
+               candidate would silently be accepted as this file's
+               dedup target instead of being rejected, corrupting
+               whatever gets hardlinked/renamed onto it next. */
+            if (st.st_size != stCandidate->st_size
+                || (repair
+                    && hash
+                        != hashPath(
+                               makeFSSourceAccessor(candidatePath),
+                               FileSerialisationMethod::NixArchive,
+                               HashAlgorithm::SHA256)
+                               .hash)) {
+                warn("removing corrupted link %s", PathFmt(candidatePath));
+                warn(
+                    "There may be more corrupted paths."
+                    "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
+                unlinkIfExists(candidatePath);
+                continue; /* Recreate this slot on the next pass. */
             }
 
-            else
-                throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(linkPath), PathFmt(path));
+            targetPath = candidatePath;
+            stTarget = *stCandidate;
+            break;
+        }
+
+        if (targetPath.empty()) {
+            printInfo("%1% exceeded maximum overflow replicas (999)", PathFmt(primaryPath));
+            return;
         }
     }
+
+    /* A concurrent garbage collection may have removed the link
+       between the existence check above and now. Skip optimising this
+       path; a later pass will dedup it. */
+    if (!stTarget)
+        return;
 
     /* Yes!  We've seen a file with the same contents.  Replace the
        current file with a hard link to that file. */
-    auto stLink = maybeLstat(linkPath);
-
-    /* A concurrent garbage collection may have removed the link in the
-       links directory between the existence check above and now. Skip
-       optimising this path; a later pass will dedup it. */
-    if (!stLink)
-        return;
-
-    if (st.st_ino == stLink->st_ino) {
-        debug("%1% is already linked to %2%", PathFmt(path), PathFmt(linkPath));
+    if (st.st_ino == stTarget->st_ino) {
+        debug("%1% is already linked to %2%", PathFmt(path), PathFmt(targetPath));
         markRelPath = relPath;
         return;
     }
 
-    printMsg(lvlTalkative, "linking %1% to %2%", PathFmt(path), PathFmt(linkPath));
+    printMsg(lvlTalkative, "linking %1% to %2%", PathFmt(path), PathFmt(targetPath));
 
     /* Make the containing directory writable, but only if it's not
        the store itself (we don't want or need to mess with its
@@ -250,7 +316,7 @@ void LocalStore::optimisePath_(
     std::filesystem::path tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
 
     try {
-        std::filesystem::create_hard_link(linkPath, tempLink);
+        std::filesystem::create_hard_link(targetPath, tempLink);
         inodeHash.insert(st.st_ino);
     } catch (std::filesystem::filesystem_error & e) {
         if (e.code() == std::errc::too_many_links) {
@@ -258,7 +324,7 @@ void LocalStore::optimisePath_(
                systems).  This is likely to happen with empty files.
                Just shrug and ignore. */
             if (st.st_size)
-                printInfo("%1% has maximum number of links", PathFmt(linkPath));
+                printInfo("%1% has maximum number of links", PathFmt(targetPath));
             return;
         }
         if (e.code() == std::errc::no_such_file_or_directory) {
@@ -267,7 +333,7 @@ void LocalStore::optimisePath_(
                will dedup it. */
             return;
         }
-        throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(linkPath), PathFmt(tempLink));
+        throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(targetPath), PathFmt(tempLink));
     }
 
     /* Atomically replace the old file with the new hard link. */
@@ -285,7 +351,7 @@ void LocalStore::optimisePath_(
                rather than on the original link.  (Probably it
                temporarily increases the st_nlink field before
                decreasing it again.) */
-            debug("%s has reached maximum number of links", PathFmt(linkPath));
+            debug("%s has reached maximum number of links", PathFmt(targetPath));
             return;
         }
         throw SystemError(e.code(), "renaming %1% to %2%", PathFmt(tempLink), PathFmt(path));
