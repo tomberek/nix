@@ -241,6 +241,8 @@ public:
 
     const std::filesystem::path dbDir;
     const std::filesystem::path linksDir;
+    const std::filesystem::path hardlinksDir;
+    const std::filesystem::path trackingDir;
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
     const std::filesystem::path tempRootsDir;
@@ -424,6 +426,15 @@ protected:
      */
     virtual VerificationResult verifyAllValidPaths(RepairFlag repair);
 
+    /**
+     * Whether `optimisePath_()`'s caller should write
+     * `.hardlinks/tracking` marks. Set to `false` by
+     * `LocalOverlayStore`, whose `deleteStorePath` calls would silently
+     * orphan marks (see its constructor). Hardlink deduplication itself
+     * is unaffected; only the mark/cache layer is disabled.
+     */
+    bool writeOptimiseMarks = true;
+
 public:
 
     /**
@@ -524,12 +535,35 @@ private:
 
     InodeHash loadInodeHash();
     Strings readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash);
+
     void optimisePath_(
         Activity * act,
         OptimiseStats & stats,
         const std::filesystem::path & path,
         InodeHash & inodeHash,
-        RepairFlag repair);
+        RepairFlag repair,
+        std::filesystem::path relPath,
+        std::optional<std::filesystem::path> & markRelPath);
+
+    /**
+     * Write (or rewrite) the `.hardlinks/tracking` mark for `storePath`
+     * using `markRelPath` as the representative file (relative to
+     * `storePath`, empty if the representative file is `storePath`
+     * itself). No-op if mark-writing is disabled (`writeOptimiseMarks`)
+     * or `markRelPath` is `std::nullopt`. Best-effort: any
+     * `filesystem_error` is caught and swallowed.
+     */
+    void writeOptimiseMark(const StorePath & storePath, const std::optional<std::filesystem::path> & markRelPath);
+
+    /**
+     * True if StorePath `storePath` (whose on-disk path is `realPath`,
+     * i.e. `config->realStoreDir.get() / storePath.to_string()`) already
+     * has a valid `.hardlinks/tracking` mark: a chain of single-entry
+     * directories under `trackingDir` mirroring some file's relative
+     * path within the StorePath, ending in a hardlink whose inode
+     * matches that file's current inode.
+     */
+    bool hasValidOptimiseMark(const StorePath & storePath, const std::filesystem::path & realPath);
 
     // Internal versions that are not wrapped in retry_sqlite.
     bool isValidPath_(State & state, const StorePath & path);

@@ -49,6 +49,17 @@ LocalOverlayStore::LocalOverlayStore(ref<const Config> config)
     , config{config}
     , lowerStore(openStore(config->lowerStoreUri.get()).dynamic_pointer_cast<LocalFSStore>())
 {
+    /* LocalOverlayStore's own optimiseStore() override deletes upper-layer
+       StorePaths outright to deduplicate against the lower store, without
+       invalidating them - a mark written for such a StorePath would be
+       silently orphaned by that deletion, with neither the primary
+       deletion-time cleanup hook nor the backstop GC sweep catching it
+       (both are keyed on "the StorePath was deleted or no longer valid",
+       neither of which happens here). Until LocalOverlayStore is properly
+       integrated with mark tracking, disable mark-writing entirely; the
+       underlying hardlink deduplication in optimisePath_() is unaffected. */
+    writeOptimiseMarks = false;
+
     if (!config->upperLayer.isOverridden())
         throw Error("overlay store at %s requires the 'upper-layer' setting", PathFmt(config->realStoreDir.get()));
 

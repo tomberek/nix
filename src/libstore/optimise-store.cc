@@ -7,6 +7,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <climits>
+#include <cassert>
 #ifdef __APPLE__
 #  include <regex>
 #endif
@@ -99,7 +101,13 @@ Strings LocalStore::readDirectoryIgnoringInodes(const std::filesystem::path & pa
 }
 
 void LocalStore::optimisePath_(
-    Activity * act, OptimiseStats & stats, const std::filesystem::path & path, InodeHash & inodeHash, RepairFlag repair)
+    Activity * act,
+    OptimiseStats & stats,
+    const std::filesystem::path & path,
+    InodeHash & inodeHash,
+    RepairFlag repair,
+    std::filesystem::path relPath,
+    std::optional<std::filesystem::path> & markRelPath)
 {
     checkInterrupt();
 
@@ -121,7 +129,7 @@ void LocalStore::optimisePath_(
     if (S_ISDIR(st.st_mode)) {
         Strings names = readDirectoryIgnoringInodes(path, inodeHash);
         for (auto & i : names)
-            optimisePath_(act, stats, path / i, inodeHash, repair);
+            optimisePath_(act, stats, path / i, inodeHash, repair, relPath / i, markRelPath);
         return;
     }
 
@@ -145,6 +153,7 @@ void LocalStore::optimisePath_(
     /* This can still happen on top-level files. */
     if (st.st_nlink > 1 && inodeHash.count(st.st_ino)) {
         debug("%s is already linked, with %d other file(s)", PathFmt(path), st.st_nlink - 2);
+        markRelPath = relPath;
         return;
     }
 
@@ -220,6 +229,7 @@ void LocalStore::optimisePath_(
 
     if (st.st_ino == stLink->st_ino) {
         debug("%1% is already linked to %2%", PathFmt(path), PathFmt(linkPath));
+        markRelPath = relPath;
         return;
     }
 
@@ -281,6 +291,8 @@ void LocalStore::optimisePath_(
         throw SystemError(e.code(), "renaming %1% to %2%", PathFmt(tempLink), PathFmt(path));
     }
 
+    markRelPath = relPath;
+
     stats.filesLinked++;
     stats.bytesFreed += st.st_size;
 
@@ -295,12 +307,182 @@ void LocalStore::optimisePath_(
         );
 }
 
+/* Sentinel mark filename for the empty-relPath case (single-file
+   StorePaths, e.g. .drv files, where the representative file *is* the
+   StorePath itself). An empty string can't be a filesystem entry name,
+   so this can't be represented via percentEncodeMarkName - it needs an
+   explicit out-of-band marker instead. "%" alone can never be produced
+   by percentEncodeMarkName for a non-empty relPath: that function only
+   ever emits a lone '%' as the first byte of a complete "%XX" triple,
+   never on its own. */
+static const std::string emptyRelPathMarkName = "%";
+
+/* Encode a relPath into a single filename safe to place directly under
+   trackingDir/<StorePath>/. '/' can't appear in a filename at all, and
+   '%' is escaped too so the encoding round-trips unambiguously. Every
+   other byte (including other reserved shell/filesystem characters)
+   passes through unchanged - relPath components are already validated
+   store-path-safe names, so this only needs to handle the one
+   character '/' introduces when components are joined. Must not be
+   called with an empty relPath - use emptyRelPathMarkName instead. */
+static std::string percentEncodeMarkName(const std::filesystem::path & relPath)
+{
+    assert(!relPath.empty());
+    std::string out;
+    for (char c : relPath.native()) {
+        if (c == '/' || c == '%') {
+            out += '%';
+            out += "0123456789ABCDEF"[(unsigned char) c >> 4];
+            out += "0123456789ABCDEF"[(unsigned char) c & 0xf];
+        } else
+            out += c;
+    }
+    return out;
+}
+
+static std::optional<std::filesystem::path> percentDecodeMarkName(const std::string & name)
+{
+    if (name == emptyRelPathMarkName)
+        return std::filesystem::path{};
+
+    std::string out;
+    for (size_t i = 0; i < name.size(); i++) {
+        if (name[i] == '%') {
+            if (i + 2 >= name.size())
+                return std::nullopt;
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9')
+                    return c - '0';
+                if (c >= 'A' && c <= 'F')
+                    return c - 'A' + 10;
+                return -1;
+            };
+            int hi = hex(name[i + 1]), lo = hex(name[i + 2]);
+            if (hi < 0 || lo < 0)
+                return std::nullopt;
+            out += (char) ((hi << 4) | lo);
+            i += 2;
+        } else
+            out += name[i];
+    }
+    return std::filesystem::path{out};
+}
+
+void LocalStore::writeOptimiseMark(const StorePath & storePath, const std::optional<std::filesystem::path> & markRelPath)
+{
+    if (!writeOptimiseMarks || !markRelPath)
+        return;
+
+    /* relPath is encoded into a single filename (percent-encoding '/'
+       and '%', or the emptyRelPathMarkName sentinel if relPath itself
+       is empty) so a mark is a fixed-depth lookup regardless of how
+       deep the representative file sits, rather than one directory
+       per path component. This trades away being able to reconstruct
+       relPath by just walking directories with `ls`, and caps the
+       encodable relPath length at NAME_MAX: if it doesn't fit, skip
+       writing a mark this round (fail-open, same as the no-candidate
+       case) rather than trying to represent it another way. */
+    std::string encoded = markRelPath->empty() ? emptyRelPathMarkName : percentEncodeMarkName(*markRelPath);
+    if (encoded.size() > NAME_MAX)
+        return;
+
+    auto markRoot = trackingDir / storePath.to_string();
+    auto tmpDir = makeTempPath(trackingDir, ".tmp-mark");
+
+    try {
+        /* Build the new mark subtree in a private temp directory, then
+           atomically rename it into place: this makes a concurrent
+           optimiser writing a different (also valid) representative
+           file for the same StorePath pick one winner or the other,
+           never a two-entry directory with both - the race that an
+           in-place remove_all()+create_hard_link() sequence can't rule
+           out, since std::filesystem::rename() replacing a directory
+           is a single atomic operation. */
+        std::filesystem::create_directory(tmpDir);
+
+        auto realPath = config->realStoreDir.get() / storePath.to_string();
+        auto representative = markRelPath->empty() ? realPath : realPath / *markRelPath;
+
+        std::filesystem::create_hard_link(representative, tmpDir / encoded);
+
+        try {
+            std::filesystem::rename(tmpDir, markRoot);
+        } catch (std::filesystem::filesystem_error & e) {
+            if (e.code() != std::errc::directory_not_empty)
+                throw;
+            /* markRoot already holds a stale mark (e.g. left by a
+               crash, a deleted-and-recreated StorePath, or simply the
+               previous valid mark being refreshed) - clear it and
+               retry once. If a concurrent writer re-populates markRoot
+               in between, this retry can also fail; that's absorbed by
+               the catch-all below like any other best-effort race. */
+            std::filesystem::remove_all(markRoot);
+            std::filesystem::rename(tmpDir, markRoot);
+        }
+    } catch (std::filesystem::filesystem_error &) {
+        /* Best-effort: never abort the run. */
+        std::error_code ec;
+        std::filesystem::remove_all(tmpDir, ec);
+    }
+}
+
+bool LocalStore::hasValidOptimiseMark(const StorePath & storePath, const std::filesystem::path & realPath)
+{
+    auto markRoot = trackingDir / storePath.to_string();
+
+    /* A genuine mark directory has exactly one entry, by construction.
+       Any deviation - missing, extra entries, unreadable - is treated
+       fail-safe: "unreadable, re-optimise". One opendir/readdir round
+       regardless of how deep the encoded relPath's original directory
+       chain would have been. */
+    std::string onlyEntry;
+    size_t count = 0;
+    try {
+        for (auto & entry : DirectoryIterator{markRoot}) {
+            checkInterrupt();
+            if (count == 1)
+                return false; /* more than one entry: fail-safe */
+            onlyEntry = entry.path().filename().string();
+            count = 1;
+        }
+    } catch (SystemError &) {
+        return false;
+    }
+    if (count != 1)
+        return false;
+
+    auto relPath = percentDecodeMarkName(onlyEntry);
+    if (!relPath)
+        return false; /* malformed name: fail-safe */
+
+    auto markLeaf = markRoot / onlyEntry;
+    auto st = maybeLstat(markLeaf);
+    if (!st)
+        return false;
+
+    /* realPath / relPath with relPath empty appends a trailing
+       separator, and lstat on that fails ENOTDIR for a regular file -
+       maybeLstat then reports "doesn't exist". Must special-case empty
+       relPath or single-file StorePaths (.drv files) never verify. */
+    auto liveRealPath = relPath->empty() ? realPath : realPath / *relPath;
+    auto liveSt = maybeLstat(liveRealPath);
+
+    return liveSt && liveSt->st_ino == st->st_ino && liveSt->st_nlink > 1;
+}
+
 void LocalStore::optimiseStore(OptimiseStats & stats)
 {
     Activity act(*logger, actOptimiseStore);
 
     auto paths = queryAllValidPaths();
-    InodeHash inodeHash = loadInodeHash();
+
+    /* No longer seeded via loadInodeHash(): hasValidOptimiseMark()
+       below skips most StorePaths outright, so that upfront full scan
+       of .links would cost more than it saves. Still shared across the
+       whole run (not reset per StorePath), so the inodeHash.count()
+       fast path in optimisePath_ can fire for an inode inserted while
+       processing an earlier StorePath. */
+    InodeHash inodeHash;
 
     act.progress(0, paths.size());
 
@@ -310,10 +492,23 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         addTempRoot(i);
         if (!isValidPath(i))
             continue; /* path was GC'ed, probably */
+
+        auto realPath = config->realStoreDir.get() / i.to_string();
+
+        if (hasValidOptimiseMark(i, realPath)) {
+            done++;
+            act.progress(done, paths.size());
+            continue;
+        }
+
+        std::optional<std::filesystem::path> markRelPath;
         {
             Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
-            optimisePath_(&act, stats, config->realStoreDir.get() / i.to_string(), inodeHash, NoRepair);
+            optimisePath_(&act, stats, realPath, inodeHash, NoRepair, "", markRelPath);
         }
+
+        writeOptimiseMark(i, markRelPath);
+
         done++;
         act.progress(done, paths.size());
     }
@@ -332,9 +527,13 @@ void LocalStore::optimisePath(const std::filesystem::path & path, RepairFlag rep
 {
     OptimiseStats stats;
     InodeHash inodeHash;
+    std::optional<std::filesystem::path> markRelPath;
 
     if (config->getLocalSettings().autoOptimiseStore)
-        optimisePath_(nullptr, stats, path, inodeHash, repair);
+        optimisePath_(nullptr, stats, path, inodeHash, repair, "", markRelPath);
+
+    StorePath storePath{path.filename().string()};
+    writeOptimiseMark(storePath, markRelPath);
 }
 
 } // namespace nix

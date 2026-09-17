@@ -17,7 +17,9 @@ if [ "$inode1" != "$inode2" ]; then
 fi
 
 nlink="$(stat --format=%h "$outPath1"/foo)"
-if [ "$nlink" != 3 ]; then
+# 3 content links (outPath1/foo, outPath2/foo, .links/<hash>) plus one
+# .hardlinks/tracking mark per referencing StorePath (outPath1, outPath2).
+if [ "$nlink" != 5 ]; then
     fail "link count incorrect"
 fi
 
