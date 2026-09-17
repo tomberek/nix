@@ -488,29 +488,45 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
 
     uint64_t done = 0;
 
-    for (auto & i : paths) {
-        addTempRoot(i);
-        if (!isValidPath(i))
-            continue; /* path was GC'ed, probably */
+    /* Registering each path as a temp root one at a time means
+       acquiring/releasing the GC lock once per path, which shows up as
+       real syscall cost at scale (flock/fcntl in the tens of thousands
+       for a large store) even though the file walk itself is now
+       skipped for marked paths. addTempRoots() already holds the lock
+       once per call regardless of how many paths it's given - call it
+       with chunks instead of one path at a time. */
+    constexpr size_t tempRootBatchSize = 256;
+    StorePathSet batch;
 
-        auto realPath = config->realStoreDir.get() / i.to_string();
+    for (auto it = paths.begin(); it != paths.end();) {
+        batch.clear();
+        for (; it != paths.end() && batch.size() < tempRootBatchSize; ++it)
+            batch.insert(*it);
+        addTempRoots(batch);
 
-        if (hasValidOptimiseMark(i, realPath)) {
+        for (auto & i : batch) {
+            if (!isValidPath(i))
+                continue; /* path was GC'ed, probably */
+
+            auto realPath = config->realStoreDir.get() / i.to_string();
+
+            if (hasValidOptimiseMark(i, realPath)) {
+                done++;
+                act.progress(done, paths.size());
+                continue;
+            }
+
+            std::optional<std::filesystem::path> markRelPath;
+            {
+                Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
+                optimisePath_(&act, stats, realPath, inodeHash, NoRepair, "", markRelPath);
+            }
+
+            writeOptimiseMark(i, markRelPath);
+
             done++;
             act.progress(done, paths.size());
-            continue;
         }
-
-        std::optional<std::filesystem::path> markRelPath;
-        {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
-            optimisePath_(&act, stats, realPath, inodeHash, NoRepair, "", markRelPath);
-        }
-
-        writeOptimiseMark(i, markRelPath);
-
-        done++;
-        act.progress(done, paths.size());
     }
 }
 
