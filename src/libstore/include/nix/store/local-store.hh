@@ -12,9 +12,37 @@
 #include <future>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 #include <boost/unordered/unordered_flat_set.hpp>
 
 namespace nix {
+
+/**
+ * Mode subdirectory names under `.hardlinks/b3/<mode>/...`. Flat
+ * content hashing (unlike the NAR-serialization hash `.links`/
+ * `.hardlinks/sha256` use) can't distinguish a regular file from an
+ * executable file from a symlink with identical bytes, so BLAKE3 links
+ * are split into three independent, mode-keyed shard trees instead.
+ */
+constexpr mode_t linkModeMask = S_IFMT | S_IXUSR;
+
+constexpr mode_t linkModeR = S_IFREG;
+constexpr mode_t linkModeX = S_IFREG | S_IXUSR;
+constexpr mode_t linkModeS = S_IFLNK | S_IXUSR;
+
+inline std::string_view linkModeDirName(mode_t mode)
+{
+    switch (mode & linkModeMask) {
+    case linkModeR:
+        return "r";
+    case linkModeX:
+        return "x";
+    case linkModeS:
+        return "s";
+    default:
+        throw Error("unexpected mode 0%o for .hardlinks/b3 entry", mode);
+    }
+}
 
 /**
  * Nix store and database schema version.
@@ -246,6 +274,7 @@ public:
     const std::filesystem::path trackingDir;
     const std::filesystem::path shardedLinksDir;
     const std::filesystem::path shardedLinksOverflowDir;
+    const std::filesystem::path b3LinksDir;
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
     const std::filesystem::path tempRootsDir;

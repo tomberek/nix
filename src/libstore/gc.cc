@@ -979,6 +979,27 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
         cleanupLinksDir(shardedLinksOverflowDir);
 
+        /* .hardlinks/b3's three mode-keyed shard trees (present only
+           if blake3-links was ever enabled - the directories are
+           created lazily on first LocalStore construction with the
+           feature on, not unconditionally like .hardlinks/sha256) get
+           the same treatment. cleanupLinksDir() already no-ops on a
+           directory that doesn't exist. */
+        for (auto modeDir : {"r", "x", "s"}) {
+            auto dir = b3LinksDir / modeDir;
+            for (size_t first = 0; first < 2; ++first) {
+                for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
+                    for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                        checkInterrupt();
+                        char shard[4] = {
+                            BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                        cleanupLinksDir(dir / shard);
+                    }
+                }
+            }
+            cleanupLinksDir(dir / "overflow");
+        }
+
         int64_t overhead =
 #ifdef _WIN32
             0
