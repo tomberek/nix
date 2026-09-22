@@ -301,7 +301,7 @@ StringSet NixRepl::completePrefix(const std::string & prefix)
                 noPos,
                 "while evaluating an attrset for the purpose of completion (this error should not be displayed; file an issue?)");
 
-            for (auto & i : *v.attrs()) {
+            for (auto & i : *v.attrs(state->mem)) {
                 std::string_view name = state->symbols[i.name];
                 if (name.substr(0, cur2.size()) != cur2)
                     continue;
@@ -341,7 +341,7 @@ void NixRepl::loadDebugTraceEnv(DebugTrace & dt)
 
     auto se = state->getStaticEnv(dt.expr);
     if (se) {
-        auto vm = mapStaticEnvBindings(state->symbols, *se.get(), dt.env);
+        auto vm = mapStaticEnvBindings(state->mem, state->symbols, *se.get(), dt.env);
 
         // add staticenv vars.
         for (auto & [name, value] : *(vm.get()))
@@ -610,7 +610,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
             fallbackName = state->symbols[name];
 
             state->forceAttrs(vAttrs, noPos, "while evaluating an attribute set to look for documentation");
-            auto attrs = vAttrs.attrs();
+            auto attrs = vAttrs.attrs(state->mem);
             assert(attrs);
             auto attr = attrs->get(name);
             if (!attr) {
@@ -770,7 +770,7 @@ void NixRepl::showLastLoaded()
 
     RunPager pager;
     try {
-        for (auto & i : *lastLoaded->attrs()) {
+        for (auto & i : *lastLoaded->attrs(state->mem)) {
             std::string_view name = state->symbols[i.name];
             logger->cout(name);
         }
@@ -838,24 +838,24 @@ void NixRepl::addAttrsToScope(Value & attrs)
         attrs,
         [&]() { return attrs.determinePos(noPos); },
         "while evaluating an attribute set to be merged in the global scope");
-    if (displ + attrs.attrs()->size() >= envSize)
+    if (displ + attrs.attrs(state->mem)->size() >= envSize)
         throw Error("environment full; cannot add more variables");
 
-    for (auto & i : *attrs.attrs()) {
+    for (auto & i : *attrs.attrs(state->mem)) {
         staticEnv->vars.emplace_back(i.name, displ);
         env->values[displ++] = i.value;
         varNames.emplace(state->symbols[i.name]);
     }
     staticEnv->sort();
     staticEnv->deduplicate();
-    notice("Added %1% variables.", attrs.attrs()->size());
+    notice("Added %1% variables.", attrs.attrs(state->mem)->size());
 
     lastLoaded = attrs;
 
     const int max_print = 20;
     int counter = 0;
     std::ostringstream loaded;
-    for (auto & i : attrs.attrs()->lexicographicOrder(state->symbols)) {
+    for (auto & i : attrs.attrs(state->mem)->lexicographicOrder(state->symbols)) {
         if (counter >= max_print)
             break;
 
@@ -868,8 +868,8 @@ void NixRepl::addAttrsToScope(Value & attrs)
 
     notice("%1%", loaded.str());
 
-    if (attrs.attrs()->size() > max_print)
-        notice("... and %1% more; view with :ll", attrs.attrs()->size() - max_print);
+    if (attrs.attrs(state->mem)->size() > max_print)
+        notice("... and %1% more; view with :ll", attrs.attrs(state->mem)->size() - max_print);
 }
 
 void NixRepl::addVarToScope(const Symbol name, Value & v)

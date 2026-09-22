@@ -203,7 +203,7 @@ static void fetchTree(
 
         fetchers::Attrs attrs;
 
-        if (auto aType = args[0]->attrs()->get(state.s.type)) {
+        if (auto aType = args[0]->attrs(state.mem)->get(state.s.type)) {
             if (type)
                 state.error<EvalError>("unexpected argument 'type'").atPos(noPos).debugThrow();
             type = state.forceStringNoCtx(
@@ -213,7 +213,7 @@ static void fetchTree(
 
         attrs.emplace("type", type.value());
 
-        for (auto & attr : *args[0]->attrs()) {
+        for (auto & attr : *args[0]->attrs(state.mem)) {
             if (attr.name == state.s.type)
                 continue;
             state.forceValue(*attr.value, attr.pos);
@@ -492,7 +492,7 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
 
     if (isArgAttrs) {
 
-        for (auto & attr : *args[0]->attrs()) {
+        for (auto & attr : *args[0]->attrs(state.mem)) {
             std::string_view n(state.symbols[attr.name]);
             if (n == "url")
                 url = state.forceStringNoCtx(*attr.value, attr.pos, "while evaluating the url we should fetch");

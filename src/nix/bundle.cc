@@ -97,7 +97,7 @@ struct CmdBundle : InstallableValueCommand
         if (!evalState->isDerivation(*vRes))
             throw Error("the bundler '%s' does not produce a derivation", bundler.what());
 
-        auto attr1 = vRes->attrs()->get(evalState->s.drvPath);
+        auto attr1 = vRes->attrs(evalState->mem)->get(evalState->s.drvPath);
         if (!attr1)
             throw Error("the bundler '%s' does not produce a derivation", bundler.what());
 
@@ -106,7 +106,7 @@ struct CmdBundle : InstallableValueCommand
 
         drvPath.requireDerivation();
 
-        auto attr2 = vRes->attrs()->get(evalState->s.outPath);
+        auto attr2 = vRes->attrs(evalState->mem)->get(evalState->s.outPath);
         if (!attr2)
             throw Error("the bundler '%s' does not produce a derivation", bundler.what());
 
@@ -120,7 +120,7 @@ struct CmdBundle : InstallableValueCommand
         });
 
         if (!outLink) {
-            auto * attr = vRes->attrs()->get(evalState->s.name);
+            auto * attr = vRes->attrs(evalState->mem)->get(evalState->s.name);
             if (!attr)
                 throw Error("attribute 'name' missing");
             outLink = evalState->forceStringNoCtx(*attr->value, attr->pos, "");

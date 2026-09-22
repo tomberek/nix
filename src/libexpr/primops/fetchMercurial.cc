@@ -18,7 +18,7 @@ static void prim_fetchMercurial(EvalState & state, CallSite callSite, Value * co
 
     if (args[0]->type() == nAttrs) {
 
-        for (auto & attr : *args[0]->attrs()) {
+        for (auto & attr : *args[0]->attrs(state.mem)) {
             std::string_view n(state.symbols[attr.name]);
             if (n == "url")
                 url = state

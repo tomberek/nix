@@ -270,13 +270,13 @@ static void scopedImport(EvalState & state, SourcePath & path, Value * vScope, V
 {
     state.forceAttrs(*vScope, noPos, "while evaluating the first argument passed to builtins.scopedImport");
 
-    Env * env = &state.mem.allocEnv(vScope->attrs()->size());
+    Env * env = &state.mem.allocEnv(vScope->attrs(state.mem)->size());
     env->up = &state.baseEnv;
 
-    auto staticEnv = std::make_shared<StaticEnv>(nullptr, state.staticBaseEnv, vScope->attrs()->size());
+    auto staticEnv = std::make_shared<StaticEnv>(nullptr, state.staticBaseEnv, vScope->attrs(state.mem)->size());
 
     unsigned int displ = 0;
-    for (auto & attr : *vScope->attrs()) {
+    for (auto & attr : *vScope->attrs(state.mem)) {
         staticEnv->vars.emplace_back(attr.name, displ);
         env->values[displ++] = attr.value;
     }
@@ -794,7 +794,7 @@ static void prim_genericClosure(EvalState & state, CallSite callSite, Value * co
 
     /* Get the start set. */
     auto startSet = state.getAttr(
-        state.s.startSet, args[0]->attrs(), "in the attrset passed as argument to builtins.genericClosure");
+        state.s.startSet, args[0]->attrs(state.mem), "in the attrset passed as argument to builtins.genericClosure");
 
     state.forceList(
         *startSet->value,
@@ -812,7 +812,7 @@ static void prim_genericClosure(EvalState & state, CallSite callSite, Value * co
 
     /* Get the operator. */
     auto op = state.getAttr(
-        state.s.operator_, args[0]->attrs(), "in the attrset passed as argument to builtins.genericClosure");
+        state.s.operator_, args[0]->attrs(state.mem), "in the attrset passed as argument to builtins.genericClosure");
     state.forceFunction(
         *op->value, noPos, "while evaluating the 'operator' attribute passed as argument to builtins.genericClosure");
 
@@ -836,7 +836,7 @@ static void prim_genericClosure(EvalState & state, CallSite callSite, Value * co
 
         const Attr * key;
         try {
-            key = state.getAttr(state.s.key, e->attrs(), "");
+            key = state.getAttr(state.s.key, e->attrs(state.mem), "");
         } catch (Error & err) {
             err.addTrace(nullptr, "in genericClosure element %s", ValuePrinter(state, *e, errorPrintOptions));
             throw;
@@ -1426,7 +1426,7 @@ static void prim_derivationStrict(EvalState & state, CallSite callSite, Value * 
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.derivationStrict");
 
-    auto attrs = args[0]->attrs();
+    auto attrs = args[0]->attrs(state.mem);
 
     /* Figure out the name first (for stack backtraces). */
     auto nameAttr =
@@ -2229,14 +2229,14 @@ static void prim_findFile(EvalState & state, CallSite callSite, Value * const * 
         state.forceAttrs(*v2, noPos, "while evaluating an element of the list passed to builtins.findFile");
 
         std::string prefix;
-        auto i = v2->attrs()->get(state.s.prefix);
+        auto i = v2->attrs(state.mem)->get(state.s.prefix);
         if (i)
             prefix = state.forceStringNoCtx(
                 *i->value,
                 noPos,
                 "while evaluating the `prefix` attribute of an element of the list passed to builtins.findFile");
 
-        i = state.getAttr(state.s.path, v2->attrs(), "in an element of the __nixPath");
+        i = state.getAttr(state.s.path, v2->attrs(state.mem), "in an element of the __nixPath");
 
         NixStringContext context;
         auto path =
@@ -3047,7 +3047,7 @@ static void prim_path(EvalState & state, CallSite callSite, Value * const * args
 
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to 'builtins.path'");
 
-    for (auto & attr : *args[0]->attrs()) {
+    for (auto & attr : *args[0]->attrs(state.mem)) {
         auto n = state.symbols[attr.name];
         if (n == "path")
             path.emplace(state.coerceToPath(
@@ -3131,9 +3131,18 @@ static void prim_attrNames(EvalState & state, CallSite callSite, Value * const *
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.attrNames");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    if (args[0]->isAttrs2()) {
+        // "name" < "value" alphabetically, so the sorted order is fixed.
+        auto list = state.buildList(2);
+        list[0] = Value::toPtr(state.symbols[state.s.name]);
+        list[1] = Value::toPtr(state.symbols[state.s.value]);
+        v.mkList(list);
+        return;
+    }
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
+    auto list = state.buildList(args[0]->attrs(state.mem)->size());
+
+    for (const auto & [n, i] : enumerate(*args[0]->attrs(state.mem)))
         list[n] = Value::toPtr(state.symbols[i.name]);
 
     std::sort(list.begin(), list.end(), [](Value * v1, Value * v2) { return v1->string_view() < v2->string_view(); });
@@ -3160,9 +3169,19 @@ static void prim_attrValues(EvalState & state, CallSite callSite, Value * const 
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.attrValues");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    if (args[0]->isAttrs2()) {
+        // "name" < "value" alphabetically, so the sorted order is fixed.
+        auto pair = args[0]->nameValuePair();
+        auto list = state.buildList(2);
+        list[0] = pair.name;
+        list[1] = pair.value;
+        v.mkList(list);
+        return;
+    }
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
+    auto list = state.buildList(args[0]->attrs(state.mem)->size());
+
+    for (const auto & [n, i] : enumerate(*args[0]->attrs(state.mem)))
         list[n] = (Value *) &i;
 
     std::sort(list.begin(), list.end(), [&](Value * v1, Value * v2) {
@@ -3194,7 +3213,27 @@ void prim_getAttr(EvalState & state, CallSite callSite, Value * const * args, Va
     auto attr =
         state.forceStringNoCtx(*args[0], noPos, "while evaluating the first argument passed to builtins.getAttr");
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.getAttr");
-    auto i = state.getAttr(state.symbols.create(attr), args[1]->attrs(), "in the attribute set under consideration");
+    auto sym = state.symbols.create(attr);
+
+    Value * value;
+    if (args[1]->isAttrs2()) {
+        // `{ name; value; }` pairs never carry a recorded position, so
+        // there's nothing to feed into the attrSelects counter below.
+        auto pair = args[1]->nameValuePair();
+        if (sym == state.s.name)
+            value = pair.name;
+        else if (sym == state.s.value)
+            value = pair.value;
+        else
+            state.error<TypeError>("attribute '%s' missing", attr)
+                .withTrace(noPos, "in the attribute set under consideration")
+                .debugThrow();
+        state.forceValue(*value, noPos);
+        v = *value;
+        return;
+    }
+
+    auto i = state.getAttr(sym, args[1]->attrs(state.mem), "in the attribute set under consideration");
     // !!! add to stack trace?
     if (state.countCalls && i->pos)
         state.attrSelects->try_emplace_or_visit(i->pos, 1, [](auto & j) { j.second++; });
@@ -3222,7 +3261,7 @@ static void prim_unsafeGetAttrPos(EvalState & state, CallSite callSite, Value * 
     auto attr = state.forceStringNoCtx(
         *args[0], noPos, "while evaluating the first argument passed to builtins.unsafeGetAttrPos");
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.unsafeGetAttrPos");
-    auto i = args[1]->attrs()->get(state.symbols.create(attr));
+    auto i = args[1]->attrs(state.mem)->get(state.symbols.create(attr));
     if (!i)
         v.mkNull();
     else
@@ -3293,7 +3332,12 @@ static void prim_hasAttr(EvalState & state, CallSite callSite, Value * const * a
     auto attr =
         state.forceStringNoCtx(*args[0], noPos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.hasAttr");
-    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)));
+    auto sym = state.symbols.create(attr);
+    if (args[1]->isAttrs2()) {
+        v.mkBool(sym == state.s.name || sym == state.s.value);
+        return;
+    }
+    v.mkBool(args[1]->attrs(state.mem)->get(sym));
 }
 
 static RegisterPrimOp primop_hasAttr({
@@ -3348,9 +3392,13 @@ static void prim_removeAttrs(EvalState & state, CallSite callSite, Value * const
     /* Copy all attributes not in that set.  Note that we don't need
        to sort v.attrs because it's a subset of an already sorted
        vector. */
-    auto attrs = state.buildBindings(args[0]->attrs()->size());
+    auto attrs = state.buildBindings(args[0]->attrs(state.mem)->size());
     std::set_difference(
-        args[0]->attrs()->begin(), args[0]->attrs()->end(), names.begin(), names.end(), std::back_inserter(attrs));
+        args[0]->attrs(state.mem)->begin(),
+        args[0]->attrs(state.mem)->end(),
+        names.begin(),
+        names.end(),
+        std::back_inserter(attrs));
     v.mkAttrs(attrs.alreadySorted());
 }
 
@@ -3390,11 +3438,25 @@ static void prim_listToAttrs(EvalState & state, CallSite callSite, Value * const
     for (const auto & [n, v2] : enumerate(listView)) {
         state.forceAttrs(*v2, noPos, "while evaluating an element of the list passed to builtins.listToAttrs");
 
-        auto j = state.getAttr(state.s.name, v2->attrs(), "in a {name=...; value=...;} pair");
+        // Common case: `{ name = ...; value = ...; }` (e.g. from
+        // `lib.nameValuePair`) is already exactly this shape. Read `name`
+        // straight out of the compact encoding instead of materializing a
+        // `Bindings` we'd otherwise discard immediately. `tAttrs2` doesn't
+        // track attribute positions, hence `noPos` on that branch.
+        Value * nameValue;
+        PosIdx namePos;
+        if (v2->isAttrs2()) {
+            nameValue = v2->nameValuePair().name;
+            namePos = noPos;
+        } else {
+            auto j = state.getAttr(state.s.name, v2->attrs(state.mem), "in a {name=...; value=...;} pair");
+            nameValue = j->value;
+            namePos = j->pos;
+        }
 
         auto name = state.forceStringNoCtx(
-            *j->value,
-            j->pos,
+            *nameValue,
+            namePos,
             "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs");
         auto sym = state.symbols.create(name);
 
@@ -3417,9 +3479,18 @@ static void prim_listToAttrs(EvalState & state, CallSite callSite, Value * const
         // Note that .value is actually a Value * *; see earlier comments
         Value * v2 = *std::bit_cast<ElemPtr>(attr.value);
 
-        auto j = state.getAttr(state.s.value, v2->attrs(), "in a {name=...; value=...;} pair");
+        Value * valueValue;
+        PosIdx valuePos;
+        if (v2->isAttrs2()) {
+            valueValue = v2->nameValuePair().value;
+            valuePos = noPos;
+        } else {
+            auto j = state.getAttr(state.s.value, v2->attrs(state.mem), "in a {name=...; value=...;} pair");
+            valueValue = j->value;
+            valuePos = j->pos;
+        }
         prev = attr.name;
-        bindings.push_back({prev, j->value, j->pos});
+        bindings.push_back({prev, valueValue, valuePos});
     }
     // help GC and clear end of allocated array
     for (size_t n = bindings.size(); n < listSize; n++) {
@@ -3466,8 +3537,8 @@ static void prim_intersectAttrs(EvalState & state, CallSite callSite, Value * co
     state.forceAttrs(*args[0], noPos, "while evaluating the first argument passed to builtins.intersectAttrs");
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.intersectAttrs");
 
-    auto & left = *args[0]->attrs();
-    auto & right = *args[1]->attrs();
+    auto & left = *args[0]->attrs(state.mem);
+    auto & right = *args[1]->attrs(state.mem);
 
     auto attrs = state.buildBindings(std::min(left.size(), right.size()));
 
@@ -3550,7 +3621,17 @@ static void prim_catAttrs(EvalState & state, CallSite callSite, Value * const * 
     for (auto v2 : args[1]->listView()) {
         state.forceAttrs(
             *v2, noPos, "while evaluating an element in the list passed as second argument to builtins.catAttrs");
-        if (auto i = v2->attrs()->get(attrName))
+        // Common case: `{ name = ...; value = ...; }` pairs (e.g. from
+        // `lib.nameValuePair`/`lib.attrsToList`) are already exactly this
+        // shape when attrName is "name" or "value" -- avoid materializing
+        // a `Bindings` we'd otherwise discard immediately.
+        if (v2->isAttrs2()) {
+            auto pair = v2->nameValuePair();
+            if (attrName == state.s.name)
+                res[found++] = pair.name;
+            else if (attrName == state.s.value)
+                res[found++] = pair.value;
+        } else if (auto i = v2->attrs(state.mem)->get(attrName))
             res[found++] = i->value;
     }
 
@@ -3629,9 +3710,9 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindings(args[1]->attrs()->size());
+    auto attrs = state.buildBindings(args[1]->attrs(state.mem)->size());
 
-    for (auto & i : *args[1]->attrs()) {
+    for (auto & i : *args[1]->attrs(state.mem)) {
         Value * vName = Value::toPtr(state.symbols[i.name]);
         Value * vFun2 = state.allocValue();
         vFun2->mkApp(args[0], vName);
@@ -3685,7 +3766,7 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
     for (auto & vElem : listItems) {
         state.forceAttrs(
             *vElem, noPos, "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith");
-        for (auto & attr : *vElem->attrs())
+        for (auto & attr : *vElem->attrs(state.mem))
             attrsSeen.try_emplace(attr.name).first->second.size++;
     }
 
@@ -3693,7 +3774,7 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
         elem.list.emplace(state.buildList(elem.size));
 
     for (auto & vElem : listItems) {
-        for (auto & attr : *vElem->attrs()) {
+        for (auto & attr : *vElem->attrs(state.mem)) {
             auto & item = attrsSeen.at(attr.name);
             (*item.list)[item.pos++] = attr.value;
         }
@@ -4788,7 +4869,7 @@ static RegisterPrimOp primop_hashString({
 static void prim_convertHash(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the first argument passed to builtins.convertHash");
-    auto inputAttrs = args[0]->attrs();
+    auto inputAttrs = args[0]->attrs(state.mem);
 
     auto iteratorHash = state.getAttr(state.symbols.create("hash"), inputAttrs, "while locating the attribute 'hash'");
     auto hash = state.forceStringNoCtx(*iteratorHash->value, noPos, "while evaluating the attribute 'hash'");
@@ -4800,7 +4881,7 @@ static void prim_convertHash(EvalState & state, CallSite callSite, Value * const
             state.forceStringNoCtx(*iteratorHashAlgo->value, noPos, "while evaluating the attribute 'hashAlgo'"));
 
     auto iteratorToHashFormat = state.getAttr(
-        state.symbols.create("toHashFormat"), args[0]->attrs(), "while locating the attribute 'toHashFormat'");
+        state.symbols.create("toHashFormat"), args[0]->attrs(state.mem), "while locating the attribute 'toHashFormat'");
     HashFormat hf = parseHashFormat(
         state.forceStringNoCtx(*iteratorToHashFormat->value, noPos, "while evaluating the attribute 'toHashFormat'"));
 
@@ -5619,7 +5700,7 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
 
     /* Now that we've added all primops, sort the `builtins' set,
        because attribute lookups expect it to be sorted. */
-    const_cast<Bindings *>(getBuiltins().attrs())->sort();
+    const_cast<Bindings *>(getBuiltins().attrsUnchecked())->sort();
 
     staticBaseEnv->sort();
 

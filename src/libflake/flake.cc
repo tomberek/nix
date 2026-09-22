@@ -145,7 +145,7 @@ static FlakeInput parseFlakeInput(
     fetchers::Attrs attrs;
     std::optional<std::string> url;
 
-    for (auto & attr : *value->attrs()) {
+    for (auto & attr : *value->attrs(state.mem)) {
         try {
             if (attr.name == sUrl) {
                 forceTrivialValue(state, *attr.value, pos);
@@ -220,13 +220,13 @@ static std::pair<std::map<FlakeId, FlakeInput>, fetchers::Attrs> parseFlakeInput
 
     expectType(state, nAttrs, *value, pos);
 
-    for (auto & inputAttr : *value->attrs()) {
+    for (auto & inputAttr : *value->attrs(state.mem)) {
         auto inputName = state.symbols[inputAttr.name];
         if (inputName == "self") {
             if (!allowSelf)
                 throw Error("'self' input attribute not allowed at %s", state.positions[inputAttr.pos]);
             expectType(state, nAttrs, *inputAttr.value, inputAttr.pos);
-            for (auto & attr : *inputAttr.value->attrs())
+            for (auto & attr : *inputAttr.value->attrs(state.mem))
                 parseFlakeInputAttr(state, attr, selfAttrs);
         } else {
             inputs.emplace(
@@ -259,14 +259,14 @@ static Flake readFlake(
         .path = flakePath,
     };
 
-    if (auto description = vInfo.attrs()->get(state.s.description)) {
+    if (auto description = vInfo.attrs(state.mem)->get(state.s.description)) {
         expectType(state, nString, *description->value, description->pos);
         flake.description = description->value->string_view();
     }
 
     auto sInputs = state.symbols.create("inputs");
 
-    if (auto inputs = vInfo.attrs()->get(sInputs)) {
+    if (auto inputs = vInfo.attrs(state.mem)->get(sInputs)) {
         auto [flakeInputs, selfAttrs] =
             parseFlakeInputs(state, inputs->value, inputs->pos, lockRootAttrPath, flakeDir, true);
         flake.inputs = std::move(flakeInputs);
@@ -275,7 +275,7 @@ static Flake readFlake(
 
     auto sOutputs = state.symbols.create("outputs");
 
-    if (auto outputs = vInfo.attrs()->get(sOutputs)) {
+    if (auto outputs = vInfo.attrs(state.mem)->get(sOutputs)) {
         expectType(state, nFunction, *outputs->value, outputs->pos);
 
         if (outputs->value->isLambda()) {
@@ -294,10 +294,10 @@ static Flake readFlake(
 
     auto sNixConfig = state.symbols.create("nixConfig");
 
-    if (auto nixConfig = vInfo.attrs()->get(sNixConfig)) {
+    if (auto nixConfig = vInfo.attrs(state.mem)->get(sNixConfig)) {
         expectType(state, nAttrs, *nixConfig->value, nixConfig->pos);
 
-        for (auto & setting : *nixConfig->value->attrs()) {
+        for (auto & setting : *nixConfig->value->attrs(state.mem)) {
             forceTrivialValue(state, *setting.value, setting.pos);
             if (setting.value->type() == nString)
                 flake.config.settings.emplace(
@@ -333,7 +333,7 @@ static Flake readFlake(
         }
     }
 
-    for (auto & attr : *vInfo.attrs()) {
+    for (auto & attr : *vInfo.attrs(state.mem)) {
         if (attr.name != state.s.description && attr.name != sInputs && attr.name != sOutputs
             && attr.name != sNixConfig)
             throw Error(
@@ -1036,7 +1036,7 @@ ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlak
 
         state.forceAttrs(*vFlake, noPos, "while parsing cached flake data");
 
-        auto aOutputs = vFlake->attrs()->get(state.symbols.create("outputs"));
+        auto aOutputs = vFlake->attrs(state.mem)->get(state.symbols.create("outputs"));
         assert(aOutputs);
 
         return aOutputs->value;

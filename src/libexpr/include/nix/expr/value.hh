@@ -58,7 +58,8 @@ enum InternalType {
     tApp,
     tThunk,
     tLambda,
-    tLastPairOfPointers = tLambda,
+    tAttrs2, //< a 2-attr attrset with fixed keys, e.g. `{ name; value; }`. See NameValuePair.
+    tLastPairOfPointers = tAttrs2,
     /* layout: Single untaggable field */
     tFirstSingleUntaggable,
     tListN = tFirstSingleUntaggable,
@@ -424,6 +425,23 @@ struct ValueBase
         ExprLambda * fun;
     };
 
+    /**
+     * A 2-attribute attrset with fixed keys, stored without a Bindings
+     * allocation. Currently used for `{ name; value; }`, the shape of
+     * `lib.nameValuePair`/`lib.mapAttrsToList`'s output, which is common
+     * enough in nixpkgs evaluation to be worth a dedicated encoding.
+     * `Value::attrs(EvalMemory&)` materializes a real Bindings on demand
+     * for any access beyond a direct `.name`/`.value` select; the plain
+     * zero-argument `.attrs()` deliberately does not exist for this
+     * reason -- every consumer of the general `Bindings` API must go
+     * through the materializing overload.
+     */
+    struct NameValuePair
+    {
+        Value * name;
+        Value * value;
+    };
+
     using SmallList = std::array<Value *, 2>;
 
     struct List
@@ -508,6 +526,7 @@ struct PayloadTypeToInternalType
     MACRO(const Bindings *, attrs, tAttrs)                          \
     MACRO(ValueBase::List, bigList, tListN)                         \
     MACRO(ValueBase::SmallList, smallList, tListSmall)              \
+    MACRO(ValueBase::NameValuePair, nameValuePair, tAttrs2)         \
     MACRO(ValueBase::ClosureThunk, thunk, tThunk)                   \
     MACRO(ValueBase::FunctionApplicationThunk, app, tApp)           \
     MACRO(ValueBase::Lambda, lambda, tLambda)                       \
@@ -859,6 +878,7 @@ protected:
     }
 
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(SmallList, [0], [1])
+    NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(NameValuePair, .name, .value)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(PrimOpApplicationThunk, .left, .right)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(FunctionApplicationThunk, .left, .right)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(ClosureThunk, .env, .expr)
@@ -1269,6 +1289,15 @@ public:
     }
 
     /**
+     * Whether this is the compact `{ name; value; }` encoding.
+     * See `ValueBase::NameValuePair`.
+     */
+    inline bool isAttrs2() const
+    {
+        return isa<tAttrs2>();
+    }
+
+    /**
      * Returns the normal type of a Value. This only returns nThunk if
      * the Value hasn't been forceValue'd
      *
@@ -1290,6 +1319,7 @@ public:
             t[tFailed] = nFailed;
             t[tExternal] = nExternal;
             t[tAttrs] = nAttrs;
+            t[tAttrs2] = nAttrs;
             t[tPrimOp] = nFunction;
             t[tLambda] = nFunction;
             t[tPrimOpApp] = nFunction;
@@ -1344,6 +1374,7 @@ public:
         case tExternal:
         case tPrimOp:
         case tAttrs:
+        case tAttrs2:
         case tListSmall:
         case tPrimOpApp: // primop-app is known to be a function, which is WHNF
         case tLambda:
@@ -1401,6 +1432,16 @@ public:
     }
 
     Value & mkAttrs(BindingsBuilder & bindings);
+
+    /**
+     * Construct the compact `{ name; value; }` encoding directly,
+     * without allocating a `Bindings`. `name`/`value` may be unforced
+     * thunks. See `ValueBase::NameValuePair`.
+     */
+    inline void mkAttrs2(Value * name, Value * value) noexcept
+    {
+        setStorage(ValueBase::NameValuePair{.name = name, .value = value});
+    }
 
     void mkList(const ListBuilder & builder) noexcept
     {
@@ -1519,9 +1560,37 @@ public:
         return getStorage<ExternalValueBase *>();
     }
 
-    const Bindings * attrs() const noexcept
+    /**
+     * Get this value's attrset as a `Bindings`, materializing the
+     * compact `{ name; value; }` encoding (`isAttrs2()`) into a real
+     * `Bindings` first if necessary. There is deliberately no
+     * zero-argument overload: every consumer of the general `Bindings`
+     * API (`//`, `?`, iteration, `attrNames`, ...) must go through this
+     * so that `tAttrs2` values are never misread as a `const Bindings *`.
+     * Defined out-of-line (attr-set.cc) since it needs `EvalMemory`'s
+     * full definition to allocate.
+     */
+    const Bindings * attrs(EvalMemory & mem) noexcept;
+
+    /**
+     * Read-only access to the underlying `Bindings` WITHOUT materializing
+     * `tAttrs2`. Only call this when the caller has already excluded
+     * `isAttrs2()` (e.g. behind a guard, or when the value is known by
+     * construction to never be `tAttrs2`) -- calling it on a `tAttrs2`
+     * value is undefined behavior (misreads the `NameValuePair` payload
+     * as a `Bindings *`). Prefer `attrs(EvalMemory&)`; this exists only
+     * for the handful of `const`-context call sites (profiler/observer
+     * code) that must not allocate.
+     */
+    const Bindings * attrsUnchecked() const noexcept
     {
         return getStorage<const Bindings *>();
+    }
+
+    /** Only valid when `isAttrs2()`. See `ValueBase::NameValuePair`. */
+    detail::ValueBase::NameValuePair nameValuePair() const noexcept
+    {
+        return getStorage<detail::ValueBase::NameValuePair>();
     }
 
     const PrimOp * primOp() const noexcept

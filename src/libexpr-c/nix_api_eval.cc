@@ -15,7 +15,7 @@ static const nix::Bindings & get_bindings_or_empty(nix::EvalState & state, nix_v
     }
     auto & v = check_value_in(autoArgs);
     state.forceAttrs(v, nix::noPos, "while evaluating automatic function arguments");
-    return *v.attrs();
+    return *v.attrs(state.mem);
 }
 
 extern "C" {

@@ -100,14 +100,14 @@ static void printValueAsXML(
             XMLAttrs xmlAttrs;
 
             std::string drvPath;
-            if (auto a = v.attrs()->get(state.s.drvPath)) {
+            if (auto a = v.attrs(state.mem)->get(state.s.drvPath)) {
                 if (strict)
                     state.forceValue(*a->value, a->pos);
                 if (a->value->type() == nString)
                     xmlAttrs["drvPath"] = drvPath = a->value->string_view();
             }
 
-            if (auto a = v.attrs()->get(state.s.outPath)) {
+            if (auto a = v.attrs(state.mem)->get(state.s.outPath)) {
                 if (strict)
                     state.forceValue(*a->value, a->pos);
                 if (a->value->type() == nString)
@@ -117,14 +117,14 @@ static void printValueAsXML(
             XMLOpenElement _(doc, "derivation", xmlAttrs);
 
             if (drvPath != "" && drvsSeen.insert(drvPath).second)
-                showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
+                showAttrs(state, strict, location, *v.attrs(state.mem), doc, context, drvsSeen);
             else
                 doc.writeEmptyElement("repeated");
         }
 
         else {
             XMLOpenElement _(doc, "attrs");
-            showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
+            showAttrs(state, strict, location, *v.attrs(state.mem), doc, context, drvsSeen);
         }
 
         break;

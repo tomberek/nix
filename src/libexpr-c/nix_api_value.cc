@@ -266,7 +266,9 @@ unsigned int nix_get_attrs_size(nix_c_context * context, const nix_value * value
     try {
         auto & v = check_value_in(value);
         assert(v.type() == nix::nAttrs);
-        return v.attrs()->size();
+        // materializing tAttrs2 (if needed) is an internal representation
+        // change, not an observable mutation; safe despite `const nix_value *`.
+        return const_cast<nix::Value &>(v).attrs(*value->mem)->size();
     }
     NIXC_CATCH_ERRS_RES(0);
 }
@@ -354,7 +356,7 @@ nix_value * nix_get_attr_byname(nix_c_context * context, const nix_value * value
         auto & v = check_value_in(value);
         assert(v.type() == nix::nAttrs);
         nix::Symbol s = state->state.symbols.create(name);
-        auto attr = v.attrs()->get(s);
+        auto attr = const_cast<nix::Value &>(v).attrs(state->state.mem)->get(s);
         if (attr) {
             state->state.forceValue(*attr->value, nix::noPos);
             return new_nix_value(attr->value, state->state.mem);
@@ -374,7 +376,7 @@ nix_get_attr_byname_lazy(nix_c_context * context, const nix_value * value, EvalS
         auto & v = check_value_in(value);
         assert(v.type() == nix::nAttrs);
         nix::Symbol s = state->state.symbols.create(name);
-        auto attr = v.attrs()->get(s);
+        auto attr = const_cast<nix::Value &>(v).attrs(state->state.mem)->get(s);
         if (attr) {
             // Note: intentionally NOT calling forceValue() to keep the attribute lazy
             return new_nix_value(attr->value, state->state.mem);
@@ -393,7 +395,7 @@ bool nix_has_attr_byname(nix_c_context * context, const nix_value * value, EvalS
         auto & v = check_value_in(value);
         assert(v.type() == nix::nAttrs);
         nix::Symbol s = state->state.symbols.create(name);
-        auto attr = v.attrs()->get(s);
+        auto attr = const_cast<nix::Value &>(v).attrs(state->state.mem)->get(s);
         if (attr)
             return true;
         return false;
@@ -403,7 +405,7 @@ bool nix_has_attr_byname(nix_c_context * context, const nix_value * value, EvalS
 
 static void collapse_attrset_layer_chain_if_needed(nix::Value & v, EvalState * state)
 {
-    auto & attrs = *v.attrs();
+    auto & attrs = *v.attrs(state->state.mem);
     if (attrs.isLayered()) {
         auto bindings = state->state.buildBindings(attrs.size());
         std::ranges::copy(attrs, std::back_inserter(bindings));
@@ -419,11 +421,11 @@ nix_get_attr_byidx(nix_c_context * context, nix_value * value, EvalState * state
     try {
         auto & v = check_value_in(value);
         collapse_attrset_layer_chain_if_needed(v, state);
-        if (i >= v.attrs()->size()) {
+        if (i >= v.attrs(state->state.mem)->size()) {
             nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds");
             return nullptr;
         }
-        const nix::Attr & a = (*v.attrs())[i];
+        const nix::Attr & a = (*v.attrs(state->state.mem))[i];
         *name = state->state.symbols[a.name].c_str();
         state->state.forceValue(*a.value, nix::noPos);
         return new_nix_value(a.value, state->state.mem);
@@ -439,11 +441,11 @@ nix_value * nix_get_attr_byidx_lazy(
     try {
         auto & v = check_value_in(value);
         collapse_attrset_layer_chain_if_needed(v, state);
-        if (i >= v.attrs()->size()) {
+        if (i >= v.attrs(state->state.mem)->size()) {
             nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds (Nix C API contract violation)");
             return nullptr;
         }
-        const nix::Attr & a = (*v.attrs())[i];
+        const nix::Attr & a = (*v.attrs(state->state.mem))[i];
         *name = state->state.symbols[a.name].c_str();
         // Note: intentionally NOT calling forceValue() to keep the attribute lazy
         return new_nix_value(a.value, state->state.mem);
@@ -458,11 +460,11 @@ const char * nix_get_attr_name_byidx(nix_c_context * context, nix_value * value,
     try {
         auto & v = check_value_in(value);
         collapse_attrset_layer_chain_if_needed(v, state);
-        if (i >= v.attrs()->size()) {
+        if (i >= v.attrs(state->state.mem)->size()) {
             nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds (Nix C API contract violation)");
             return nullptr;
         }
-        const nix::Attr & a = (*v.attrs())[i];
+        const nix::Attr & a = (*v.attrs(state->state.mem))[i];
         return state->state.symbols[a.name].c_str();
     }
     NIXC_CATCH_ERRS_NULL

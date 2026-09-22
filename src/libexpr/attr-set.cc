@@ -39,6 +39,19 @@ void Bindings::sort()
     std::sort(attrs, attrs + numAttrs);
 }
 
+const Bindings * Value::attrs(EvalMemory & mem) noexcept
+{
+    if (isAttrs2()) {
+        auto pair = nameValuePair();
+        auto bindings = mem.allocBindings(2);
+        bindings->push_back(Attr(EvalState::s.name, pair.name));
+        bindings->push_back(Attr(EvalState::s.value, pair.value));
+        bindings->sort();
+        mkAttrs(bindings);
+    }
+    return attrsUnchecked();
+}
+
 Value & Value::mkAttrs(BindingsBuilder & bindings)
 {
     mkAttrs(bindings.finish());

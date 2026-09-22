@@ -410,6 +410,17 @@ struct ExprAttrs : Expr
     std::optional<AttrDefs> attrs;
     std::unique_ptr<std::pmr::vector<Expr *>> inheritFromExprs;
 
+    /**
+     * Whether this literal is exactly `{ name = ..; value = ..; }` or
+     * `{ inherit name value; }` (in either key order), making it eligible
+     * for the compact `tAttrs2` encoding (see `ValueBase::NameValuePair`).
+     * Computed once, lazily, on first evaluation: -1 = not yet computed,
+     * 0 = not eligible, 1 = eligible. Nix's AST is immutable after parsing
+     * and evaluated single-threaded, so a plain (non-atomic) cache on the
+     * node is sound here, same as `ExprLet::elidableDispl`.
+     */
+    mutable int8_t isNameValuePair = -1;
+
     struct DynamicAttrDef
     {
         Expr *nameExpr, *valueExpr;

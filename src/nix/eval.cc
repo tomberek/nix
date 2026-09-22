@@ -90,7 +90,7 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
                     [[maybe_unused]] bool directoryCreated = std::filesystem::create_directory(path);
                     // Directory should not already exist
                     assert(directoryCreated);
-                    for (auto & attr : *v.attrs()) {
+                    for (auto & attr : *v.attrs(state->mem)) {
                         std::string_view name = state->symbols[attr.name];
                         try {
                             if (name == "." || name == "..")

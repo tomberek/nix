@@ -190,7 +190,7 @@ EvalState::peelToStringOutPath(const PosIdx pos, Value & v, bool checkToStringRe
                     .debugThrow();
             return std::forward<Cb>(cb)(&v, cameThroughToString);
         }
-        if (auto i = v.attrs()->get(state.s.toString)) {
+        if (auto i = v.attrs(state.mem)->get(state.s.toString)) {
             Value & v1 = *state.allocValue();
             try {
                 state.callFunction(*i->value, v, v1, i->pos);
@@ -208,7 +208,7 @@ EvalState::peelToStringOutPath(const PosIdx pos, Value & v, bool checkToStringRe
                 throw;
             }
         }
-        if (auto i = v.attrs()->get(state.s.outPath)) {
+        if (auto i = v.attrs(state.mem)->get(state.s.outPath)) {
             try {
                 state.forceValue(*i->value, i->pos);
                 auto _level = state.addCallDepth(pos);
