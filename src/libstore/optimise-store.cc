@@ -368,9 +368,15 @@ void LocalStore::optimisePath_(
         auto stLink = maybeLstat(linkPath);
         if (!stLink)
             return; /* Concurrent GC race; a later pass will dedup it. */
-        tryLinkTo(linkPath, *stLink);
-        return;
-    } else {
+        if (tryLinkTo(linkPath, *stLink))
+            return;
+        /* linkPath itself is full (EMLINK) - fall through to the
+           sharded farm below instead of giving up, same as the
+           sharded farm's own overflow-slot retry. */
+        foundInFlatLinks = false;
+    }
+
+    {
         /* Not in the old flat layout (or it was just removed above as
            corrupted) - use the sharded farm. Shard prefix is the first
            3 characters of the Nix32-encoded hash (2048 shards, first
