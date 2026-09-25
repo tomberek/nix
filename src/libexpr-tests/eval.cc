@@ -262,6 +262,109 @@ TEST_F(LibExprTest, resetFileCacheReleasesValues)
 
     EXPECT_EQ(nullptr, *weak);
 }
+
+/* ponytail: GC-safety test for the mapAttrs "shape sharing" prototype
+   (see docs/attrset-range-sharing-design.md, mechanism 1, and
+   Bindings::isShapeShared() in attr-set.hh). A shape-shared Bindings
+   stores a raw `const Bindings * shapeBase` pointing at the ORIGINAL
+   input attrset's Bindings instead of copying its Symbol/PosIdx pairs.
+   Because Boehm's interior-pointer support is disabled
+   (GC_set_all_interior_pointers(0), eval-gc.cc), the only way this is
+   safe is if `shapeBase` is an exact, GC-block-start pointer that the
+   collector treats as a normal strong reference (same as
+   Bindings::baseLayer already does). This test constructs the "owner"
+   Bindings and a shape-shared node referencing it on a throwaway GC
+   thread (so the calling thread's conservative stack scan can't
+   accidentally keep the owner alive by coincidence), roots ONLY the
+   shape-shared result via GC-heap storage, forces a real collection
+   cycle, and checks: (1) the owner survived purely because shapeBase
+   references it, and (2) the shape-shared result's keys/values still
+   read back correctly afterward -- which is exactly what would go
+   silently wrong (dangling shapeBase, corrupted reads) if the pointer
+   were interior instead of block-start. */
+TEST_F(LibExprTest, mapAttrsShapeSharingSurvivesGC)
+{
+    auto weakOwner = static_cast<void **>(GC_MALLOC_ATOMIC(sizeof(void *)));
+    ASSERT_NE(nullptr, weakOwner);
+    *weakOwner = nullptr;
+    Finally cleanupOwner([&] {
+        GC_unregister_disappearing_link(weakOwner);
+        GC_FREE(weakOwner);
+    });
+
+    /* Strong root for the shape-shared RESULT, living on the GC heap
+       (not the C++ call stack) so it is the only thing keeping the
+       result -- and transitively, via shapeBase, the owner -- alive
+       once the construction thread below exits. */
+    auto rootedResult = static_cast<const Bindings **>(GC_MALLOC(sizeof(void *)));
+    ASSERT_NE(nullptr, rootedResult);
+    *rootedResult = nullptr;
+    Finally cleanupResult([&] { GC_FREE(rootedResult); });
+
+    runOnGCThread([&] {
+        auto b = state.buildBindings(3);
+        b.alloc("a").mkInt(1);
+        b.alloc("b").mkInt(2);
+        b.alloc("c").mkInt(3);
+        const Bindings * owner = b.finish();
+
+        *weakOwner = const_cast<Bindings *>(owner);
+        ASSERT_EQ(GC_SUCCESS, GC_GENERAL_REGISTER_DISAPPEARING_LINK(weakOwner, owner));
+
+        auto * shared = state.mem.allocShapeSharedBindings(owner, 3);
+        ASSERT_TRUE(shared->isShapeShared());
+
+        Value * v10 = state.allocValue();
+        v10->mkInt(10);
+        Value * v20 = state.allocValue();
+        v20->mkInt(20);
+        Value * v30 = state.allocValue();
+        v30->mkInt(30);
+        Value * newVals[3] = {v10, v20, v30};
+
+        auto values = shared->shapeValuesArrayMut();
+        for (size_t idx = 0; idx < 3; ++idx)
+            values[idx] = newVals[idx];
+
+        *rootedResult = shared;
+    });
+    ASSERT_FALSE(HasFatalFailure());
+
+    /* The owner is reachable ONLY through the shape-shared result's
+       shapeBase pointer at this point -- the construction thread that
+       had `owner` on its stack has already exited and joined. */
+    GC_gcollect();
+    ASSERT_NE(nullptr, *weakOwner) << "owner Bindings was collected despite being referenced via shapeBase -- "
+                                      "shapeBase is not being treated as a real GC root";
+
+    auto * shared = *rootedResult;
+    ASSERT_NE(nullptr, shared);
+
+    auto a = shared->get(createSymbol("a"));
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->value->integer().value, 10);
+
+    auto b2 = shared->get(createSymbol("b"));
+    ASSERT_NE(b2, nullptr);
+    EXPECT_EQ(b2->value->integer().value, 20);
+
+    auto c = shared->get(createSymbol("c"));
+    ASSERT_NE(c, nullptr);
+    EXPECT_EQ(c->value->integer().value, 30);
+
+    std::vector<std::pair<std::string, int64_t>> got;
+    for (auto & attr : *shared)
+        got.push_back({std::string(state.symbols[attr.name]), attr.value->integer().value});
+    std::vector<std::pair<std::string, int64_t>> expected = {{"a", 10}, {"b", 20}, {"c", 30}};
+    EXPECT_EQ(got, expected);
+
+    /* Not asserting that `owner` becomes collectible after this point:
+       this test function's own C++ stack still holds `shared`/`a`/`b2`/
+       `c` above, and Boehm's conservative stack scan legitimately treats
+       those as roots for as long as they're in scope -- that's expected
+       GC behavior, not something this prototype's shape-sharing changes
+       could or should try to work around. */
+}
 #endif
 
 } // namespace nix

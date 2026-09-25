@@ -1548,9 +1548,9 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
     outputs.insert("out");
 
     for (auto & i : attrs->lexicographicOrder(state.symbols)) {
-        if (i->name == state.s.ignoreNulls)
+        if (i.name == state.s.ignoreNulls)
             continue;
-        auto key = state.symbols[i->name];
+        auto key = state.symbols[i.name];
         vomit("processing attribute '%1%'", key);
 
         // Like `warn`, but with the position of the attribute and the derivation name as an added trace.
@@ -1558,7 +1558,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             ErrorInfo info{
                 .level = lvlWarn,
                 .msg = std::move(msg),
-                .pos = state.positions[i->pos],
+                .pos = state.positions[i.pos],
             };
             info.traces.push_back(Trace{.hint = HintFmt{"while evaluating derivation '%1%'", drvName}});
             logWarning(info);
@@ -1607,20 +1607,20 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             const std::string_view context_below("");
 
             if (ignoreNulls) {
-                state.forceValue(*i->value, noPos);
-                if (i->value->type() == nNull)
+                state.forceValue(*i.value, noPos);
+                if (i.value->type() == nNull)
                     continue;
             }
 
-            switch (i->name.getId()) {
+            switch (i.name.getId()) {
             case EvalState::s.contentAddressed.getId():
-                if (state.forceBool(*i->value, pos, context_below)) {
+                if (state.forceBool(*i.value, pos, context_below)) {
                     contentAddressed = true;
                     experimentalFeatureSettings.require(Xp::CaDerivations);
                 }
                 break;
             case EvalState::s.impure.getId():
-                if (state.forceBool(*i->value, pos, context_below)) {
+                if (state.forceBool(*i.value, pos, context_below)) {
                     isImpure = true;
                     experimentalFeatureSettings.require(Xp::ImpureDerivations);
                 }
@@ -1628,8 +1628,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             /* The `args' attribute is special: it supplies the
                command-line arguments to the builder. */
             case EvalState::s.args.getId():
-                state.forceList(*i->value, pos, context_below);
-                for (auto elem : i->value->listView()) {
+                state.forceList(*i.value, pos, context_below);
+                for (auto elem : i.value->listView()) {
                     auto s = state
                                  .coerceToString(
                                      pos, *elem, context, "while evaluating an element of the argument list", true)
@@ -1643,32 +1643,32 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
                 if (jsonObject) {
 
-                    if (i->name == state.s.structuredAttrs)
+                    if (i.name == state.s.structuredAttrs)
                         continue;
 
-                    jsonObject->structuredAttrs.emplace(key, printValueAsJSON(state, true, *i->value, pos, context));
+                    jsonObject->structuredAttrs.emplace(key, printValueAsJSON(state, true, *i.value, pos, context));
 
-                    switch (i->name.getId()) {
+                    switch (i.name.getId()) {
                     case EvalState::s.builder.getId():
-                        drv.builder = state.forceString(*i->value, context, pos, context_below);
+                        drv.builder = state.forceString(*i.value, context, pos, context_below);
                         break;
                     case EvalState::s.system.getId():
-                        drv.platform = state.forceStringNoCtx(*i->value, pos, context_below);
+                        drv.platform = state.forceStringNoCtx(*i.value, pos, context_below);
                         break;
                     case EvalState::s.outputHash.getId():
-                        outputHash = state.forceStringNoCtx(*i->value, pos, context_below);
+                        outputHash = state.forceStringNoCtx(*i.value, pos, context_below);
                         break;
                     case EvalState::s.outputHashAlgo.getId():
-                        outputHashAlgo = parseHashAlgoOpt(state.forceStringNoCtx(*i->value, pos, context_below));
+                        outputHashAlgo = parseHashAlgoOpt(state.forceStringNoCtx(*i.value, pos, context_below));
                         break;
                     case EvalState::s.outputHashMode.getId():
-                        handleHashMode(state.forceStringNoCtx(*i->value, pos, context_below));
+                        handleHashMode(state.forceStringNoCtx(*i.value, pos, context_below));
                         break;
                     case EvalState::s.outputs.getId(): {
                         /* Require 'outputs' to be a list of strings. */
-                        state.forceList(*i->value, pos, context_below);
+                        state.forceList(*i.value, pos, context_below);
                         Strings ss;
-                        for (auto elem : i->value->listView())
+                        for (auto elem : i.value->listView())
                             ss.emplace_back(state.forceStringNoCtx(*elem, pos, context_below));
                         handleOutputs(ss);
                         break;
@@ -1679,8 +1679,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                            enabled. */
                         if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
                             break;
-                        state.forceList(*i->value, pos, context_below);
-                        for (auto elem : i->value->listView()) {
+                        state.forceList(*i.value, pos, context_below);
+                        for (auto elem : i.value->listView()) {
                             auto name = state.forceString(*elem, context, pos, context_below);
                             if (name == drvFeatureBuilderRpcV0) {
                                 isSubmittingOutputs = true;
@@ -1693,7 +1693,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                         break;
                     }
 
-                    switch (i->name.getId()) {
+                    switch (i.name.getId()) {
                     case EvalState::s.allowedReferences.getId():
                     case EvalState::s.allowedRequisites.getId():
                     case EvalState::s.disallowedReferences.getId():
@@ -1709,7 +1709,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                     }
 
                 } else {
-                    auto s = state.coerceToString(noPos, *i->value, context, context_below, true).toOwned();
+                    auto s = state.coerceToString(noPos, *i.value, context, context_below, true).toOwned();
 
                     /* Re-interpret the attribute's value as a list of
                        strings.
@@ -1719,13 +1719,13 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                        strings without spaces to begin with. */
                     auto forceStringList = [&] { return tokenizeString<Strings>(s); };
 
-                    if (i->name == state.s.json) {
+                    if (i.name == state.s.json) {
                         warnAttr(HintFmt(
                             "setting structured attributes via '__json' is deprecated, and may be disallowed in future versions of Nix. Set '__structuredAttrs = true' instead."));
                         drv.structuredAttrs = StructuredAttrs::parse(s);
                     } else {
                         drv.env.emplace(key, s);
-                        switch (i->name.getId()) {
+                        switch (i.name.getId()) {
                         case EvalState::s.builder.getId():
                             drv.builder = std::move(s);
                             break;
@@ -1768,7 +1768,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
         } catch (Error & e) {
             e.addTrace(
-                state.positions[i->pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
+                state.positions[i.pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
             throw;
         }
     }
@@ -3624,21 +3624,35 @@ static RegisterPrimOp primop_functionArgs({
     .impl = prim_functionArgs,
 });
 
-/*  */
+/* ponytail: mapAttrs's output has the exact same key set, in the exact
+   same sorted order, as its input -- only the values change. Instead of
+   rebuilding a full Attr array (re-deriving/copying Symbol+PosIdx for
+   every key, 16 bytes/slot), allocate a "shape-shared" Bindings that
+   references the input's own name/pos array directly and only writes a
+   fresh Value* per slot (8 bytes/slot). See
+   EvalMemory::allocShapeSharedBindings and Bindings::isShapeShared() in
+   attr-set.hh. This is the only primop opted into this path. */
 static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindings(args[1]->attrs()->size());
+    auto n = args[1]->attrs()->size();
+    auto * shared = state.mem.allocShapeSharedBindings(args[1]->attrs(), n);
 
-    for (auto & i : *args[1]->attrs()) {
-        Value * vName = Value::toPtr(state.symbols[i.name]);
-        Value * vFun2 = state.allocValue();
-        vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+    if (n > 0) {
+        auto values = shared->shapeValuesArrayMut();
+        size_t idx = 0;
+        for (auto & i : *args[1]->attrs()) {
+            Value * vName = Value::toPtr(state.symbols[i.name]);
+            Value * vFun2 = state.allocValue();
+            vFun2->mkApp(args[0], vName);
+            Value * vAppResult = state.allocValue();
+            vAppResult->mkApp(vFun2, i.value);
+            values[idx++] = vAppResult;
+        }
     }
 
-    v.mkAttrs(attrs.alreadySorted());
+    v.mkAttrs(shared);
 }
 
 static RegisterPrimOp primop_mapAttrs({

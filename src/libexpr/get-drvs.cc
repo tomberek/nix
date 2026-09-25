@@ -419,29 +419,29 @@ static void getDerivations(
            bound to the attribute with the "lower" name should take
            precedence). */
         for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
-            std::string_view symbol{state.symbols[i->name]};
+            std::string_view symbol{state.symbols[i.name]};
             try {
                 debug("evaluating attribute '%1%'", symbol);
                 if (!isAttrPathComponent(symbol))
                     continue;
                 std::string pathPrefix2 = addToPath(pathPrefix, symbol);
                 if (combineChannels)
-                    getDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
-                else if (getDerivation(state, *i->value, pathPrefix2, drvs, done, ignoreAssertionFailures)) {
+                    getDerivations(state, *i.value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
+                else if (getDerivation(state, *i.value, pathPrefix2, drvs, done, ignoreAssertionFailures)) {
                     /* If the value of this attribute is itself a set,
                     should we recurse into it?  => Only if it has a
                     `recurseForDerivations = true' attribute. */
-                    if (i->value->type() == nAttrs) {
-                        auto j = i->value->attrs()->get(state.s.recurseForDerivations);
+                    if (i.value->type() == nAttrs) {
+                        auto j = i.value->attrs()->get(state.s.recurseForDerivations);
                         if (j
                             && state.forceBool(
                                 *j->value, j->pos, "while evaluating the attribute `recurseForDerivations`"))
                             getDerivations(
-                                state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
+                                state, *i.value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
                     }
                 }
             } catch (Error & e) {
-                e.addTrace(state.positions[i->pos], "while evaluating the attribute '%s'", symbol);
+                e.addTrace(state.positions[i.pos], "while evaluating the attribute '%s'", symbol);
                 throw;
             }
         }

@@ -354,6 +354,14 @@ public:
         Counter nrAttrsets;
         Counter nrAttrsInAttrsets;
         Counter nrListElems;
+        /* ponytail: prototype-only counters for the mapAttrs shape-sharing
+           path (see allocShapeSharedBindings below). Kept separate from
+           nrAttrsets/nrAttrsInAttrsets because the byte cost per slot is
+           different (sizeof(Value*)==8, not sizeof(Attr)==16), so mixing
+           them into the existing counters would make printStatistics's
+           "sets.bytes" figure wrong. */
+        Counter nrShapeSharedAttrsets;
+        Counter nrShapeSharedValues;
     };
 
     EvalMemory();
@@ -368,6 +376,38 @@ public:
     inline Env & allocEnv(size_t size);
 
     Bindings * allocBindings(size_t capacity);
+
+    /**
+     * ponytail: prototype-only. Allocates a "shape-shared" Bindings: it
+     * has exactly `capacity` slots, in the exact sorted name/pos order of
+     * `shapeBase` (which must have at least `capacity` entries -- callers
+     * are expected to pass the same size), but only allocates a packed
+     * `Value*[capacity]` array (8 bytes/slot instead of Attr's 16). Only
+     * used by builtins.mapAttrs so far -- an explicit opt-in, not a
+     * change to the general Bindings construction path. See
+     * Bindings::isShapeShared() in attr-set.hh for the representation.
+     *
+     * `shapeBase` is flattened if it is itself shape-shared, so the
+     * stored base always points at a real, GC-block-start Bindings with
+     * an actual Attr array (required for GC safety: Boehm's
+     * interior-pointer support is disabled, so every stored pointer must
+     * point at the exact start of an allocation).
+     */
+    Bindings * allocShapeSharedBindings(const Bindings * shapeBase, size_t capacity)
+    {
+        while (shapeBase->isShapeShared())
+            shapeBase = shapeBase->shapeBase;
+        if (capacity == 0)
+            return const_cast<Bindings *>(&Bindings::emptyBindings);
+        auto * b = new (allocBytes(sizeof(Bindings) + sizeof(Value *) * capacity)) Bindings();
+        b->numAttrs = capacity;
+        b->numAttrsInChain = capacity;
+        b->numLayers = Bindings::shapeSharedFlag | 1;
+        b->shapeBase = shapeBase;
+        stats.nrShapeSharedAttrsets++;
+        stats.nrShapeSharedValues += capacity;
+        return b;
+    }
 
     BindingsBuilder buildBindings(SymbolTable & symbols, size_t capacity)
     {

@@ -100,8 +100,35 @@ private:
      */
     const Bindings * baseLayer = nullptr;
 
+    /* ponytail: prototype-only "shape sharing" path for builtins.mapAttrs
+       (see docs/attrset-range-sharing-design.md, mechanism 1). Entirely
+       separate from the baseLayer/numLayers general layering mechanism
+       above -- do not conflate the two. When shapeSharedFlag is set in
+       numLayers:
+         - `shapeBase` points at the *exact start* of another, definitely
+           non-shape-shared Bindings ("the names owner") whose `attrs[]`
+           supplies every name/pos pair for this instance, in the same
+           order. This pointer is always to a real GC allocation's block
+           start (never an interior offset), so Boehm's disabled
+           interior-pointer support (GC_set_all_interior_pointers(0) in
+           eval-gc.cc) is irrelevant here -- exactly like baseLayer.
+         - `attrs[0]` (the FAM below) is reinterpreted as a packed
+           `Value*` array of `numAttrs` entries instead of `Attr` entries
+           -- see shapeValuesArray()/shapeValuesArrayMut(). This is what
+           gets the real allocation savings (8 bytes/slot instead of 16).
+         - `shapeGetScratch` is a per-instance scratch Attr used to hand
+           back a `const Attr *` from get() without materializing a full
+           Attr array. Safe because nothing in this codebase holds two
+           `get()` results from the *same* Bindings instance
+           simultaneously (verified by inspection of all call sites at
+           implementation time); a fresh call overwrites it. */
+    const Bindings * shapeBase = nullptr;
+    mutable Attr shapeGetScratch;
+
     /**
-     * Flexible array member of attributes.
+     * Flexible array member of attributes (or, for shape-shared
+     * instances, a packed `Value*[numAttrs]` array -- see shapeBase
+     * above).
      */
     Attr attrs[0];
 
@@ -114,13 +141,41 @@ private:
     ~Bindings() = default;
 
     friend class BindingsBuilder;
+    friend class EvalMemory;
 
     /**
      * Maximum length of the Bindings layer chains.
      */
     static constexpr unsigned maxLayers = 8;
 
+    /**
+     * ponytail: stolen top bit of numLayers (which only ever needs
+     * values 0..maxLayers==8) as a discriminant for the shape-sharing
+     * variant above. Costs nothing extra since numLayers is already a
+     * uint32_t with plenty of spare range.
+     */
+    static constexpr uint32_t shapeSharedFlag = 0x8000'0000u;
+
 public:
+    bool isShapeShared() const noexcept
+    {
+        return (numLayers & shapeSharedFlag) != 0;
+    }
+
+    /**
+     * Packed `Value*` array for a shape-shared instance. Only valid
+     * when isShapeShared().
+     */
+    Value * const * shapeValuesArray() const noexcept
+    {
+        return reinterpret_cast<Value * const *>(attrs);
+    }
+
+    Value ** shapeValuesArrayMut() noexcept
+    {
+        return reinterpret_cast<Value **>(attrs);
+    }
+
     size_type size() const
     {
         return numAttrsInChain;
@@ -213,6 +268,28 @@ public:
          */
         bool doMerge = true;
 
+        /* ponytail: prototype-only shape-sharing iteration mode (see
+           Bindings::isShapeShared() above). Entirely separate from the
+           k-way merge machinery above/below -- a shape-shared Bindings
+           never participates in that machinery (isLayerListFull() is
+           forced true for it, so it can never become someone else's
+           baseLayer via the one and only layerOnTopOf() call site). This
+           walks the names-owner's Attr array and this node's own
+           Value* array in lockstep, synthesizing an Attr into
+           `shapeScratch` at each step. Note: this makes `current` a
+           self-referential pointer (&shapeScratch) that is NOT fixed up
+           by the implicitly-generated copy constructor -- postfix ++
+           (unused by any real call site: range-for, std::ranges::copy,
+           std::set_difference all use prefix ++ on the source iterator)
+           would alias stale/live scratch state. Fine for this prototype;
+           would need a real fix (e.g. no cached scratch, or index-based
+           dereference) before this became permanent. */
+        bool shapeMode = false;
+        pointer shapeNamesCur = nullptr;
+        pointer shapeNamesEnd = nullptr;
+        Value * const * shapeValuesCur = nullptr;
+        Attr shapeScratch;
+
         void push(BindingsCursor cursor) noexcept
         {
             cursorHeap.push_back(cursor);
@@ -262,8 +339,23 @@ public:
         }
 
         explicit iterator(const Bindings & attrs) noexcept
-            : doMerge(attrs.baseLayer)
+            : doMerge(!attrs.isShapeShared() && attrs.baseLayer)
         {
+            if (attrs.isShapeShared()) {
+                shapeMode = true;
+                auto owner = attrs.shapeBase;
+                shapeNamesCur = owner->attrs;
+                shapeNamesEnd = owner->attrs + owner->numAttrs;
+                shapeValuesCur = attrs.shapeValuesArray();
+                if (shapeNamesCur == shapeNamesEnd) {
+                    shapeMode = false;
+                    return;
+                }
+                shapeScratch = Attr(shapeNamesCur->name, *shapeValuesCur, shapeNamesCur->pos);
+                current = &shapeScratch;
+                return;
+            }
+
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
                 auto first = layer.attrs;
                 push(
@@ -312,6 +404,16 @@ public:
 
         iterator & operator++() noexcept
         {
+            if (shapeMode) {
+                ++shapeNamesCur;
+                ++shapeValuesCur;
+                if (shapeNamesCur == shapeNamesEnd)
+                    return finished();
+                shapeScratch = Attr(shapeNamesCur->name, *shapeValuesCur, shapeNamesCur->pos);
+                current = &shapeScratch;
+                return *this;
+            }
+
             if (!doMerge) {
                 ++current;
                 if (current == cursorHeap.front().end)
@@ -357,6 +459,17 @@ public:
     const Attr * get(Symbol name) const noexcept
     {
         auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
+            if (chunk.isShapeShared()) {
+                auto owner = chunk.shapeBase;
+                auto first = owner->attrs;
+                auto last = first + owner->numAttrs;
+                const Attr * i = std::lower_bound(first, last, key);
+                if (i == last || i->name != key.name)
+                    return nullptr;
+                auto idx = static_cast<size_t>(i - first);
+                chunk.shapeGetScratch = Attr(i->name, chunk.shapeValuesArray()[idx], i->pos);
+                return &chunk.shapeGetScratch;
+            }
             auto first = chunk.attrs;
             auto last = first + chunk.numAttrs;
             const Attr * i = std::lower_bound(first, last, key);
@@ -370,7 +483,14 @@ public:
             const Attr * maybeAttr = getInChunk(*currentChunk);
             if (maybeAttr)
                 return maybeAttr;
-            currentChunk = currentChunk->baseLayer;
+            /* A shape-shared chunk never has a real baseLayer chain of its
+               own (see isLayerListFull() below, which guarantees a
+               shape-shared Bindings can never become another Bindings's
+               baseLayer via layerOnTopOf() -- the only call site of
+               that method). So stop here instead of reading
+               currentChunk->baseLayer, which is unused/null for a
+               shape-shared chunk anyway. */
+            currentChunk = currentChunk->isShapeShared() ? nullptr : currentChunk->baseLayer;
         }
 
         return nullptr;
@@ -381,7 +501,14 @@ public:
      */
     bool isLayerListFull() const noexcept
     {
-        return numLayers == Bindings::maxLayers;
+        /* ponytail: force "full" for shape-shared Bindings so the one
+           layerOnTopOf() call site (ExprOpUpdate::eval's `//`) always
+           takes its full-copy fallback instead of ever making a
+           shape-shared node someone else's baseLayer -- which the
+           general k-way merge/get() traversal above cannot safely read
+           (it's a packed Value* array, not a real Attr array). Keeps
+           `//` itself completely unmodified per the prototype's scope. */
+        return isShapeShared() || numLayers == Bindings::maxLayers;
     }
 
     /**
@@ -389,7 +516,7 @@ public:
      */
     bool isLayered() const noexcept
     {
-        return numLayers > 1;
+        return !isShapeShared() && numLayers > 1;
     }
 
     const_iterator begin() const
@@ -404,14 +531,14 @@ public:
 
     Attr & operator[](size_type pos)
     {
-        if (isLayered()) [[unlikely]]
+        if (isLayered() || isShapeShared()) [[unlikely]]
             unreachable();
         return attrs[pos];
     }
 
     const Attr & operator[](size_type pos) const
     {
-        if (isLayered()) [[unlikely]]
+        if (isLayered() || isShapeShared()) [[unlikely]]
             unreachable();
         return attrs[pos];
     }
@@ -420,14 +547,23 @@ public:
 
     /**
      * Returns the attributes in lexicographically sorted order.
+     *
+     * ponytail: returns by value (not `const Attr *`) so this works
+     * uniformly for shape-shared Bindings too -- their iterator
+     * synthesizes each Attr into a single shared scratch slot as it
+     * advances, so collecting *pointers* into that transient state would
+     * alias (every pointer in the result would end up referring to the
+     * last element visited). Collecting by value sidesteps that
+     * entirely, at the cost of a copy per attr, which is fine here: this
+     * is a debug-printing/serialization path, not a hot loop.
      */
-    std::vector<const Attr *> lexicographicOrder(const SymbolTable & symbols) const
+    std::vector<Attr> lexicographicOrder(const SymbolTable & symbols) const
     {
-        std::vector<const Attr *> res;
+        std::vector<Attr> res;
         res.reserve(size());
-        std::ranges::transform(*this, std::back_inserter(res), [](const Attr & a) { return &a; });
-        std::ranges::sort(res, [&](const Attr * a, const Attr * b) {
-            std::string_view sa = symbols[a->name], sb = symbols[b->name];
+        std::ranges::copy(*this, std::back_inserter(res));
+        std::ranges::sort(res, [&](const Attr & a, const Attr & b) {
+            std::string_view sa = symbols[a.name], sb = symbols[b.name];
             return sa < sb;
         });
         return res;

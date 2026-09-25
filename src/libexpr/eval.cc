@@ -704,8 +704,8 @@ static void printWithBindings(const SymbolTable & st, const Env & env)
         std::cout << ANSI_MAGENTA;
         auto * bindings = env.values[0]->attrs();
         /* TODO: Don't print the whole attribute set, since it can be quite large. */
-        for (const Attr * attr : bindings->lexicographicOrder(st))
-            std::cout << st[attr->name] << " ";
+        for (const Attr & attr : bindings->lexicographicOrder(st))
+            std::cout << st[attr.name] << " ";
         std::cout << ANSI_NORMAL;
         std::cout << std::endl;
     }
@@ -3088,6 +3088,8 @@ void EvalState::printStatistics()
     uint64_t bLists = memstats.nrListElems * sizeof(Value *);
     uint64_t bValues = memstats.nrValues * sizeof(Value);
     uint64_t bAttrsets = memstats.nrAttrsets * sizeof(Bindings) + memstats.nrAttrsInAttrsets * sizeof(Attr);
+    uint64_t bShapeShared =
+        memstats.nrShapeSharedAttrsets * sizeof(Bindings) + memstats.nrShapeSharedValues * sizeof(Value *);
 
 #if NIX_USE_BOEHMGC
     GC_word heapSize, totalBytes;
@@ -3135,6 +3137,10 @@ void EvalState::printStatistics()
         {"number", memstats.nrAttrsets.load()},
         {"bytes", bAttrsets},
         {"elements", memstats.nrAttrsInAttrsets.load()},
+        /* ponytail: prototype-only mapAttrs shape-sharing counters. */
+        {"shapeSharedNumber", memstats.nrShapeSharedAttrsets.load()},
+        {"shapeSharedValues", memstats.nrShapeSharedValues.load()},
+        {"shapeSharedBytes", bShapeShared},
     };
     topObj["sizes"] = {
         {"Env", sizeof(Env)},

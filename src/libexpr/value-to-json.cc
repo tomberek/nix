@@ -65,12 +65,12 @@ json printValueAsJSON(
                 for (auto & a : peeled->attrs()->lexicographicOrder(state.symbols)) {
                     try {
                         obj.emplace(
-                            state.symbols[a->name],
-                            printValueAsJSON(state, strict, *a->value, a->pos, context, copyToStore));
+                            state.symbols[a.name],
+                            printValueAsJSON(state, strict, *a.value, a.pos, context, copyToStore));
                     } catch (Error & e) {
                         e.addTrace(
-                            state.positions[a->pos],
-                            HintFmt("while evaluating attribute '%1%'", state.symbols[a->name]));
+                            state.positions[a.pos],
+                            HintFmt("while evaluating attribute '%1%'", state.symbols[a.name]));
                         throw;
                     }
                 }
