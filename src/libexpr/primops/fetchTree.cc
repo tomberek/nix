@@ -126,7 +126,7 @@ void emitTreeAttrs(
     bool emptyRevFallback,
     bool forceDirty)
 {
-    auto attrs = state.buildBindingsWithValues(100);
+    auto attrs = state.buildBindings(100);
 
     state.mkStorePathString(storePath, attrs.alloc(state.s.outPath, callPos));
 

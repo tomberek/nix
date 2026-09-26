@@ -58,7 +58,7 @@ bool createUserEnv(
         PackageInfo::Outputs outputs = i.queryOutputs(true, true);
         StringSet metaNames = i.queryMetaNames();
 
-        auto attrs = state.buildBindingsWithValues(7 + outputs.size());
+        auto attrs = state.buildBindings(7 + outputs.size());
 
         attrs.alloc(state.s.type).mkStringNoCopy("derivation"_sds);
         attrs.alloc(state.s.name).mkString(i.queryName(), state.mem);
@@ -73,7 +73,7 @@ bool createUserEnv(
         auto outputsList = state.buildList(outputs.size());
         for (const auto & [m, j] : enumerate(outputs)) {
             (outputsList[m] = state.allocValue())->mkString(j.first, state.mem);
-            auto outputAttrs = state.buildBindingsWithValues(2);
+            auto outputAttrs = state.buildBindings(2);
             outputAttrs.alloc(state.s.outPath).mkString(state.store->printStorePath(*j.second), state.mem);
             attrs.alloc(j.first).mkAttrs(outputAttrs);
 

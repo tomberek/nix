@@ -97,7 +97,7 @@ static void prim_fromTOML(EvalState & state, CallSite callSite, Value * const * 
         switch (t.type()) {
         case toml::value_t::table: {
             auto table = toml::get<toml::table>(t);
-            auto attrs = state.buildBindingsWithValues(table.size());
+            auto attrs = state.buildBindings(table.size());
 
             for (auto & elem : table) {
                 forceNoNullByte(elem.first);
@@ -136,7 +136,7 @@ static void prim_fromTOML(EvalState & state, CallSite callSite, Value * const * 
 #if HAVE_TOML11_4
                 normalizeDatetimeFormat(t);
 #endif
-                auto attrs = state.buildBindingsWithValues(2);
+                auto attrs = state.buildBindings(2);
                 attrs.alloc("_type").mkStringNoCopy("timestamp"_sds);
                 std::ostringstream s;
                 s << t;

@@ -230,7 +230,7 @@ void derivationToValue(EvalState & state, const SourcePath & path, const StorePa
 {
     auto path2 = path.path.abs();
     Derivation drv = state.store->readDerivation(storePath);
-    auto attrs = state.buildBindingsWithValues(3 + drv.outputs.size());
+    auto attrs = state.buildBindings(3 + drv.outputs.size());
     attrs.alloc(state.s.drvPath)
         .mkString(
             path2,
@@ -1930,7 +1930,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         derivation::masked::hashes.insert_or_assign(drvPath, std::move(h));
     }
 
-    auto result = state.buildBindingsWithValues(1 + drv.outputs.size());
+    auto result = state.buildBindings(1 + drv.outputs.size());
     result.alloc(state.s.drvPath)
         .mkString(
             drvPathS,
@@ -3629,7 +3629,7 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindingsWithValues(args[1]->attrs()->size());
+    auto attrs = state.buildBindings(args[1]->attrs()->size());
 
     for (auto & i : *args[1]->attrs()) {
         Value * vName = Value::toPtr(state.symbols[i.name]);
@@ -4293,7 +4293,7 @@ static void prim_partition(EvalState & state, CallSite callSite, Value * const *
             wrong.push_back(vElem);
     }
 
-    auto attrs = state.buildBindingsWithValues(2);
+    auto attrs = state.buildBindings(2);
 
     auto rsize = right.size();
     auto rlist = state.buildList(rsize);
@@ -4352,7 +4352,7 @@ static void prim_groupBy(EvalState & state, CallSite callSite, Value * const * a
         vector->second.push_back(vElem);
     }
 
-    auto attrs2 = state.buildBindingsWithValues(attrs.size());
+    auto attrs2 = state.buildBindings(attrs.size());
 
     for (auto & i : attrs) {
         auto size = i.second.size();
@@ -5230,7 +5230,7 @@ static void prim_parseDrvName(EvalState & state, CallSite callSite, Value * cons
     auto name =
         state.forceStringNoCtx(*args[0], noPos, "while evaluating the first argument passed to builtins.parseDrvName");
     DrvName parsed(name);
-    auto attrs = state.buildBindingsWithValues(2);
+    auto attrs = state.buildBindings(2);
     attrs.alloc(state.s.name).mkString(parsed.name, state.mem);
     attrs.alloc("version").mkString(parsed.version, state.mem);
     v.mkAttrs(attrs);
@@ -5552,7 +5552,7 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
     /* Add a value containing the current Nix expression search path. */
     auto list = buildList(lookupPath.elements.size());
     for (const auto & [n, i] : enumerate(lookupPath.elements)) {
-        auto attrs = buildBindingsWithValues(2);
+        auto attrs = buildBindings(2);
         attrs.alloc("path").mkString(i.path.s, mem);
         attrs.alloc("prefix").mkString(i.prefix.s, mem);
         (list[n] = allocValue())->mkAttrs(attrs);

@@ -374,18 +374,6 @@ public:
         return BindingsBuilder(*this, symbols, allocBindings(capacity), capacity);
     }
 
-    /**
-     * Like buildBindings(), but the returned builder's `alloc()` batch-allocates
-     * each attribute's Value from a free list private to this builder (@see
-     * BindingsBuilder::valueFreeList) instead of going through `allocValue()`'s
-     * globally shared cache. Only worth it for builders that exclusively use
-     * `alloc()` (no `insert()`/`push_back()` of externally-owned Values).
-     */
-    BindingsBuilder buildBindingsWithValues(SymbolTable & symbols, size_t capacity)
-    {
-        return BindingsBuilder(*this, symbols, allocBindings(capacity), capacity, /*dedicatedValueAlloc=*/true);
-    }
-
     ListBuilder buildList(size_t size)
     {
         stats.nrListElems += size;
@@ -404,13 +392,6 @@ public:
 
 private:
     Statistics stats;
-
-    /**
-     * Lets `BindingsBuilder::alloc()` bump `stats.nrValues` when it
-     * batch-allocates a Value straight from its own dedicated free list,
-     * bypassing `allocValue()`.
-     */
-    friend class BindingsBuilder;
 };
 
 class EvalState : public std::enable_shared_from_this<EvalState>
@@ -1050,11 +1031,6 @@ public:
     BindingsBuilder buildBindings(size_t capacity)
     {
         return mem.buildBindings(symbols, capacity);
-    }
-
-    BindingsBuilder buildBindingsWithValues(size_t capacity)
-    {
-        return mem.buildBindingsWithValues(symbols, capacity);
     }
 
     ListBuilder buildList(size_t size)

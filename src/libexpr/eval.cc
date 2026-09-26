@@ -991,7 +991,7 @@ void EvalState::mkPos(Value & v, PosIdx p)
 {
     auto origin = positions.originOf(p);
     if (auto path = std::get_if<SourcePath>(&origin)) {
-        auto attrs = buildBindingsWithValues(3);
+        auto attrs = buildBindings(3);
         attrs.alloc(s.file).mkString(path->path.abs(), mem);
         makePositionThunks(*this, p, attrs.alloc(s.line), attrs.alloc(s.column));
         v.mkAttrs(attrs);

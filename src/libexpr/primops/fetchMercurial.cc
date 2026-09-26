@@ -81,7 +81,7 @@ static void prim_fetchMercurial(EvalState & state, CallSite callSite, Value * co
 
     auto [storePath, input2] = input.fetchToStore(state.fetchSettings, *state.store);
 
-    auto attrs2 = state.buildBindingsWithValues(8);
+    auto attrs2 = state.buildBindings(8);
     state.mkStorePathString(storePath, attrs2.alloc(state.s.outPath));
     if (input2.getRef())
         attrs2.alloc("branch").mkString(*input2.getRef(), state.mem);

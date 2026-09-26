@@ -24,30 +24,7 @@ Bindings * EvalMemory::allocBindings(size_t capacity)
 
 Value & BindingsBuilder::alloc(Symbol name, PosIdx pos)
 {
-    Value * value;
-#if NIX_USE_BOEHMGC
-    if (dedicatedValueAlloc) {
-        /* Batch-allocate from a free list private to this builder, mirroring
-           EvalMemory::allocValue()'s GC_malloc_many-based refill (@see
-           eval-inline.hh) verbatim, just against `valueFreeList` instead of
-           the globally shared thread_local cache. Each popped node is still
-           an independently-valid, exact-base-address GC object (same
-           GC_malloc_many contract as allocValue() -- no interior pointers,
-           no change to Bindings' memory layout); only which free list a
-           given alloc() call draws from changes. */
-        if (!valueFreeList) {
-            valueFreeList = GC_malloc_many(sizeof(Value));
-            if (!valueFreeList)
-                throw std::bad_alloc();
-        }
-        void * p = valueFreeList;
-        valueFreeList = GC_NEXT(p);
-        GC_NEXT(p) = nullptr;
-        value = (Value *) p;
-        mem.get().stats.nrValues++;
-    } else
-#endif
-        value = mem.get().allocValue();
+    auto value = mem.get().allocValue();
     bindings->push_back(Attr(name, value, pos));
     return *value;
 }
