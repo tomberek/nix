@@ -101,7 +101,7 @@ static void prim_parseFlakeRef(EvalState & state, CallSite callSite, Value * con
     std::string flakeRefS(
         state.forceStringNoCtx(*args[0], noPos, "while evaluating the argument passed to builtins.parseFlakeRef"));
     auto attrs = nix::parseFlakeRef(flakeRefS, {}, true).toAttrs();
-    auto binds = state.buildBindings(attrs.size());
+    auto binds = state.buildBindingsWithValues(attrs.size());
     for (const auto & [key, value] : attrs) {
         auto s = state.symbols.create(key);
         auto & vv = binds.alloc(s);

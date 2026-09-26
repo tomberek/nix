@@ -206,12 +206,12 @@ static void prim_getContext(EvalState & state, CallSite callSite, Value * const 
             ((NixStringContextElem &&) i).raw);
     }
 
-    auto attrs = state.buildBindings(contextInfos.size());
+    auto attrs = state.buildBindingsWithValues(contextInfos.size());
 
     auto sPath = state.symbols.create("path");
     auto sAllOutputs = state.symbols.create("allOutputs");
     for (const auto & info : contextInfos) {
-        auto infoAttrs = state.buildBindings(3);
+        auto infoAttrs = state.buildBindingsWithValues(3);
         if (info.second.path)
             infoAttrs.alloc(sPath).mkBool(true);
         if (info.second.allOutputs)

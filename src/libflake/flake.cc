@@ -939,10 +939,10 @@ void callFlake(EvalState & state, const LockedFlake & lockedFlake, Value & vRes)
 
     auto [lockFileStr, keyMap] = lockedFlake.lockFile.to_string();
 
-    auto overrides = state.buildBindings(lockedFlake.nodePaths.size());
+    auto overrides = state.buildBindingsWithValues(lockedFlake.nodePaths.size());
 
     for (auto & [node, sourcePath] : lockedFlake.nodePaths) {
-        auto override = state.buildBindings(2);
+        auto override = state.buildBindingsWithValues(2);
 
         auto & vSourceInfo = override.alloc(state.symbols.create("sourceInfo"));
 

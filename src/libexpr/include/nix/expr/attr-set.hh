@@ -455,11 +455,31 @@ private:
     Bindings * bindings;
     Bindings::size_type capacity_;
 
+    /**
+     * Head of a private linked list of not-yet-handed-out `Value` GC objects,
+     * batch-allocated via `GC_malloc_many` dedicated to this builder alone --
+     * as opposed to `EvalMemory::allocValue()`'s globally shared thread_local
+     * free list -- so that all the Values a single attrset builds come from
+     * batches this builder itself requested, not interleaved with unrelated
+     * Value allocations made by other code in between `alloc()` calls. Only
+     * populated/consulted when `dedicatedValueAlloc` is set; @see alloc().
+     */
+    void * valueFreeList = nullptr;
+
+    /**
+     * Whether this builder was created via `EvalMemory::buildBindingsWithValues()`
+     * and should therefore batch-allocate its own Values via `valueFreeList`
+     * instead of going through `EvalMemory::allocValue()`'s shared cache.
+     */
+    bool dedicatedValueAlloc = false;
+
     friend class EvalMemory;
 
-    BindingsBuilder(EvalMemory & mem, SymbolTable & symbols, Bindings * bindings, size_type capacity)
+    BindingsBuilder(
+        EvalMemory & mem, SymbolTable & symbols, Bindings * bindings, size_type capacity, bool dedicatedValueAlloc = false)
         : bindings(bindings)
         , capacity_(capacity)
+        , dedicatedValueAlloc(dedicatedValueAlloc)
         , mem(mem)
         , symbols(symbols)
     {
