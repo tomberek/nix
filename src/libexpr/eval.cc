@@ -1997,16 +1997,19 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }
 
     /* Simple heuristic for determining whether attrs2 should be "layered" on top of
-       attrs1 instead of copying to a new Bindings. */
-    bool shouldLayer = [&]() -> bool {
-        if (bindings1.isLayerListFull())
-            return false;
+       attrs1 instead of copying to a new Bindings. Layering is cheap (O(|attrs2|))
+       vs. a full copy (O(|attrs1|+|attrs2|)), so it's always worth it once attrs2
+       is smaller than attrs1 -- not just when attrs2 is smaller than some small
+       absolute constant. This matters a lot for patterns like `prev // overlay`
+       (lib.extends / pkgs.extend) where attrs1 accumulates to the size of the
+       whole package set and gets re-layered many times.
 
-        if (bindings2.size() > state.settings.bindingsUpdateLayerRhsSizeThreshold)
-            return false;
-
-        return true;
-    }();
+       `bindingsUpdateLayerRhsSizeThreshold == 0` is documented as disabling this
+       optimization completely, so it has to gate the relative-size check too,
+       not just the absolute one. */
+    auto threshold = state.settings.bindingsUpdateLayerRhsSizeThreshold.get();
+    bool shouldLayer = threshold != 0 && !bindings1.isLayerListFull()
+                        && (bindings2.size() <= threshold || bindings2.size() < bindings1.size());
 
     if (shouldLayer) {
         auto attrs = state.buildBindings(bindings2.size());
