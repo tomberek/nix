@@ -87,8 +87,19 @@ private:
      *
      * This is the *real* user-facing size of bindings, whereas @ref numAttrs is
      * an implementation detail of the data structure.
+     *
+     * For LAYERED bindings, this is computed LAZILY (see @ref size and
+     * @ref computeChainSize) rather than eagerly at construction time: 0
+     * means "not yet computed". Computing it requires walking/binary-
+     * searching the base layer once per new attribute, which is only
+     * worth paying if something actually asks for the size -- many
+     * intermediate accumulator states (e.g. `prev` in a long chain of
+     * `prev // overlay` applications) are only ever read via individual
+     * attribute lookups before being superseded, and never need this at
+     * all. 0 is never a real chain size here: layering only happens when
+     * both sides are non-empty (see ExprOpUpdate::eval).
      */
-    size_type numAttrsInChain = 0;
+    mutable size_type numAttrsInChain = 0;
 
     /**
      * Length of the layers list.
@@ -120,9 +131,43 @@ private:
      */
     static constexpr unsigned maxLayers = 16;
 
+    /**
+     * Lazily compute and memoize numAttrsInChain for a layered Bindings --
+     * see its doc comment. Only ever called from @ref size / @ref empty,
+     * on demand.
+     */
+    void computeChainSize() const noexcept
+    {
+        auto & base = *baseLayer;
+        auto ownAttrs = std::span(attrs, numAttrs);
+
+        size_type duplicates = 0;
+
+        /* If the base bindings is smaller than the newly added attributes
+           iterate using std::set_intersection to run in O(|base| + |attrs|) =
+           O(|attrs|). Otherwise use an O(|attrs| * log(|base|)) per-attr binary
+           search to check for duplicates. */
+        if (ownAttrs.size() > base.size()) {
+            std::set_intersection(
+                base.begin(),
+                base.end(),
+                ownAttrs.begin(),
+                ownAttrs.end(),
+                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
+        } else {
+            for (const auto & attr : ownAttrs)
+                if (base.get(attr.name))
+                    ++duplicates;
+        }
+
+        numAttrsInChain = base.size() + ownAttrs.size() - duplicates;
+    }
+
 public:
     size_type size() const
     {
+        if (baseLayer && numAttrsInChain == 0)
+            computeChainSize();
         return numAttrsInChain;
     }
 
@@ -348,7 +393,13 @@ public:
     void push_back(const Attr & attr)
     {
         attrs[numAttrs++] = attr;
-        numAttrsInChain = numAttrs;
+        // If this is being layered on top of a base (layerOnTopOf runs
+        // before any push_back calls that build the overlay's own attrs --
+        // see the single call site in ExprOpUpdate::eval), numAttrsInChain
+        // was already reset to the "not computed" sentinel and must stay
+        // there for Bindings::size()'s lazy computation to trigger.
+        if (!baseLayer)
+            numAttrsInChain = numAttrs;
     }
 
     /**
@@ -465,55 +516,6 @@ private:
     {
     }
 
-    bool hasBaseLayer() const noexcept
-    {
-        return bindings->baseLayer;
-    }
-
-    /**
-     * If the bindings gets "layered" on top of another we need to recalculate
-     * the number of unique attributes in the chain.
-     *
-     * This is done by either iterating over the base "layer" and the newly added
-     * attributes and counting duplicates. If the base "layer" is big this approach
-     * is inefficient and we fall back to doing per-element binary search in the base
-     * "layer".
-     */
-    void finishSizeIfNecessary()
-    {
-        if (!hasBaseLayer())
-            return;
-
-        auto & base = *bindings->baseLayer;
-        auto attrs = std::span(bindings->attrs, bindings->numAttrs);
-
-        Bindings::size_type duplicates = 0;
-
-        /* If the base bindings is smaller than the newly added attributes
-           iterate using std::set_intersection to run in O(|base| + |attrs|) =
-           O(|attrs|). Otherwise use an O(|attrs| * log(|base|)) per-attr binary
-           search to check for duplicates. Note that if we are in this code path then
-           |attrs| <= bindingsUpdateLayerRhsSizeThreshold, which 16 by default. We are
-           optimizing for the case when a small attribute set gets "layered" on top of
-           a much larger one. When attrsets are already small it's fine to do a linear
-           scan, but we should avoid expensive iterations over large "base" attrsets. */
-        if (attrs.size() > base.size()) {
-            std::set_intersection(
-                base.begin(),
-                base.end(),
-                attrs.begin(),
-                attrs.end(),
-                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
-        } else {
-            for (const auto & attr : attrs) {
-                if (base.get(attr.name))
-                    ++duplicates;
-            }
-        }
-
-        bindings->numAttrsInChain = base.numAttrsInChain + attrs.size() - duplicates;
-    }
-
 public:
     std::reference_wrapper<EvalMemory> mem;
     std::reference_wrapper<SymbolTable> symbols;
@@ -548,6 +550,11 @@ public:
     {
         bindings->baseLayer = &base;
         bindings->numLayers = base.numLayers + 1;
+        // push_back() before this point set numAttrsInChain to just this
+        // layer's own attr count (correct for the not-yet-layered case);
+        // reset to the "not computed" sentinel now that it's layered, so
+        // Bindings::size() computes it lazily on demand instead of eagerly.
+        bindings->numAttrsInChain = 0;
     }
 
     Value & alloc(Symbol name, PosIdx pos = noPos);
@@ -557,13 +564,11 @@ public:
     const Bindings * finish()
     {
         bindings->sort();
-        finishSizeIfNecessary();
         return bindings;
     }
 
     const Bindings * alreadySorted()
     {
-        finishSizeIfNecessary();
         return bindings;
     }
 
