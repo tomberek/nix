@@ -173,7 +173,15 @@ public:
 
     bool empty() const
     {
-        return size() == 0;
+        /* Layering only ever happens between two non-empty Bindings (see
+           ExprOpUpdate::eval), so any layered chain is provably non-empty --
+           no need to force @ref size's computation (and cache it) just to
+           answer this. This matters because ExprOpUpdate::eval calls empty()
+           on its LHS on every single `//`, which is exactly the long-lived
+           "prev" accumulator this laziness is meant to protect. */
+        if (baseLayer)
+            return false;
+        return numAttrsInChain == 0;
     }
 
     class iterator
