@@ -3385,8 +3385,38 @@ static void prim_removeAttrs(EvalState & state, CallSite callSite, Value * const
        to sort v.attrs because it's a subset of an already sorted
        vector. */
     auto attrs = state.buildBindings(args[0]->attrs()->size());
-    std::set_difference(
-        args[0]->attrs()->begin(), args[0]->attrs()->end(), names.begin(), names.end(), std::back_inserter(attrs));
+
+    if (!args[0]->attrs()->isLayered()) {
+        /* Fast path: scan the dense names() array directly instead of
+           going through the general Attr-synthesizing iterator below.
+           That iterator reads pos/values on every step it takes (even
+           for attributes about to be discarded by set_difference), which
+           is wasted work for every *removed* attribute. Here pos/values
+           are only touched for attributes that actually survive, which
+           need them for the output anyway. */
+        auto view = args[0]->attrs()->denseView();
+        size_t ni = 0;
+        for (size_t i = 0; i < view.size; ++i) {
+            while (ni < names.size() && names[ni].name < view.names[i])
+                ++ni;
+            if (ni < names.size() && names[ni].name == view.names[i]) {
+                ++ni;
+                continue;
+            }
+            attrs.push_back(Attr(view.names[i], view.values[i], view.pos[i]));
+        }
+    } else {
+        /* A layered chain's attributes can live in any layer, so the
+           dense-view fast path above isn't applicable; fall back to the
+           general merge-aware iterator. */
+        std::set_difference(
+            args[0]->attrs()->begin(),
+            args[0]->attrs()->end(),
+            names.begin(),
+            names.end(),
+            std::back_inserter(attrs));
+    }
+
     v.mkAttrs(attrs.alreadySorted());
 }
 
