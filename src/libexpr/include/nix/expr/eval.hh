@@ -1170,6 +1170,9 @@ private:
     Counter nrAvoided;
     Counter nrOpUpdates;
     Counter nrOpUpdateValuesCopied;
+    Counter nrFormalsMergeFast;
+    Counter nrFormalsMergeFallbackLayered;
+    Counter nrFormalsMergeFallbackSizeGate;
     Counter nrListConcats;
     Counter nrPrimOpCalls;
     Counter nrFunctionCalls;

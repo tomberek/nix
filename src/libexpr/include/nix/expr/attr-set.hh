@@ -559,6 +559,30 @@ public:
     }
 
     /**
+     * Direct read-only view of a single (unlayered) chunk's dense parallel
+     * arrays. For hot paths that want to run their own merge/scan against a
+     * sorted key sequence instead of paying one binary search per key via
+     * `get()`.
+     *
+     * Only valid when `!isLayered()`: a layered chain's attributes can live
+     * in any layer, not just the top one, so scanning only this layer's
+     * `names` would silently miss base-layer attributes.
+     */
+    struct DenseView
+    {
+        const Symbol * names;
+        const PosIdx * pos;
+        Value * const * values;
+        size_type size;
+    };
+
+    DenseView denseView() const noexcept
+    {
+        assert(!isLayered());
+        return DenseView{namesPtr(), posPtr(), valuesPtr(), numAttrs};
+    }
+
+    /**
      * Check if the layer chain is full.
      */
     bool isLayerListFull() const noexcept

@@ -355,4 +355,26 @@ TEST_F(TrivialExpressionTest, tooManyFormals)
             "too many formal arguments, implementation supports at most 65535")));
 }
 
+TEST_F(TrivialExpressionTest, formalsFromLayeredArgs)
+{
+    // `//` with a small RHS layers `extra` on top of `base` (see
+    // ExprOpUpdate::eval's shouldLayer heuristic) instead of copying into a
+    // flat Bindings. callFunction's formals-binding fast path must not scan
+    // only the top layer's names[] in that case -- it must fall back to the
+    // layer-chain-aware Bindings::get() -- or attributes that live only in
+    // the base layer would be silently missed.
+    auto v = eval(
+        "let base = { a = 1; b = 2; }; extra = { c = 3; }; merged = base // extra; "
+        "f = { a, b, c, d ? 40 }: a + b + c + d; in f merged");
+    ASSERT_THAT(v, IsIntEq(46));
+}
+
+TEST_F(TrivialExpressionTest, formalsMissingRequiredArg)
+{
+    ASSERT_THAT(
+        [&]() { eval("({ a, b }: a + b) { a = 1; }"); },
+        ::testing::ThrowsMessage<Error>(
+            ::nix::testing::HasSubstrIgnoreANSIMatcher("called without required argument 'b'")));
+}
+
 } /* namespace nix */
