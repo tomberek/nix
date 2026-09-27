@@ -3785,20 +3785,40 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
     state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.zipAttrsWith");
     const auto listItems = args[1]->listView();
 
+    // Only `name` (and, below, `value`) is ever read from each input's
+    // Bindings -- `pos` is never needed. The general iterator synthesizes a
+    // full Attr (touching `pos`/`values` too) on every step, so walk the
+    // dense `names`/`values` arrays directly when an input isn't layered.
     for (auto & vElem : listItems) {
         state.forceAttrs(
             *vElem, noPos, "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith");
-        for (auto & attr : *vElem->attrs())
-            attrsSeen.try_emplace(attr.name).first->second.size++;
+        auto & bindings = *vElem->attrs();
+        if (!bindings.isLayered()) {
+            auto dense = bindings.denseView();
+            for (Bindings::size_type n = 0; n < dense.size; ++n)
+                attrsSeen.try_emplace(dense.names[n]).first->second.size++;
+        } else {
+            for (auto & attr : bindings)
+                attrsSeen.try_emplace(attr.name).first->second.size++;
+        }
     }
 
     for (auto & [sym, elem] : attrsSeen)
         elem.list.emplace(state.buildList(elem.size));
 
     for (auto & vElem : listItems) {
-        for (auto & attr : *vElem->attrs()) {
-            auto & item = attrsSeen.at(attr.name);
-            (*item.list)[item.pos++] = attr.value;
+        auto & bindings = *vElem->attrs();
+        if (!bindings.isLayered()) {
+            auto dense = bindings.denseView();
+            for (Bindings::size_type n = 0; n < dense.size; ++n) {
+                auto & item = attrsSeen.at(dense.names[n]);
+                (*item.list)[item.pos++] = dense.values[n];
+            }
+        } else {
+            for (auto & attr : bindings) {
+                auto & item = attrsSeen.at(attr.name);
+                (*item.list)[item.pos++] = attr.value;
+            }
         }
     }
 
