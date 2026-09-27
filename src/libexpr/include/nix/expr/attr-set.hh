@@ -15,13 +15,6 @@
 
 #if defined(__x86_64__) && defined(__SSE2__)
 #  include <emmintrin.h>
-/* immintrin.h (AVX2 intrinsics) is safe to include unconditionally: its
-   AVX2 declarations are only *used* inside avx2FindIndex() below, which is
-   annotated `__attribute__((target("avx2")))` so only that one function is
-   ever compiled to emit AVX2 instructions, regardless of this TU's default
-   -march/-mtune. Runtime dispatch (@see Bindings::SimdDispatch) makes sure
-   that function is never *called* on a CPU that doesn't support AVX2. */
-#  include <immintrin.h>
 #endif
 
 namespace nix {
@@ -538,46 +531,7 @@ public:
         numAttrsInChain = numAttrs;
     }
 
-public:
-    /**
-     * Which per-chunk search implementation findIndex() should dispatch
-     * to. Selected once via runtime CPU-feature detection (@see
-     * detectDispatch()) and cached (@see currentDispatch()); never
-     * re-checked per call. The only thing allowed to override the cached,
-     * real answer is setDispatchOverrideForTesting(), so unit tests can
-     * force-exercise the AVX2 and SSE2 paths independently of what the
-     * machine actually running the tests supports (this cannot be a
-     * compile-time #if -- AVX2 support is a runtime property of the CPU,
-     * not the compiler target).
-     */
-    enum class SimdDispatch : uint8_t {
-        Scalar,
-        Sse2,
-        Avx2,
-    };
-
-    /**
-     * Test-only hook: force findIndex()'s dispatch decision to a specific
-     * implementation, or std::nullopt to go back to real runtime
-     * detection. Lets unit tests directly exercise the AVX2/SSE2/scalar
-     * per-chunk search paths regardless of what the CPU actually running
-     * the tests supports -- e.g. verifying the SSE2 and scalar fallbacks
-     * are correct even on hardware (like this dev machine) that supports
-     * AVX2 and would otherwise never take those paths. Not for production
-     * use.
-     */
-    static void setDispatchOverrideForTesting(std::optional<SimdDispatch> dispatch) noexcept
-    {
-        dispatchOverride() = dispatch;
-    }
-
 private:
-    static std::optional<SimdDispatch> & dispatchOverride() noexcept
-    {
-        static std::optional<SimdDispatch> currentOverride;
-        return currentOverride;
-    }
-
 #if defined(__x86_64__) && defined(__SSE2__)
     /**
      * Branch-light SIMD linear scan over `first[0..n)`, used by findIndex()
@@ -622,112 +576,23 @@ private:
     }
 
     static constexpr size_type simdLinearScanMaxSize = 320;
-
-    /**
-     * AVX2 (8-lane) widening of simdFindIndex(): same branch-light linear
-     * scan, but comparing 8 `Symbol` (uint32) lanes per instruction instead
-     * of 4, via `_mm256_cmpeq_epi32`. AVX2 is NOT part of the x86_64
-     * baseline ABI (unlike SSE2, which every x86_64 CPU has) -- it's only
-     * guaranteed from the x86-64-v3 microarchitecture level onward -- so
-     * this function must never run on a CPU that doesn't support it. It is
-     * annotated `target("avx2")` so *compiling* it in doesn't force AVX2
-     * codegen anywhere else in this TU; whether it is ever *called* is
-     * gated entirely by the runtime-detected dispatch cached in
-     * currentDispatch() below, never by a compile-time #if.
-     */
-    __attribute__((target("avx2"))) static std::optional<size_type>
-    avx2FindIndex(const Symbol * first, size_type n, Symbol name) noexcept
-    {
-        const __m256i key = _mm256_set1_epi32(static_cast<int>(name.getId()));
-        size_type i = 0;
-        for (; i + 8 <= n; i += 8) {
-            __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(first + i));
-            __m256i cmp = _mm256_cmpeq_epi32(key, data);
-            unsigned mask = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(cmp)));
-            if (mask)
-                return i + static_cast<size_type>(__builtin_ctz(mask));
-        }
-        for (; i < n; ++i)
-            if (first[i] == name)
-                return i;
-        return std::nullopt;
-    }
-
-    /**
-     * Located the same way simdLinearScanMaxSize was (standalone
-     * microbenchmark, release flags, 64+ independent arrays/size, 50/50
-     * present/absent query mix, interleaved trials, Welch's t-test, reruns
-     * on a quiet machine after an initial noisy-shared-machine pass showed
-     * an unstable crossover region -- see commit message for the full
-     * numbers). AVX2 beats scalar binary search decisively and
-     * consistently up to ~675 entries (-9% to -25%, |t| mostly >10), then
-     * enters a noisy, unstable crossover zone from ~700-875 (sign flips
-     * between reruns), then loses clearly and consistently from ~900 on
-     * (+20% to +80%). 640 sits comfortably under the start of that noisy
-     * zone. Separately, AVX2 beat SSE2 (avx2FindIndex vs. simdFindIndex)
-     * at *every* size measured, from 150 up to 1400 -- no crossover found
-     * where SSE2 overtakes AVX2 in the range that matters here.
-     */
-    static constexpr size_type avx2LinearScanMaxSize = 640;
-
-    /**
-     * Runtime CPU-feature check, run once and cached by currentDispatch().
-     * `__builtin_cpu_supports` is available on both GCC and Clang (this
-     * codebase's two supported compilers, @see flake.nix's gccStdenv /
-     * clangStdenv / ccacheStdenv package variants) and, unlike a
-     * compile-time `#ifdef __AVX2__`, reflects what the CPU *running* this
-     * binary actually supports -- necessary because Nix ships prebuilt
-     * binaries that must run on x86_64 hardware older than x86-64-v3.
-     */
-    static SimdDispatch detectDispatch() noexcept
-    {
-        if (__builtin_cpu_supports("avx2"))
-            return SimdDispatch::Avx2;
-        return SimdDispatch::Sse2;
-    }
-
-    /**
-     * Cached (function-local static, thread-safe, initialized on first
-     * use) real dispatch decision, overridable only for testing via
-     * dispatchOverride(). This is the single point that decides AVX2 vs.
-     * SSE2 for the whole process's lifetime -- findIndex() never calls
-     * __builtin_cpu_supports directly.
-     */
-    static SimdDispatch currentDispatch() noexcept
-    {
-        static const SimdDispatch cached = detectDispatch();
-        if (auto o = dispatchOverride())
-            return *o;
-        return cached;
-    }
 #endif
 
     /**
      * Find the index of `name` within the first `n` entries of a single
      * (unlayered) chunk's dense, sorted `names` array, or std::nullopt if
      * absent. Dispatches to a SIMD linear scan for small-to-medium chunks
-     * -- AVX2 (avx2FindIndex()) or SSE2 (simdFindIndex()), whichever
-     * currentDispatch() picked -- and falls back to (scalar) binary search
-     * otherwise: either because the chunk is large enough that binary
+     * (see simdFindIndex()) and falls back to (scalar) binary search
+     * otherwise -- either because the chunk is large enough that binary
      * search's better asymptotics win out, or because this isn't an
-     * x86_64/SSE2 target / the CPU lacks even SSE2 (not possible in
-     * practice), in which case binary search is used unconditionally.
+     * x86_64/SSE2 target, in which case binary search is used
+     * unconditionally.
      */
     static std::optional<size_type> findIndex(const Symbol * first, size_type n, Symbol name) noexcept
     {
 #if defined(__x86_64__) && defined(__SSE2__)
-        switch (currentDispatch()) {
-        case SimdDispatch::Avx2:
-            if (n <= avx2LinearScanMaxSize)
-                return avx2FindIndex(first, n, name);
-            break;
-        case SimdDispatch::Sse2:
-            if (n <= simdLinearScanMaxSize)
-                return simdFindIndex(first, n, name);
-            break;
-        case SimdDispatch::Scalar:
-            break;
-        }
+        if (n <= simdLinearScanMaxSize)
+            return simdFindIndex(first, n, name);
 #endif
         auto last = first + n;
         auto i = std::lower_bound(first, last, name);
