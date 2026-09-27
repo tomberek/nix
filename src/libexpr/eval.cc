@@ -2406,23 +2406,54 @@ void EvalState::forceValueDeep(Value & v)
         state.forceValue(v, v.determinePos(noPos));
 
         if (v.type() == nAttrs) {
-            for (auto & i : *v.attrs())
-                try {
-                    // If the value is a thunk, we're evaling. Otherwise no trace necessary.
-                    auto dts = state.debugRepl && i.value->isThunk() ? makeDebugTraceStacker(
-                                                                           state,
-                                                                           *i.value->thunk().expr,
-                                                                           *i.value->thunk().env,
-                                                                           i.pos,
-                                                                           "while evaluating the attribute '%1%'",
-                                                                           state.symbols[i.name])
-                                                                     : nullptr;
+            // `pos` is only read on the (rare) debug-trace/error paths below,
+            // but the general iterator synthesizes a full Attr -- touching
+            // `pos` too -- on every step regardless. When unlayered, walk
+            // the dense `name`/`value` arrays directly and fetch `pos` only
+            // where it's actually needed (a plain array read, not an
+            // iterator-synthesis cost).
+            auto & bindings = *v.attrs();
+            if (!bindings.isLayered()) {
+                auto dense = bindings.denseView();
+                for (Bindings::size_type idx = 0; idx < dense.size; ++idx) {
+                    Symbol name = dense.names[idx];
+                    Value * value = dense.values[idx];
+                    try {
+                        // If the value is a thunk, we're evaling. Otherwise no trace necessary.
+                        auto dts = state.debugRepl && value->isThunk() ? makeDebugTraceStacker(
+                                                                              state,
+                                                                              *value->thunk().expr,
+                                                                              *value->thunk().env,
+                                                                              dense.pos[idx],
+                                                                              "while evaluating the attribute '%1%'",
+                                                                              state.symbols[name])
+                                                                        : nullptr;
 
-                    recurse(*i.value);
-                } catch (Error & e) {
-                    state.addErrorTrace(e, i.pos, "while evaluating the attribute '%1%'", state.symbols[i.name]);
-                    throw;
+                        recurse(*value);
+                    } catch (Error & e) {
+                        state.addErrorTrace(e, dense.pos[idx], "while evaluating the attribute '%1%'", state.symbols[name]);
+                        throw;
+                    }
                 }
+            } else {
+                for (auto & i : bindings)
+                    try {
+                        // If the value is a thunk, we're evaling. Otherwise no trace necessary.
+                        auto dts = state.debugRepl && i.value->isThunk() ? makeDebugTraceStacker(
+                                                                               state,
+                                                                               *i.value->thunk().expr,
+                                                                               *i.value->thunk().env,
+                                                                               i.pos,
+                                                                               "while evaluating the attribute '%1%'",
+                                                                               state.symbols[i.name])
+                                                                         : nullptr;
+
+                        recurse(*i.value);
+                    } catch (Error & e) {
+                        state.addErrorTrace(e, i.pos, "while evaluating the attribute '%1%'", state.symbols[i.name]);
+                        throw;
+                    }
+            }
         }
 
         else if (v.isList()) {

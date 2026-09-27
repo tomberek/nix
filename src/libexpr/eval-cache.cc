@@ -758,8 +758,19 @@ std::vector<Symbol> AttrCursor::getAttrs()
         root->state.error<TypeError>("'%s' is not an attribute set", getAttrPathStr()).debugThrow();
 
     std::vector<Symbol> attrs;
-    for (auto & attr : *getValue().attrs())
-        attrs.push_back(attr.name);
+    // Only `name` is ever read below -- the general iterator synthesizes a
+    // full Attr (touching `pos`/`values` too) on every step regardless. When
+    // unlayered, copy straight from the dense `names` array instead.
+    auto & bindings = *getValue().attrs();
+    attrs.reserve(bindings.size());
+    if (!bindings.isLayered()) {
+        auto dense = bindings.denseView();
+        for (Bindings::size_type n = 0; n < dense.size; ++n)
+            attrs.push_back(dense.names[n]);
+    } else {
+        for (auto & attr : bindings)
+            attrs.push_back(attr.name);
+    }
     std::sort(attrs.begin(), attrs.end(), [&](Symbol a, Symbol b) {
         std::string_view sa = root->state.symbols[a], sb = root->state.symbols[b];
         return sa < sb;

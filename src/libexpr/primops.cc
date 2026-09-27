@@ -3732,13 +3732,27 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindings(args[1]->attrs()->size());
+    auto & bindings = *args[1]->attrs();
+    auto attrs = state.buildBindings(bindings.size());
 
-    for (auto & i : *args[1]->attrs()) {
-        Value * vName = Value::toPtr(state.symbols[i.name]);
+    // Only `name` and `value` are ever read below (the output's positions
+    // are unrelated to the input's, so `pos` is never touched) -- but the
+    // general iterator synthesizes it anyway on every step. Source straight
+    // from the dense arrays when unlayered.
+    auto mapOne = [&](Symbol name, Value * value) {
+        Value * vName = Value::toPtr(state.symbols[name]);
         Value * vFun2 = state.allocValue();
         vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+        attrs.alloc(name).mkApp(vFun2, value);
+    };
+
+    if (!bindings.isLayered()) {
+        auto dense = bindings.denseView();
+        for (Bindings::size_type n = 0; n < dense.size; ++n)
+            mapOne(dense.names[n], dense.values[n]);
+    } else {
+        for (auto & i : bindings)
+            mapOne(i.name, i.value);
     }
 
     v.mkAttrs(attrs.alreadySorted());

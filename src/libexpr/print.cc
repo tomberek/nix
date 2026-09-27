@@ -343,8 +343,20 @@ private:
             output << "{";
 
             AttrVec sorted;
-            for (auto & i : *v.attrs())
-                sorted.emplace_back(std::pair(state.symbols[i.name], i.value));
+            auto & bindings = *v.attrs();
+            sorted.reserve(bindings.size());
+            // Only `name` (as a sort/display key) and `value` are ever read
+            // here -- `pos` is dead weight. The general iterator
+            // synthesizes (and thus touches) it on every step regardless,
+            // so when unlayered, source straight from the dense arrays.
+            if (!bindings.isLayered()) {
+                auto dense = bindings.denseView();
+                for (Bindings::size_type n = 0; n < dense.size; ++n)
+                    sorted.emplace_back(std::pair(state.symbols[dense.names[n]], dense.values[n]));
+            } else {
+                for (auto & i : bindings)
+                    sorted.emplace_back(std::pair(state.symbols[i.name], i.value));
+            }
 
             if (options.maxAttrs == std::numeric_limits<size_t>::max())
                 std::sort(sorted.begin(), sorted.end());
