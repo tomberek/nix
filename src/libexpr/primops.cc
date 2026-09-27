@@ -3820,7 +3820,7 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
     // The (large: it embeds a small priority-queue of per-layer sub-cursors)
     // iterator pair is heap-allocated and only touched for layered inputs,
     // so a Cursor for the common, unlayered case stays small -- scanning all
-    // N cursors on every merge step (see `findMin` below) stays cache-friendly
+    // N cursors on every merge step (see `nextGroup` below) stays cache-friendly
     // even for N in the dozens.
     struct LayeredState
     {
@@ -3878,49 +3878,50 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
         return cursors;
     };
 
-    // Finds the index of the cursor currently sitting on the
-    // lexicographically-least name among all non-empty cursors, or
-    // `cursors.size()` if every cursor is exhausted. A linear scan: N is a
-    // handful of input attrsets in practice, so this beats a heap's
-    // bookkeeping.
-    auto findMin = [](const std::vector<Cursor> & cursors) noexcept -> size_t {
-        size_t minIdx = cursors.size();
+    // Finds, in a single linear scan over all cursors (N is a handful of
+    // input attrsets in practice, so this beats a heap's bookkeeping), both
+    // the lexicographically-least current name and every cursor currently
+    // sitting on it (in input order) -- one scan rather than a `findMin`
+    // scan followed by a separate tie-collection scan, since for large N
+    // scanning the (cache-resident but not free) cursor array twice per
+    // merge step is exactly the cost this rewrite exists to cut. `tied` is
+    // caller-owned so repeated calls reuse its buffer instead of
+    // allocating a fresh vector every merge step. Returns `nullopt` once
+    // every cursor is exhausted.
+    auto nextGroup = [](std::vector<Cursor> & cursors, std::vector<size_t> & tied) -> std::optional<Symbol> {
+        tied.clear();
+        std::optional<Symbol> minName;
         for (size_t i = 0; i < cursors.size(); ++i) {
             if (cursors[i].empty())
                 continue;
-            if (minIdx == cursors.size() || cursors[i].name() < cursors[minIdx].name())
-                minIdx = i;
+            auto n = cursors[i].name();
+            if (!minName || n < *minName) {
+                minName = n;
+                tied.clear();
+                tied.push_back(i);
+            } else if (n == *minName) {
+                tied.push_back(i);
+            }
         }
-        return minIdx;
+        return minName;
     };
-
-    size_t totalAttrs = 0;
-    for (auto & vElem : listItems)
-        totalAttrs += vElem->attrs()->size();
 
     // Pass 1: merge once just to learn the sorted key union and each key's
     // total count across all inputs. `names`/`sizes` hold plain data (no
-    // GC-traced pointers), so they can grow freely as the merge discovers
-    // keys.
+    // GC-traced pointers), so they can grow freely (via ordinary vector
+    // doubling) as the merge discovers keys -- reserving the N*K upper
+    // bound up front would badly over-allocate whenever inputs overlap
+    // heavily (many inputs, few distinct keys).
     std::vector<Symbol> names;
     std::vector<size_t> sizes;
-    names.reserve(totalAttrs);
-    sizes.reserve(totalAttrs);
     {
         auto cursors = makeCursors();
-        for (;;) {
-            auto minIdx = findMin(cursors);
-            if (minIdx == cursors.size())
-                break;
-            auto minName = cursors[minIdx].name();
-            size_t count = 0;
-            for (auto & c : cursors)
-                if (!c.empty() && c.name() == minName) {
-                    ++count;
-                    c.advance();
-                }
-            names.push_back(minName);
-            sizes.push_back(count);
+        std::vector<size_t> tied;
+        while (auto minName = nextGroup(cursors, tied)) {
+            names.push_back(*minName);
+            sizes.push_back(tied.size());
+            for (auto i : tied)
+                cursors[i].advance();
         }
     }
 
@@ -3944,18 +3945,14 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
     // per-key lookup.
     {
         auto cursors = makeCursors();
+        std::vector<size_t> tied;
         size_t unionIdx = 0;
-        for (;;) {
-            auto minIdx = findMin(cursors);
-            if (minIdx == cursors.size())
-                break;
-            auto minName = cursors[minIdx].name();
+        while (nextGroup(cursors, tied)) {
             auto & item = items[unionIdx++];
-            for (auto & c : cursors)
-                if (!c.empty() && c.name() == minName) {
-                    (*item.list)[item.pos++] = c.value();
-                    c.advance();
-                }
+            for (auto i : tied) {
+                (*item.list)[item.pos++] = cursors[i].value();
+                cursors[i].advance();
+            }
         }
     }
 
