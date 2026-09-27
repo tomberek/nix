@@ -74,9 +74,9 @@ void ExprOpHasAttr::show(const SymbolTable & symbols, std::ostream & str) const
 
 void ExprAttrs::showBindings(const SymbolTable & symbols, std::ostream & str) const
 {
-    typedef const AttrDefs::value_type * Attr;
+    typedef const BoundAttrDefs::value_type * Attr;
     std::vector<Attr> sorted;
-    for (auto & i : *attrs)
+    for (auto & i : *boundAttrs)
         sorted.push_back(&i);
     std::sort(sorted.begin(), sorted.end(), [&](Attr a, Attr b) {
         std::string_view sa = symbols[a->first], sb = symbols[b->first];
@@ -401,8 +401,14 @@ ExprAttrs::bindInheritSources(EvalState & es, const std::shared_ptr<const Static
 
 void ExprAttrs::moveDataToAllocator(std::pmr::polymorphic_allocator<char> & alloc)
 {
-    AttrDefs newAttrs{std::move(*attrs), alloc};
-    attrs.emplace(std::move(newAttrs), alloc);
+    BoundAttrDefs newAttrs(alloc);
+    newAttrs.reserve(attrs->size());
+    for (auto & [sym, def] : *attrs)
+        newAttrs.emplace_back(sym, std::move(def));
+    boundAttrs.emplace(std::move(newAttrs));
+    attrs.reset(); // discard the parse-time map's heap nodes now, instead of
+                    // orphaning them in the arena for the process's lifetime.
+
     DynamicAttrDefs newDynamicAttrs{std::move(*dynamicAttrs), alloc};
     dynamicAttrs.emplace(std::move(newDynamicAttrs), alloc);
     if (inheritFromExprs)
@@ -418,18 +424,18 @@ void ExprAttrs::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> 
 
     if (recursive) {
         auto newEnv = [&]() -> std::shared_ptr<const StaticEnv> {
-            auto newEnv = std::make_shared<StaticEnv>(nullptr, env, attrs->size());
+            auto newEnv = std::make_shared<StaticEnv>(nullptr, env, boundAttrs->size());
 
             Displacement displ = 0;
-            for (auto & i : *attrs)
+            for (auto & i : *boundAttrs)
                 newEnv->vars.emplace_back(i.first, i.second.displ = displ++);
             return newEnv;
         }();
 
-        // No need to sort newEnv since attrs is in sorted order.
+        // No need to sort newEnv since boundAttrs is in sorted order.
 
         auto inheritFromEnv = bindInheritSources(es, newEnv);
-        for (auto & i : *attrs)
+        for (auto & i : *boundAttrs)
             i.second.e->bindVars(es, i.second.chooseByKind(newEnv, env, inheritFromEnv));
 
         for (auto & i : *dynamicAttrs) {
@@ -439,7 +445,7 @@ void ExprAttrs::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> 
     } else {
         auto inheritFromEnv = bindInheritSources(es, env);
 
-        for (auto & i : *attrs)
+        for (auto & i : *boundAttrs)
             i.second.e->bindVars(es, i.second.chooseByKind(env, env, inheritFromEnv));
 
         for (auto & i : *dynamicAttrs) {
@@ -506,18 +512,18 @@ void ExprLet::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & 
 {
     attrs->moveDataToAllocator(es.mem.exprs.alloc);
     auto newEnv = [&]() -> std::shared_ptr<const StaticEnv> {
-        auto newEnv = std::make_shared<StaticEnv>(nullptr, env, attrs->attrs->size());
+        auto newEnv = std::make_shared<StaticEnv>(nullptr, env, attrs->boundAttrs->size());
 
         Displacement displ = 0;
-        for (auto & i : *attrs->attrs)
+        for (auto & i : *attrs->boundAttrs)
             newEnv->vars.emplace_back(i.first, i.second.displ = displ++);
         return newEnv;
     }();
 
-    // No need to sort newEnv since attrs->attrs is in sorted order.
+    // No need to sort newEnv since attrs->boundAttrs is in sorted order.
 
     auto inheritFromEnv = attrs->bindInheritSources(es, newEnv);
-    for (auto & i : *attrs->attrs)
+    for (auto & i : *attrs->boundAttrs)
         i.second.e->bindVars(es, i.second.chooseByKind(newEnv, env, inheritFromEnv));
 
     if (es.debugRepl)

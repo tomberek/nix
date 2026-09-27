@@ -1292,26 +1292,26 @@ Env * ExprAttrs::buildInheritFromEnv(EvalState & state, Env & up)
 
 void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
 {
-    auto bindings = state.buildBindings(attrs->size() + dynamicAttrs->size());
+    auto bindings = state.buildBindings(boundAttrs->size() + dynamicAttrs->size());
     auto dynamicEnv = &env;
     bool sort = false;
 
     if (recursive) {
         /* Create a new environment that contains the attributes in
            this `rec'. */
-        Env & env2(state.mem.allocEnv(attrs->size()));
+        Env & env2(state.mem.allocEnv(boundAttrs->size()));
         env2.up = &env;
         dynamicEnv = &env2;
         Env * inheritEnv = inheritFromExprs ? buildInheritFromEnv(state, env2) : nullptr;
 
-        AttrDefs::iterator overrides = attrs->find(state.s.overrides);
-        bool hasOverrides = overrides != attrs->end();
+        BoundAttrDefs::iterator overrides = boundAttrs->find(state.s.overrides);
+        bool hasOverrides = overrides != boundAttrs->end();
 
         /* The recursive attributes are evaluated in the new
            environment, while the inherited attributes are evaluated
            in the original environment. */
         Displacement displ = 0;
-        for (auto & i : *attrs) {
+        for (auto & i : *boundAttrs) {
             Value * vAttr;
             if (hasOverrides && i.second.kind != AttrDef::Kind::Inherited) {
                 vAttr = state.allocValue();
@@ -1338,8 +1338,8 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
                 "while evaluating the `__overrides` attribute");
             bindings.grow(state.buildBindings(bindings.capacity() + vOverrides->attrs()->size()));
             for (auto & i : *vOverrides->attrs()) {
-                AttrDefs::iterator j = attrs->find(i.name);
-                if (j != attrs->end()) {
+                BoundAttrDefs::iterator j = boundAttrs->find(i.name);
+                if (j != boundAttrs->end()) {
                     (*bindings.bindings)[j->second.displ] = i;
                     env2.values[j->second.displ] = i.value;
                 } else
@@ -1351,7 +1351,7 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
 
     else {
         Env * inheritEnv = inheritFromExprs ? buildInheritFromEnv(state, env) : nullptr;
-        for (auto & i : *attrs)
+        for (auto & i : *boundAttrs)
             bindings.insert(
                 i.first, i.second.e->maybeThunk(state, *i.second.chooseByKind(&env, &env, inheritEnv)), i.second.pos);
     }
@@ -1395,7 +1395,7 @@ void ExprLet::eval(EvalState & state, Env & env, Value & v)
 {
     /* Create a new environment that contains the attributes in this
        `let'. */
-    Env & env2(state.mem.allocEnv(attrs->attrs->size()));
+    Env & env2(state.mem.allocEnv(attrs->boundAttrs->size()));
     env2.up = &env;
 
     Env * inheritEnv = attrs->inheritFromExprs ? attrs->buildInheritFromEnv(state, env2) : nullptr;
@@ -1404,7 +1404,7 @@ void ExprLet::eval(EvalState & state, Env & env, Value & v)
        while the inherited attributes are evaluated in the original
        environment. */
     Displacement displ = 0;
-    for (auto & i : *attrs->attrs) {
+    for (auto & i : *attrs->boundAttrs) {
         env2.values[displ++] = i.second.e->maybeThunk(state, *i.second.chooseByKind(&env2, &env, inheritEnv));
     }
 
