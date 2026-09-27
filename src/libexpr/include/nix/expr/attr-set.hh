@@ -559,6 +559,26 @@ public:
     }
 
     /**
+     * Test whether an attribute by this name exists anywhere in the layer
+     * chain, without synthesizing an `Attr` (i.e. without touching `pos`/
+     * `values` at all, even on a hit). For callers that only need a yes/no
+     * answer, this avoids the wasted `pos`/`values` reads `get()` would pay
+     * for a result that's immediately discarded.
+     */
+    bool contains(Symbol name) const noexcept
+    {
+        const Bindings * currentChunk = this;
+        while (currentChunk) {
+            auto first = currentChunk->namesPtr();
+            auto last = first + currentChunk->numAttrs;
+            if (std::binary_search(first, last, name))
+                return true;
+            currentChunk = currentChunk->baseLayer;
+        }
+        return false;
+    }
+
+    /**
      * Direct read-only view of a single (unlayered) chunk's dense parallel
      * arrays. For hot paths that want to run their own merge/scan against a
      * sorted key sequence instead of paying one binary search per key via

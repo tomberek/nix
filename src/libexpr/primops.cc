@@ -3131,10 +3131,21 @@ static void prim_attrNames(EvalState & state, CallSite callSite, Value * const *
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.attrNames");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    auto & bindings = *args[0]->attrs();
+    auto list = state.buildList(bindings.size());
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
-        list[n] = Value::toPtr(state.symbols[i.name]);
+    // Only `name` is ever read below, but the general iterator synthesizes a
+    // full Attr (touching `pos`/`values` too) on every step. When the
+    // Bindings isn't layered, walk the dense `names` array directly instead
+    // so the copy only touches the one array it actually needs.
+    if (!bindings.isLayered()) {
+        auto dense = bindings.denseView();
+        for (Bindings::size_type n = 0; n < dense.size; ++n)
+            list[n] = Value::toPtr(state.symbols[dense.names[n]]);
+    } else {
+        for (const auto & [n, i] : enumerate(bindings))
+            list[n] = Value::toPtr(state.symbols[i.name]);
+    }
 
     std::sort(list.begin(), list.end(), [](Value * v1, Value * v2) { return v1->string_view() < v2->string_view(); });
 
@@ -3160,24 +3171,43 @@ static void prim_attrValues(EvalState & state, CallSite callSite, Value * const 
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.attrValues");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    auto & bindings = *args[0]->attrs();
+    auto list = state.buildList(bindings.size());
 
-    // Bindings no longer stores a contiguous Attr array we could point into
-    // directly (its iterator synthesizes each Attr on the fly), so copy the
-    // attributes into a locally-owned, stable array first, and (ab)use
-    // pointers into *that* for the sort below.
-    std::vector<Attr> attrs(args[0]->attrs()->begin(), args[0]->attrs()->end());
+    // Only `name` (as a sort key) and `value` (the payload) are ever read
+    // below -- `pos` is dead weight here. Bindings no longer stores a
+    // contiguous Attr array we could point into directly, so copy into a
+    // locally-owned, stable array first and (ab)use pointers into *that* for
+    // the sort; but when the Bindings isn't layered, source that copy from
+    // the dense `names`/`values` arrays directly instead of going through
+    // the general iterator, which would synthesize (and thus touch) `pos`
+    // for every entry despite it never being used.
+    struct NameValue
+    {
+        Symbol name;
+        Value * value;
+    };
+    std::vector<NameValue> attrs;
+    attrs.reserve(bindings.size());
+    if (!bindings.isLayered()) {
+        auto dense = bindings.denseView();
+        for (Bindings::size_type n = 0; n < dense.size; ++n)
+            attrs.push_back({dense.names[n], dense.values[n]});
+    } else {
+        for (auto & i : bindings)
+            attrs.push_back({i.name, i.value});
+    }
 
     for (const auto & [n, i] : enumerate(attrs))
         list[n] = (Value *) &i;
 
     std::sort(list.begin(), list.end(), [&](Value * v1, Value * v2) {
-        std::string_view s1 = state.symbols[((Attr *) v1)->name], s2 = state.symbols[((Attr *) v2)->name];
+        std::string_view s1 = state.symbols[((NameValue *) v1)->name], s2 = state.symbols[((NameValue *) v2)->name];
         return s1 < s2;
     });
 
     for (auto & v : list)
-        v = ((Attr *) v)->value;
+        v = ((NameValue *) v)->value;
 
     v.mkList(list);
 }
@@ -3531,16 +3561,37 @@ static void prim_intersectAttrs(EvalState & state, CallSite callSite, Value * co
     // Finally one could run try a simultaneous scan, count misses and fall back
     // to double binary search when the counter hit some threshold and/or ratio.
 
+    // In both branches below, only the *smaller* operand's `name` is ever
+    // used, for the lookup key -- its `pos`/`value` are never read (the
+    // output always comes from `right`, per the `e2`-wins semantics above).
+    // The general iterator would synthesize (and thus touch) those fields
+    // for every element regardless, so when the smaller operand isn't
+    // layered, walk its dense `names` array directly instead.
     if (left.size() < right.size()) {
-        for (auto & l : left) {
-            auto r = right.get(l.name);
-            if (r)
-                attrs.insert(*r);
+        if (!left.isLayered()) {
+            auto dense = left.denseView();
+            for (Bindings::size_type n = 0; n < dense.size; ++n) {
+                auto r = right.get(dense.names[n]);
+                if (r)
+                    attrs.insert(*r);
+            }
+        } else {
+            for (auto & l : left) {
+                auto r = right.get(l.name);
+                if (r)
+                    attrs.insert(*r);
+            }
         }
     } else {
+        // Here the roles are reversed: `right` is the smaller operand we
+        // scan, but its `Attr` (not just its name) is what ends up in the
+        // output, so there's nothing to save on the `right`-side traversal.
+        // The one wasted read is on the `left.get()` side: its result is
+        // used only as a yes/no existence check, so `contains()` (skips
+        // synthesizing an Attr, i.e. skips touching `left`'s `pos`/`values`
+        // even on a hit) replaces it.
         for (auto & r : right) {
-            auto l = left.get(r.name);
-            if (l)
+            if (left.contains(r.name))
                 attrs.insert(r);
         }
     }
