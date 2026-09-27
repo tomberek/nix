@@ -13,6 +13,10 @@
 #include <ranges>
 #include <optional>
 
+#if defined(__x86_64__) && defined(__SSE2__)
+#  include <emmintrin.h>
+#endif
+
 namespace nix {
 
 class EvalMemory;
@@ -527,6 +531,66 @@ public:
         numAttrsInChain = numAttrs;
     }
 
+private:
+#if defined(__x86_64__) && defined(__SSE2__)
+    /**
+     * Branch-light SIMD linear scan over `first[0..n)`, used by findIndex()
+     * for small-to-medium chunks in place of binary search.
+     *
+     * Binary search's data-dependent, sequentially-dependent comparisons
+     * don't predict well (each step's branch outcome depends on the
+     * previous one, so the CPU can't speculate ahead reliably). A linear
+     * scan comparing 4 `Symbol` (uint32) lanes at once via SSE2 trades
+     * O(log n) mispredicted branches for O(n/4) branch-light SIMD compares,
+     * which wins for small n despite the worse asymptotic complexity.
+     * Measured empirically (see task notes) to win up to ~300-500 entries,
+     * with a noisy crossover after that; `simdLinearScanMaxSize` is kept
+     * well under the crossover for margin.
+     */
+    static std::optional<size_type> simdFindIndex(const Symbol * first, size_type n, Symbol name) noexcept
+    {
+        const __m128i key = _mm_set1_epi32(static_cast<int>(name.getId()));
+        size_type i = 0;
+        for (; i + 4 <= n; i += 4) {
+            __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i *>(first + i));
+            __m128i cmp = _mm_cmpeq_epi32(key, data);
+            int mask = _mm_movemask_ps(_mm_castsi128_ps(cmp));
+            if (mask)
+                return i + static_cast<size_type>(__builtin_ctz(static_cast<unsigned>(mask)));
+        }
+        for (; i < n; ++i)
+            if (first[i] == name)
+                return i;
+        return std::nullopt;
+    }
+
+    static constexpr size_type simdLinearScanMaxSize = 256;
+#endif
+
+    /**
+     * Find the index of `name` within the first `n` entries of a single
+     * (unlayered) chunk's dense, sorted `names` array, or std::nullopt if
+     * absent. Dispatches to a SIMD linear scan for small-to-medium chunks
+     * (see simdFindIndex()) and falls back to (scalar) binary search
+     * otherwise -- either because the chunk is large enough that binary
+     * search's better asymptotics win out, or because this isn't an
+     * x86_64/SSE2 target, in which case binary search is used
+     * unconditionally.
+     */
+    static std::optional<size_type> findIndex(const Symbol * first, size_type n, Symbol name) noexcept
+    {
+#if defined(__x86_64__) && defined(__SSE2__)
+        if (n <= simdLinearScanMaxSize)
+            return simdFindIndex(first, n, name);
+#endif
+        auto last = first + n;
+        auto i = std::lower_bound(first, last, name);
+        if (i != last && *i == name)
+            return static_cast<size_type>(i - first);
+        return std::nullopt;
+    }
+
+public:
     /**
      * Get attribute by name, or std::nullopt if no such attribute exists.
      *
@@ -538,13 +602,8 @@ public:
     std::optional<Attr> get(Symbol name) const noexcept
     {
         auto getInChunk = [name](const Bindings & chunk) -> std::optional<Attr> {
-            auto first = chunk.namesPtr();
-            auto last = first + chunk.numAttrs;
-            auto i = std::lower_bound(first, last, name);
-            if (i != last && *i == name) {
-                auto idx = static_cast<size_type>(i - first);
-                return Attr(*i, chunk.valuesPtr()[idx], chunk.posPtr()[idx]);
-            }
+            if (auto idx = findIndex(chunk.namesPtr(), chunk.numAttrs, name))
+                return Attr(chunk.namesPtr()[*idx], chunk.valuesPtr()[*idx], chunk.posPtr()[*idx]);
             return std::nullopt;
         };
 
