@@ -101,11 +101,47 @@ private:
     const Bindings * baseLayer = nullptr;
 
     /**
+     * Number of Attr slots reserved after this structure (@ref attrs), which
+     * is also the number of Symbol slots reserved in the dense name mirror
+     * that follows the attrs allocation (@ref namesPtr). Needed to locate the
+     * name mirror, since it is placed right after the *reserved* (not just
+     * used) attrs region.
+     */
+    size_type capacity = 0;
+
+    /**
      * Flexible array member of attributes.
      */
     Attr attrs[0];
 
+    /**
+     * A dense, redundant mirror of `attrs[i].name` for `i` in `[0, numAttrs)`,
+     * kept in the same sorted order as `attrs`. It is allocated right after
+     * the reserved `attrs[capacity]` region, in the same allocation as this
+     * Bindings object (@see EvalMemory::allocBindings).
+     *
+     * Symbol is 4 bytes vs. Attr's 16, so a binary search over this mirror
+     * touches 4x as many entries per cache line as searching `attrs`
+     * directly would. Bindings::get() uses it to find the matching index,
+     * then returns a normal `&attrs[index]`.
+     */
+    Symbol * namesPtr() noexcept
+    {
+        return reinterpret_cast<Symbol *>(attrs + capacity);
+    }
+
+    const Symbol * namesPtr() const noexcept
+    {
+        return reinterpret_cast<const Symbol *>(attrs + capacity);
+    }
+
     constexpr Bindings() = default;
+
+    explicit Bindings(size_type capacity) noexcept
+        : capacity(capacity)
+    {
+    }
+
     Bindings(const Bindings &) = delete;
     Bindings(Bindings &&) = delete;
     Bindings & operator=(const Bindings &) = delete;
@@ -347,6 +383,7 @@ public:
 
     void push_back(const Attr & attr)
     {
+        namesPtr()[numAttrs] = attr.name;
         attrs[numAttrs++] = attr;
         numAttrsInChain = numAttrs;
     }
@@ -356,12 +393,12 @@ public:
      */
     const Attr * get(Symbol name) const noexcept
     {
-        auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
-            auto first = chunk.attrs;
-            auto last = first + chunk.numAttrs;
-            const Attr * i = std::lower_bound(first, last, key);
-            if (i != last && i->name == key.name)
-                return i;
+        auto getInChunk = [name](const Bindings & chunk) -> const Attr * {
+            const Symbol * first = chunk.namesPtr();
+            const Symbol * last = first + chunk.numAttrs;
+            const Symbol * i = std::lower_bound(first, last, name);
+            if (i != last && *i == name)
+                return &chunk.attrs[i - first];
             return nullptr;
         };
 

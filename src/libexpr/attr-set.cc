@@ -19,7 +19,10 @@ Bindings * EvalMemory::allocBindings(size_t capacity)
         throw Error("attribute set of size %d is too big", capacity);
     stats.nrAttrsets++;
     stats.nrAttrsInAttrsets += capacity;
-    return new (allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity)) Bindings();
+    /* The attrs[] FAM is followed, in the same allocation, by a dense
+       Symbol[] mirror of the same capacity (@see Bindings::namesPtr). */
+    return new (allocBytes(sizeof(Bindings) + (sizeof(Attr) + sizeof(Symbol)) * capacity))
+        Bindings(static_cast<Bindings::size_type>(capacity));
 }
 
 Value & BindingsBuilder::alloc(Symbol name, PosIdx pos)
@@ -37,6 +40,9 @@ Value & BindingsBuilder::alloc(std::string_view name, PosIdx pos)
 void Bindings::sort()
 {
     std::sort(attrs, attrs + numAttrs);
+    /* Re-derive the dense name mirror from attrs[] in one pass, rather than
+       permuting it in lockstep with the sort. */
+    std::transform(attrs, attrs + numAttrs, namesPtr(), [](const Attr & a) { return a.name; });
 }
 
 Value & Value::mkAttrs(BindingsBuilder & bindings)
