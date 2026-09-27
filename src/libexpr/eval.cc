@@ -2009,7 +2009,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
        not just the absolute one. */
     auto threshold = state.settings.bindingsUpdateLayerRhsSizeThreshold.get();
     bool shouldLayer = threshold != 0 && !bindings1.isLayerListFull()
-                        && (bindings2.size() <= threshold || bindings2.size() < bindings1.size());
+                       && (bindings2.size() <= threshold || bindings2.size() < bindings1.size());
 
     if (shouldLayer) {
         auto attrs = state.buildBindings(bindings2.size());
