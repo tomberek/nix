@@ -108,7 +108,7 @@ PackageInfo::Outputs PackageInfo::queryOutputs(bool withPaths, bool onlyOutputsT
 {
     if (outputs.empty()) {
         /* Get the ‘outputs’ list. */
-        std::optional<Attr> i;
+        const Attr * i;
         if (attrs && (i = attrs->get(state->s.outputs))) {
             state->forceList(*i->value, i->pos, "while evaluating the 'outputs' attribute of a derivation");
 
@@ -143,7 +143,7 @@ PackageInfo::Outputs PackageInfo::queryOutputs(bool withPaths, bool onlyOutputsT
     if (!onlyOutputsToInstall || !attrs)
         return outputs;
 
-    std::optional<Attr> i;
+    const Attr * i;
     if (attrs && (i = attrs->get(state->s.outputSpecified))
         && state->forceBool(*i->value, i->pos, "while evaluating the 'outputSpecified' attribute of a derivation")) {
         Outputs result;
@@ -411,7 +411,7 @@ static void getDerivations(
 
         /* !!! undocumented hackery to support combining channels in
            nix-env.cc. */
-        bool combineChannels = v.attrs()->get(state.symbols.create("_combineChannels")).has_value();
+        bool combineChannels = v.attrs()->get(state.symbols.create("_combineChannels"));
 
         /* Consider the attributes in sorted order to get more
            deterministic behaviour in nix-env operations (e.g. when
@@ -419,29 +419,29 @@ static void getDerivations(
            bound to the attribute with the "lower" name should take
            precedence). */
         for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
-            std::string_view symbol{state.symbols[i.name]};
+            std::string_view symbol{state.symbols[i->name]};
             try {
                 debug("evaluating attribute '%1%'", symbol);
                 if (!isAttrPathComponent(symbol))
                     continue;
                 std::string pathPrefix2 = addToPath(pathPrefix, symbol);
                 if (combineChannels)
-                    getDerivations(state, *i.value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
-                else if (getDerivation(state, *i.value, pathPrefix2, drvs, done, ignoreAssertionFailures)) {
+                    getDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
+                else if (getDerivation(state, *i->value, pathPrefix2, drvs, done, ignoreAssertionFailures)) {
                     /* If the value of this attribute is itself a set,
                     should we recurse into it?  => Only if it has a
                     `recurseForDerivations = true' attribute. */
-                    if (i.value->type() == nAttrs) {
-                        auto j = i.value->attrs()->get(state.s.recurseForDerivations);
+                    if (i->value->type() == nAttrs) {
+                        auto j = i->value->attrs()->get(state.s.recurseForDerivations);
                         if (j
                             && state.forceBool(
                                 *j->value, j->pos, "while evaluating the attribute `recurseForDerivations`"))
                             getDerivations(
-                                state, *i.value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
+                                state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
                     }
                 }
             } catch (Error & e) {
-                e.addTrace(state.positions[i.pos], "while evaluating the attribute '%s'", symbol);
+                e.addTrace(state.positions[i->pos], "while evaluating the attribute '%s'", symbol);
                 throw;
             }
         }

@@ -43,8 +43,8 @@ void printAmbiguous(
         else {
             str << "{ ";
             for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
-                str << state.symbols[i.name] << " = ";
-                printAmbiguous(state, *i.value, str, seen, context, depth + 1);
+                str << state.symbols[i->name] << " = ";
+                printAmbiguous(state, *i->value, str, seen, context, depth + 1);
                 str << "; ";
             }
             str << "}";

@@ -834,7 +834,7 @@ static void prim_genericClosure(EvalState & state, CallSite callSite, Value * co
             throw;
         }
 
-        std::optional<Attr> key;
+        const Attr * key;
         try {
             key = state.getAttr(state.s.key, e->attrs(), "");
         } catch (Error & err) {
@@ -1548,9 +1548,9 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
     outputs.insert("out");
 
     for (auto & i : attrs->lexicographicOrder(state.symbols)) {
-        if (i.name == state.s.ignoreNulls)
+        if (i->name == state.s.ignoreNulls)
             continue;
-        auto key = state.symbols[i.name];
+        auto key = state.symbols[i->name];
         vomit("processing attribute '%1%'", key);
 
         // Like `warn`, but with the position of the attribute and the derivation name as an added trace.
@@ -1558,7 +1558,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             ErrorInfo info{
                 .level = lvlWarn,
                 .msg = std::move(msg),
-                .pos = state.positions[i.pos],
+                .pos = state.positions[i->pos],
             };
             info.traces.push_back(Trace{.hint = HintFmt{"while evaluating derivation '%1%'", drvName}});
             logWarning(info);
@@ -1607,20 +1607,20 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             const std::string_view context_below("");
 
             if (ignoreNulls) {
-                state.forceValue(*i.value, noPos);
-                if (i.value->type() == nNull)
+                state.forceValue(*i->value, noPos);
+                if (i->value->type() == nNull)
                     continue;
             }
 
-            switch (i.name.getId()) {
+            switch (i->name.getId()) {
             case EvalState::s.contentAddressed.getId():
-                if (state.forceBool(*i.value, pos, context_below)) {
+                if (state.forceBool(*i->value, pos, context_below)) {
                     contentAddressed = true;
                     experimentalFeatureSettings.require(Xp::CaDerivations);
                 }
                 break;
             case EvalState::s.impure.getId():
-                if (state.forceBool(*i.value, pos, context_below)) {
+                if (state.forceBool(*i->value, pos, context_below)) {
                     isImpure = true;
                     experimentalFeatureSettings.require(Xp::ImpureDerivations);
                 }
@@ -1628,8 +1628,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             /* The `args' attribute is special: it supplies the
                command-line arguments to the builder. */
             case EvalState::s.args.getId():
-                state.forceList(*i.value, pos, context_below);
-                for (auto elem : i.value->listView()) {
+                state.forceList(*i->value, pos, context_below);
+                for (auto elem : i->value->listView()) {
                     auto s = state
                                  .coerceToString(
                                      pos, *elem, context, "while evaluating an element of the argument list", true)
@@ -1643,32 +1643,32 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
                 if (jsonObject) {
 
-                    if (i.name == state.s.structuredAttrs)
+                    if (i->name == state.s.structuredAttrs)
                         continue;
 
-                    jsonObject->structuredAttrs.emplace(key, printValueAsJSON(state, true, *i.value, pos, context));
+                    jsonObject->structuredAttrs.emplace(key, printValueAsJSON(state, true, *i->value, pos, context));
 
-                    switch (i.name.getId()) {
+                    switch (i->name.getId()) {
                     case EvalState::s.builder.getId():
-                        drv.builder = state.forceString(*i.value, context, pos, context_below);
+                        drv.builder = state.forceString(*i->value, context, pos, context_below);
                         break;
                     case EvalState::s.system.getId():
-                        drv.platform = state.forceStringNoCtx(*i.value, pos, context_below);
+                        drv.platform = state.forceStringNoCtx(*i->value, pos, context_below);
                         break;
                     case EvalState::s.outputHash.getId():
-                        outputHash = state.forceStringNoCtx(*i.value, pos, context_below);
+                        outputHash = state.forceStringNoCtx(*i->value, pos, context_below);
                         break;
                     case EvalState::s.outputHashAlgo.getId():
-                        outputHashAlgo = parseHashAlgoOpt(state.forceStringNoCtx(*i.value, pos, context_below));
+                        outputHashAlgo = parseHashAlgoOpt(state.forceStringNoCtx(*i->value, pos, context_below));
                         break;
                     case EvalState::s.outputHashMode.getId():
-                        handleHashMode(state.forceStringNoCtx(*i.value, pos, context_below));
+                        handleHashMode(state.forceStringNoCtx(*i->value, pos, context_below));
                         break;
                     case EvalState::s.outputs.getId(): {
                         /* Require 'outputs' to be a list of strings. */
-                        state.forceList(*i.value, pos, context_below);
+                        state.forceList(*i->value, pos, context_below);
                         Strings ss;
-                        for (auto elem : i.value->listView())
+                        for (auto elem : i->value->listView())
                             ss.emplace_back(state.forceStringNoCtx(*elem, pos, context_below));
                         handleOutputs(ss);
                         break;
@@ -1679,8 +1679,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                            enabled. */
                         if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
                             break;
-                        state.forceList(*i.value, pos, context_below);
-                        for (auto elem : i.value->listView()) {
+                        state.forceList(*i->value, pos, context_below);
+                        for (auto elem : i->value->listView()) {
                             auto name = state.forceString(*elem, context, pos, context_below);
                             if (name == drvFeatureBuilderRpcV0) {
                                 isSubmittingOutputs = true;
@@ -1693,7 +1693,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                         break;
                     }
 
-                    switch (i.name.getId()) {
+                    switch (i->name.getId()) {
                     case EvalState::s.allowedReferences.getId():
                     case EvalState::s.allowedRequisites.getId():
                     case EvalState::s.disallowedReferences.getId():
@@ -1709,7 +1709,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                     }
 
                 } else {
-                    auto s = state.coerceToString(noPos, *i.value, context, context_below, true).toOwned();
+                    auto s = state.coerceToString(noPos, *i->value, context, context_below, true).toOwned();
 
                     /* Re-interpret the attribute's value as a list of
                        strings.
@@ -1719,13 +1719,13 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                        strings without spaces to begin with. */
                     auto forceStringList = [&] { return tokenizeString<Strings>(s); };
 
-                    if (i.name == state.s.json) {
+                    if (i->name == state.s.json) {
                         warnAttr(HintFmt(
                             "setting structured attributes via '__json' is deprecated, and may be disallowed in future versions of Nix. Set '__structuredAttrs = true' instead."));
                         drv.structuredAttrs = StructuredAttrs::parse(s);
                     } else {
                         drv.env.emplace(key, s);
-                        switch (i.name.getId()) {
+                        switch (i->name.getId()) {
                         case EvalState::s.builder.getId():
                             drv.builder = std::move(s);
                             break;
@@ -1768,7 +1768,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
         } catch (Error & e) {
             e.addTrace(
-                state.positions[i.pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
+                state.positions[i->pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
             throw;
         }
     }
@@ -3162,13 +3162,7 @@ static void prim_attrValues(EvalState & state, CallSite callSite, Value * const 
 
     auto list = state.buildList(args[0]->attrs()->size());
 
-    // Bindings no longer stores a contiguous Attr array we could point into
-    // directly (its iterator synthesizes each Attr on the fly), so copy the
-    // attributes into a locally-owned, stable array first, and (ab)use
-    // pointers into *that* for the sort below.
-    std::vector<Attr> attrs(args[0]->attrs()->begin(), args[0]->attrs()->end());
-
-    for (const auto & [n, i] : enumerate(attrs))
+    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
         list[n] = (Value *) &i;
 
     std::sort(list.begin(), list.end(), [&](Value * v1, Value * v2) {
@@ -3299,7 +3293,7 @@ static void prim_hasAttr(EvalState & state, CallSite callSite, Value * const * a
     auto attr =
         state.forceStringNoCtx(*args[0], noPos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.hasAttr");
-    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)).has_value());
+    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)));
 }
 
 static RegisterPrimOp primop_hasAttr({
@@ -3387,34 +3381,11 @@ static void prim_listToAttrs(EvalState & state, CallSite callSite, Value * const
 {
     state.forceList(*args[0], noPos, "while evaluating the argument passed to builtins.listToAttrs");
 
-    // Step 1. Collect (name, list-slot) pairs into scratch storage and sort by
-    // name, using the list-slot address as a tiebreaker. Since slot addresses
-    // increase monotonically with list position, this makes the sort
-    // effectively stable (first occurrence of a name wins) without paying for
-    // std::stable_sort.
-    //
-    // Bindings no longer supports writing into it before it's sorted (there's
-    // no contiguous, mutable Attr array to (ab)use as scratch), so unlike the
-    // old implementation this uses a separate scratch vector instead of
-    // reusing the result Bindings' own backing storage.
+    // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
     auto listView = args[0]->listView();
     size_t listSize = listView.size();
-
-    struct Entry
-    {
-        Symbol name;
-        PosIdx pos;
-        // Actually a Value * *, i.e. the address of the list slot; stored as
-        // a plain Value * (bit_cast both ways) to sidestep having to spell
-        // out the exact (const-qualified) reference type that enumerate()
-        // hands back for a ListView element.
-        Value * slotBits;
-    };
-    // The address of a ListView element (as yielded by enumerate(listView),
-    // which zips in a reference to the underlying Value * slot).
-    using ElemPtr = Value * const *;
-    std::vector<Entry> entries;
-    entries.reserve(listSize);
+    auto & bindings = *state.mem.allocBindings(listSize);
+    using ElemPtr = decltype(&bindings[0].value);
 
     for (const auto & [n, v2] : enumerate(listView)) {
         state.forceAttrs(*v2, noPos, "while evaluating an element of the list passed to builtins.listToAttrs");
@@ -3425,27 +3396,34 @@ static void prim_listToAttrs(EvalState & state, CallSite callSite, Value * const
             *j->value,
             j->pos,
             "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs");
+        auto sym = state.symbols.create(name);
 
-        entries.push_back({state.symbols.create(name), j->pos, std::bit_cast<Value *>(&v2)});
+        // (ab)use Attr to store a Value * * instead of a Value *, so that we can stabilize the sort using the Value * *
+        bindings[n] = Attr(sym, std::bit_cast<Value *>(&v2));
     }
 
-    std::sort(entries.begin(), entries.end(), [](const Entry & a, const Entry & b) {
-        return a.name < b.name
-               || (a.name == b.name && std::bit_cast<ElemPtr>(a.slotBits) < std::bit_cast<ElemPtr>(b.slotBits));
+    std::sort(&bindings[0], &bindings[listSize], [](const Attr & a, const Attr & b) {
+        // Note that .value is actually a Value * * that corresponds to the position in the list
+        return a < b || (!(a > b) && std::bit_cast<ElemPtr>(a.value) < std::bit_cast<ElemPtr>(b.value));
     });
 
-    // Step 2. Build the result, skipping name-value pairs with duplicate names
-    // (the first, i.e. lowest list index, occurrence of a name wins).
-    auto & bindings = *state.mem.allocBindings(listSize);
+    // Step 2. Unpack the bindings in place and skip name-value pairs with duplicate names
     Symbol prev;
-    for (auto & entry : entries) {
-        if (prev == entry.name)
+    for (size_t n = 0; n < listSize; n++) {
+        auto attr = bindings[n];
+        if (prev == attr.name) {
             continue;
-        Value * v2 = *std::bit_cast<ElemPtr>(entry.slotBits);
+        }
+        // Note that .value is actually a Value * *; see earlier comments
+        Value * v2 = *std::bit_cast<ElemPtr>(attr.value);
 
         auto j = state.getAttr(state.s.value, v2->attrs(), "in a {name=...; value=...;} pair");
-        prev = entry.name;
+        prev = attr.name;
         bindings.push_back({prev, j->value, j->pos});
+    }
+    // help GC and clear end of allocated array
+    for (size_t n = bindings.size(); n < listSize; n++) {
+        bindings[n] = Attr{};
     }
     v.mkAttrs(&bindings);
 }

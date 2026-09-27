@@ -462,7 +462,8 @@ void mainWrapped(int argc, char ** argv)
             evalSettings);
         auto & state = *statePtr;
         auto builtinsJson = nlohmann::json::object();
-        for (auto & builtin : state.getBuiltins().attrs()->lexicographicOrder(state.symbols)) {
+        for (auto & builtinPtr : state.getBuiltins().attrs()->lexicographicOrder(state.symbols)) {
+            auto & builtin = *builtinPtr;
             auto b = nlohmann::json::object();
             if (!builtin.value->isPrimOp())
                 continue;

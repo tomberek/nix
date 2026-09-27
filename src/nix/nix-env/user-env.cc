@@ -145,13 +145,10 @@ bool createUserEnv(
     debug("evaluating user environment builder");
     state.forceValue(topLevel, topLevel.determinePos(noPos));
     NixStringContext context;
-    // NB: copy by value, not `auto &`: get() now returns a synthesized-by-value
-    // std::optional<Attr>, so binding a reference to *optional would dangle
-    // once the temporary optional is destroyed at the end of this statement.
-    auto aDrvPath(*topLevel.attrs()->get(state.s.drvPath));
+    auto & aDrvPath(*topLevel.attrs()->get(state.s.drvPath));
     auto topLevelDrv = state.coerceToStorePath(aDrvPath.pos, *aDrvPath.value, context, "");
     topLevelDrv.requireDerivation();
-    auto aOutPath(*topLevel.attrs()->get(state.s.outPath));
+    auto & aOutPath(*topLevel.attrs()->get(state.s.outPath));
     auto topLevelOut = state.coerceToStorePath(aOutPath.pos, *aOutPath.value, context, "");
 
     /* Realise the resulting store expression. */
