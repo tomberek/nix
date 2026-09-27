@@ -3779,12 +3779,21 @@ static RegisterPrimOp primop_mapAttrs({
 
 static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
-    // we will first count how many values are present for each given key.
-    // we then allocate a single attrset and pre-populate it with lists of
-    // appropriate sizes, stash the pointers to the list elements of each,
-    // and populate the lists. after that we replace the list in the every
-    // attribute with the merge function application. this way we need not
-    // use (slightly slower) temporary storage the GC does not know about.
+    // We need the union of all keys across every input attrset, in sorted
+    // order, plus a per-key value list holding one entry per input that has
+    // that key (in input order). Each input's keys are already available as
+    // a sorted sequence (the dense `names[]` array for an unlayered input,
+    // or Bindings' own iterator -- which does its own layer-priority-aware
+    // merge internally -- for a layered one), so the union can be built by
+    // walking all N inputs' sorted sequences in lockstep (a k-way merge)
+    // instead of funneling every key through a std::map's O(log K)
+    // tree-node allocation and pointer-chasing.
+    //
+    // As before, we do this in two passes: pass 1 sizes each key's value
+    // list, pass 2 fills it. Both passes perform the exact same merge over
+    // the exact same (unmodified) inputs, so they visit keys in identical
+    // order; pass 2 can therefore index straight into pass 1's result by a
+    // running counter, with no per-key lookup at all.
 
     struct Item
     {
@@ -3793,60 +3802,175 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
         std::optional<ListBuilder> list;
     };
 
-    std::map<Symbol, Item, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, Item>>> attrsSeen;
-
     state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.zipAttrsWith");
     state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.zipAttrsWith");
     const auto listItems = args[1]->listView();
 
-    // Only `name` (and, below, `value`) is ever read from each input's
-    // Bindings -- `pos` is never needed. The general iterator synthesizes a
-    // full Attr (touching `pos`/`values` too) on every step, so walk the
-    // dense `names`/`values` arrays directly when an input isn't layered.
-    for (auto & vElem : listItems) {
+    for (auto & vElem : listItems)
         state.forceAttrs(
             *vElem, noPos, "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith");
-        auto & bindings = *vElem->attrs();
-        if (!bindings.isLayered()) {
-            auto dense = bindings.denseView();
-            for (Bindings::size_type n = 0; n < dense.size; ++n)
-                attrsSeen.try_emplace(dense.names[n]).first->second.size++;
-        } else {
-            for (auto & attr : bindings)
-                attrsSeen.try_emplace(attr.name).first->second.size++;
+
+    // A cursor over one input's (name, value) sequence in ascending name
+    // order. Only `name` and `value` are ever read -- `pos` is never
+    // needed. An unlayered input's dense `names`/`values` arrays are walked
+    // directly; a layered input has no such array of its own (its
+    // attributes can live in any layer), so it's walked via Bindings' own
+    // iterator, which already does the correct layer-priority-aware merge
+    // for a single input -- that logic is reused as-is, not reimplemented.
+    // The (large: it embeds a small priority-queue of per-layer sub-cursors)
+    // iterator pair is heap-allocated and only touched for layered inputs,
+    // so a Cursor for the common, unlayered case stays small -- scanning all
+    // N cursors on every merge step (see `findMin` below) stays cache-friendly
+    // even for N in the dozens.
+    struct LayeredState
+    {
+        Bindings::const_iterator it, itEnd;
+    };
+
+    struct Cursor
+    {
+        const Symbol * names = nullptr;
+        Value * const * values = nullptr;
+        Bindings::size_type idx = 0, end = 0;
+        std::unique_ptr<LayeredState> layered;
+
+        explicit Cursor(const Bindings & bindings)
+        {
+            if (bindings.isLayered()) {
+                layered = std::make_unique<LayeredState>(LayeredState{bindings.begin(), bindings.end()});
+            } else {
+                auto dense = bindings.denseView();
+                names = dense.names;
+                values = dense.values;
+                end = dense.size;
+            }
+        }
+
+        bool empty() const noexcept
+        {
+            return layered ? layered->it == layered->itEnd : idx == end;
+        }
+
+        Symbol name() const noexcept
+        {
+            return layered ? layered->it->name : names[idx];
+        }
+
+        Value * value() const noexcept
+        {
+            return layered ? layered->it->value : values[idx];
+        }
+
+        void advance() noexcept
+        {
+            if (layered)
+                ++layered->it;
+            else
+                ++idx;
+        }
+    };
+
+    auto makeCursors = [&] {
+        std::vector<Cursor> cursors;
+        cursors.reserve(listItems.size());
+        for (auto & vElem : listItems)
+            cursors.emplace_back(*vElem->attrs());
+        return cursors;
+    };
+
+    // Finds the index of the cursor currently sitting on the
+    // lexicographically-least name among all non-empty cursors, or
+    // `cursors.size()` if every cursor is exhausted. A linear scan: N is a
+    // handful of input attrsets in practice, so this beats a heap's
+    // bookkeeping.
+    auto findMin = [](const std::vector<Cursor> & cursors) noexcept -> size_t {
+        size_t minIdx = cursors.size();
+        for (size_t i = 0; i < cursors.size(); ++i) {
+            if (cursors[i].empty())
+                continue;
+            if (minIdx == cursors.size() || cursors[i].name() < cursors[minIdx].name())
+                minIdx = i;
+        }
+        return minIdx;
+    };
+
+    size_t totalAttrs = 0;
+    for (auto & vElem : listItems)
+        totalAttrs += vElem->attrs()->size();
+
+    // Pass 1: merge once just to learn the sorted key union and each key's
+    // total count across all inputs. `names`/`sizes` hold plain data (no
+    // GC-traced pointers), so they can grow freely as the merge discovers
+    // keys.
+    std::vector<Symbol> names;
+    std::vector<size_t> sizes;
+    names.reserve(totalAttrs);
+    sizes.reserve(totalAttrs);
+    {
+        auto cursors = makeCursors();
+        for (;;) {
+            auto minIdx = findMin(cursors);
+            if (minIdx == cursors.size())
+                break;
+            auto minName = cursors[minIdx].name();
+            size_t count = 0;
+            for (auto & c : cursors)
+                if (!c.empty() && c.name() == minName) {
+                    ++count;
+                    c.advance();
+                }
+            names.push_back(minName);
+            sizes.push_back(count);
         }
     }
 
-    for (auto & [sym, elem] : attrsSeen)
-        elem.list.emplace(state.buildList(elem.size));
+    // Only now, with the final key count known, do we allocate the
+    // GC-traced storage for the per-key `Value *` lists -- sized exactly
+    // once and never grown afterwards (only default-constructed, then
+    // filled in place via `emplace`/indexing), since `traceable_allocator`
+    // (needed so the GC can see the `Value *`s reachable through
+    // `Item::list`) only implements the pre-C++11, copy-only
+    // `construct(pointer, const T &)` and `Item` (via `ListBuilder`) is
+    // move-only: growing this vector would need to move existing elements
+    // into a new buffer, which that allocator has no valid way to do.
+    std::vector<Item, traceable_allocator<Item>> items(names.size());
+    for (size_t i = 0; i < items.size(); ++i)
+        items[i].list.emplace(state.buildList(sizes[i]));
 
-    for (auto & vElem : listItems) {
-        auto & bindings = *vElem->attrs();
-        if (!bindings.isLayered()) {
-            auto dense = bindings.denseView();
-            for (Bindings::size_type n = 0; n < dense.size; ++n) {
-                auto & item = attrsSeen.at(dense.names[n]);
-                (*item.list)[item.pos++] = dense.values[n];
-            }
-        } else {
-            for (auto & attr : bindings) {
-                auto & item = attrsSeen.at(attr.name);
-                (*item.list)[item.pos++] = attr.value;
-            }
+    // Pass 2: merge again, over the same unmodified inputs, so the exact
+    // same sequence of keys (and, for each key, the exact same set of
+    // inputs, in the same input order) is visited as in pass 1. `unionIdx`
+    // therefore walks `items` in lockstep with the merge, needing no
+    // per-key lookup.
+    {
+        auto cursors = makeCursors();
+        size_t unionIdx = 0;
+        for (;;) {
+            auto minIdx = findMin(cursors);
+            if (minIdx == cursors.size())
+                break;
+            auto minName = cursors[minIdx].name();
+            auto & item = items[unionIdx++];
+            for (auto & c : cursors)
+                if (!c.empty() && c.name() == minName) {
+                    (*item.list)[item.pos++] = c.value();
+                    c.advance();
+                }
         }
     }
 
-    auto attrs = state.buildBindings(attrsSeen.size());
+    auto attrs = state.buildBindings(names.size());
 
-    for (auto & [sym, elem] : attrsSeen) {
-        auto name = Value::toPtr(state.symbols[sym]);
+    for (size_t i = 0; i < names.size(); ++i) {
+        auto & item = items[i];
+        auto name = Value::toPtr(state.symbols[names[i]]);
         auto call1 = state.allocValue();
         call1->mkApp(args[0], name);
         auto call2 = state.allocValue();
         auto arg = state.allocValue();
-        arg->mkList(*elem.list);
+        arg->mkList(*item.list);
         call2->mkApp(call1, arg);
-        attrs.insert(sym, call2);
+        attrs.insert(names[i], call2);
     }
 
     v.mkAttrs(attrs.alreadySorted());
