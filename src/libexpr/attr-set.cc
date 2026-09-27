@@ -19,6 +19,7 @@ Bindings * EvalMemory::allocBindings(size_t capacity)
         throw Error("attribute set of size %d is too big", capacity);
     stats.nrAttrsets++;
     stats.nrAttrsInAttrsets += capacity;
+    stats.attrsetSizeHistogram[sizeHistogramBucket(capacity)]++;
     return new (allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity)) Bindings();
 }
 

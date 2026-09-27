@@ -11,10 +11,13 @@
 #include <functional>
 #include <ranges>
 #include <optional>
+#include <span>
 
 namespace nix {
 
 class EvalMemory;
+class EvalState;
+class Bindings;
 struct Value;
 
 /**
@@ -103,32 +106,55 @@ private:
     /* ponytail: prototype-only "shape sharing" path for builtins.mapAttrs
        (see docs/attrset-range-sharing-design.md, mechanism 1). Entirely
        separate from the baseLayer/numLayers general layering mechanism
-       above -- do not conflate the two. When shapeSharedFlag is set in
-       numLayers:
-         - `shapeBase` points at the *exact start* of another, definitely
-           non-shape-shared Bindings ("the names owner") whose `attrs[]`
-           supplies every name/pos pair for this instance, in the same
-           order. This pointer is always to a real GC allocation's block
-           start (never an interior offset), so Boehm's disabled
-           interior-pointer support (GC_set_all_interior_pointers(0) in
-           eval-gc.cc) is irrelevant here -- exactly like baseLayer.
-         - `attrs[0]` (the FAM below) is reinterpreted as a packed
-           `Value*` array of `numAttrs` entries instead of `Attr` entries
-           -- see shapeValuesArray()/shapeValuesArrayMut(). This is what
-           gets the real allocation savings (8 bytes/slot instead of 16).
-         - `shapeGetScratch` is a per-instance scratch Attr used to hand
-           back a `const Attr *` from get() without materializing a full
-           Attr array. Safe because nothing in this codebase holds two
-           `get()` results from the *same* Bindings instance
-           simultaneously (verified by inspection of all call sites at
-           implementation time); a fresh call overwrites it. */
-    const Bindings * shapeBase = nullptr;
-    mutable Attr shapeGetScratch;
+       above -- do not conflate the two.
+
+       First cut stored `shapeBase`/a scratch `Attr` as direct members of
+       `Bindings` -- that grew *every* Bindings (24 -> 48 bytes), including
+       the ~90-98% of real-world attrsets that never touch mapAttrs, and
+       measured as a net memory *regression* on real nixpkgs/NixOS eval
+       despite winning its own synthetic benchmark. Fixed by not adding
+       any member to the class at all: for a shape-shared instance (only,
+       flagged via shapeSharedFlag below), the leading bytes of the FAM
+       region are repurposed as a `ShapeShareInfo` header, and the actual
+       packed `Value*[numAttrs]` array starts right after it -- see
+       shapeInfo()/shapeValuesArray()/shapeValuesArrayMut(). A plain
+       Bindings never allocates that header, so sizeof(Bindings) stays at
+       its original 24 bytes for every instance; only shape-shared
+       instances' own single allocation is bigger (by sizeof(ShapeShareInfo)),
+       which they can afford since they're the ones saving 8 bytes/slot. */
+    struct ShapeShareInfo
+    {
+        /**
+         * The *exact start* of another, definitely non-shape-shared
+         * Bindings ("the names owner") whose `attrs[]` supplies every
+         * name/pos pair for this instance, in the same order. Always a
+         * real GC allocation's block start (never an interior offset),
+         * so Boehm's disabled interior-pointer support
+         * (GC_set_all_interior_pointers(0) in eval-gc.cc) is irrelevant
+         * here -- exactly like baseLayer.
+         */
+        const Bindings * shapeBase;
+
+        /**
+         * Per-instance scratch Attr used to hand back a `const Attr *`
+         * from get() without materializing a full Attr array. Safe
+         * because nothing in this codebase holds two `get()` results
+         * from the *same* Bindings instance simultaneously (verified by
+         * inspection of all call sites at implementation time); a fresh
+         * call overwrites it.
+         */
+        mutable Attr scratch;
+    };
+
+    ShapeShareInfo & shapeInfo() const noexcept
+    {
+        return *const_cast<ShapeShareInfo *>(reinterpret_cast<const ShapeShareInfo *>(attrs));
+    }
 
     /**
      * Flexible array member of attributes (or, for shape-shared
-     * instances, a packed `Value*[numAttrs]` array -- see shapeBase
-     * above).
+     * instances, a `ShapeShareInfo` header followed by a packed
+     * `Value*[numAttrs]` array -- see shapeInfo() above).
      */
     Attr attrs[0];
 
@@ -156,6 +182,16 @@ private:
      */
     static constexpr uint32_t shapeSharedFlag = 0x8000'0000u;
 
+    /**
+     * The real layer count, with the discriminant bit masked off.
+     * Needed because `layerOnTopOf` and `isLayered()`/`isLayerListFull()`
+     * need the count without the flag.
+     */
+    uint32_t rawNumLayers() const noexcept
+    {
+        return numLayers & ~shapeSharedFlag;
+    }
+
 public:
     bool isShapeShared() const noexcept
     {
@@ -168,12 +204,12 @@ public:
      */
     Value * const * shapeValuesArray() const noexcept
     {
-        return reinterpret_cast<Value * const *>(attrs);
+        return reinterpret_cast<Value * const *>(reinterpret_cast<const char *>(attrs) + sizeof(ShapeShareInfo));
     }
 
     Value ** shapeValuesArrayMut() noexcept
     {
-        return reinterpret_cast<Value **>(attrs);
+        return reinterpret_cast<Value **>(reinterpret_cast<char *>(attrs) + sizeof(ShapeShareInfo));
     }
 
     size_type size() const
@@ -339,11 +375,11 @@ public:
         }
 
         explicit iterator(const Bindings & attrs) noexcept
-            : doMerge(!attrs.isShapeShared() && attrs.baseLayer)
+            : doMerge(!attrs.isShapeShared() && attrs.baseLayer != nullptr)
         {
             if (attrs.isShapeShared()) {
                 shapeMode = true;
-                auto owner = attrs.shapeBase;
+                auto owner = attrs.shapeInfo().shapeBase;
                 shapeNamesCur = owner->attrs;
                 shapeNamesEnd = owner->attrs + owner->numAttrs;
                 shapeValuesCur = attrs.shapeValuesArray();
@@ -460,15 +496,16 @@ public:
     {
         auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
             if (chunk.isShapeShared()) {
-                auto owner = chunk.shapeBase;
+                auto owner = chunk.shapeInfo().shapeBase;
                 auto first = owner->attrs;
                 auto last = first + owner->numAttrs;
                 const Attr * i = std::lower_bound(first, last, key);
                 if (i == last || i->name != key.name)
                     return nullptr;
                 auto idx = static_cast<size_t>(i - first);
-                chunk.shapeGetScratch = Attr(i->name, chunk.shapeValuesArray()[idx], i->pos);
-                return &chunk.shapeGetScratch;
+                auto & scratch = chunk.shapeInfo().scratch;
+                scratch = Attr(i->name, chunk.shapeValuesArray()[idx], i->pos);
+                return &scratch;
             }
             auto first = chunk.attrs;
             auto last = first + chunk.numAttrs;
@@ -508,7 +545,7 @@ public:
            general k-way merge/get() traversal above cannot safely read
            (it's a packed Value* array, not a real Attr array). Keeps
            `//` itself completely unmodified per the prototype's scope. */
-        return isShapeShared() || numLayers == Bindings::maxLayers;
+        return isShapeShared() || rawNumLayers() == Bindings::maxLayers;
     }
 
     /**
@@ -516,7 +553,7 @@ public:
      */
     bool isLayered() const noexcept
     {
-        return !isShapeShared() && numLayers > 1;
+        return !isShapeShared() && rawNumLayers() > 1;
     }
 
     const_iterator begin() const
@@ -683,7 +720,11 @@ public:
     void layerOnTopOf(const Bindings & base) noexcept
     {
         bindings->baseLayer = &base;
-        bindings->numLayers = base.numLayers + 1;
+        /* Mask off the discriminant bit before incrementing: a
+           (hypothetically) shape-shared `base` must not make this wrapper
+           look shape-shared too -- it isn't, it's a plain flat/layered
+           node whose baseLayer happens to be one of those. */
+        bindings->numLayers = base.rawNumLayers() + 1;
     }
 
     Value & alloc(Symbol name, PosIdx pos = noPos);

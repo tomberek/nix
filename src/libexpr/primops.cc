@@ -3160,18 +3160,22 @@ static void prim_attrValues(EvalState & state, CallSite callSite, Value * const 
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.attrValues");
 
+    /* ponytail: temporary measurement instrumentation, see
+       EvalMemory::Statistics::nrAttrValuesOnShapeShared. */
+    if (args[0]->attrs()->isShapeShared())
+        state.mem.noteAttrValuesOnShapeSharedArg(args[0]->attrs()->size());
+
     auto list = state.buildList(args[0]->attrs()->size());
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
-        list[n] = (Value *) &i;
-
-    std::sort(list.begin(), list.end(), [&](Value * v1, Value * v2) {
-        std::string_view s1 = state.symbols[((Attr *) v1)->name], s2 = state.symbols[((Attr *) v2)->name];
-        return s1 < s2;
-    });
-
-    for (auto & v : list)
-        v = ((Attr *) v)->value;
+    /* ponytail: was a hand-rolled sort that took the *address* of the
+       range-for reference into `Bindings::attrs()` and dereferenced it
+       later -- safe for a normal Bindings (stable Attr[] storage), but a
+       dangling-pointer bug for a shape-shared Bindings, whose iterator
+       synthesizes each Attr into a single reused scratch slot. Delegate
+       to `lexicographicOrder()`, which already handles this by
+       collecting by value instead of by pointer. */
+    for (const auto & [n, i] : enumerate(args[0]->attrs()->lexicographicOrder(state.symbols)))
+        list[n] = i.value;
 
     v.mkList(list);
 }
@@ -3372,6 +3376,23 @@ static RegisterPrimOp primop_removeAttrs({
     .impl = prim_removeAttrs,
 });
 
+/* ponytail: temporary measurement instrumentation. Peeks at a value's
+   thunk *before* forcing it to see whether it's syntactically an
+   unevaluated call to a builtin named `name` with `nargs` arguments (e.g.
+   `map f list` is a 2-arg call to `map`). Purely syntactic -- matches the
+   callee identifier's name, doesn't verify it isn't shadowed -- fine for
+   sizing a potential fusion, not a safety check. */
+static bool isUnevaluatedCallTo(SymbolTable & symbols, Value * val, std::string_view name, size_t nargs)
+{
+    if (!val->isThunk())
+        return false;
+    auto * call = dynamic_cast<ExprCall *>(val->thunk().expr);
+    if (!call || !call->args || call->args->size() != nargs)
+        return false;
+    auto * var = dynamic_cast<ExprVar *>(call->fun);
+    return var && symbols[var->name] == name;
+}
+
 /* Builds a set from a list specifying (name, value) pairs.  To be
    precise, a list [{name = "name1"; value = value1;} ... {name =
    "nameN"; value = valueN;}] is transformed to {name1 = value1;
@@ -3379,7 +3400,14 @@ static RegisterPrimOp primop_removeAttrs({
    name, the first takes precedence. */
 static void prim_listToAttrs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
+    /* ponytail: temporary measurement instrumentation, see
+       EvalMemory::Statistics::nrListToAttrsOnMapArg. */
+    state.mem.noteListToAttrsCall();
+    bool onMapArg = isUnevaluatedCallTo(state.symbols, args[0], "map", 2);
+
     state.forceList(*args[0], noPos, "while evaluating the argument passed to builtins.listToAttrs");
+    if (onMapArg)
+        state.mem.noteListToAttrsOnMapArg(args[0]->listView().size());
 
     // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
     auto listView = args[0]->listView();
@@ -3636,23 +3664,45 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto n = args[1]->attrs()->size();
-    auto * shared = state.mem.allocShapeSharedBindings(args[1]->attrs(), n);
+    auto inputAttrs = args[1]->attrs();
+    auto n = inputAttrs->size();
 
-    if (n > 0) {
+    /* ponytail: allocShapeSharedBindings's `shapeBase` indexes names/pos
+       via the owner's own *local* `attrs`/`numAttrs` (see
+       Bindings::get()'s shape-shared branch in attr-set.hh), which only
+       covers that owner's top layer -- not the full k-way-merged view a
+       layered Bindings (numLayers > 1, from `//`) presents via its
+       general iterator. `n` here is the *merged* size, so for a layered
+       input the value array size and the name/pos lookup space disagree:
+       silently drops lower-layer keys and misaligns index-based lookups
+       (observed as a crash and as `mapAttrs` losing keys). Fall back to
+       the original full-copy behavior for that case; only take the
+       shape-sharing fast path when the input is a single flat,
+       unlayered layer. */
+    if (n > 0 && !inputAttrs->isLayered()) {
+        auto * shared = state.mem.allocShapeSharedBindings(inputAttrs, n);
         auto values = shared->shapeValuesArrayMut();
         size_t idx = 0;
-        for (auto & i : *args[1]->attrs()) {
+        for (auto & i : *inputAttrs) {
             Value * vName = Value::toPtr(state.symbols[i.name]);
             Value * vFun2 = state.allocValue();
             vFun2->mkApp(args[0], vName);
-            Value * vAppResult = state.allocValue();
-            vAppResult->mkApp(vFun2, i.value);
-            values[idx++] = vAppResult;
+            Value * vCall = state.allocValue();
+            vCall->mkApp(vFun2, i.value);
+            values[idx++] = vCall;
         }
+        v.mkAttrs(shared);
+        return;
     }
 
-    v.mkAttrs(shared);
+    auto attrs = state.buildBindings(n);
+    for (auto & i : *inputAttrs) {
+        Value * vName = Value::toPtr(state.symbols[i.name]);
+        Value * vFun2 = state.allocValue();
+        vFun2->mkApp(args[0], vName);
+        attrs.alloc(i.name).mkApp(vFun2, i.value);
+    }
+    v.mkAttrs(attrs.alreadySorted());
 }
 
 static RegisterPrimOp primop_mapAttrs({
@@ -3865,7 +3915,13 @@ static RegisterPrimOp primop_tail({
 /* Apply a function to every element of a list. */
 static void prim_map(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
+    /* ponytail: temporary measurement instrumentation, see
+       EvalMemory::Statistics::nrMapOnAttrValuesArg. */
+    bool onAttrValuesArg = isUnevaluatedCallTo(state.symbols, args[1], "attrValues", 1);
+
     state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.map");
+    if (onAttrValuesArg)
+        state.mem.noteMapOnAttrValuesArg(args[1]->listSize());
 
     if (args[1]->listSize() == 0) {
         v = *args[1];
@@ -3953,8 +4009,14 @@ static RegisterPrimOp primop_filter({
 /* Return true if a list contains a given element. */
 static void prim_elem(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
+    /* ponytail: temporary measurement instrumentation, see
+       EvalMemory::Statistics::nrElemOnAttrNamesArg. */
+    bool onAttrNamesArg = isUnevaluatedCallTo(state.symbols, args[1], "attrNames", 1);
+
     bool res = false;
     state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.elem");
+    if (onAttrNamesArg)
+        state.mem.noteElemOnAttrNamesArg(args[1]->listSize());
     for (auto elem : args[1]->listView())
         if (state.eqValues(
                 *args[0], *elem, noPos, "while searching for the presence of the given element in the list")) {
@@ -3995,6 +4057,12 @@ static RegisterPrimOp primop_concatLists({
 /* Return the length of a list.  This is an O(1) time operation. */
 static void prim_length(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
+    /* ponytail: temporary measurement instrumentation, see
+       EvalMemory::Statistics::nrLengthOnAttrNamesOrValuesArg. */
+    if (isUnevaluatedCallTo(state.symbols, args[0], "attrNames", 1)
+        || isUnevaluatedCallTo(state.symbols, args[0], "attrValues", 1))
+        state.mem.noteLengthOnAttrNamesOrValuesArg();
+
     state.forceList(*args[0], noPos, "while evaluating the first argument passed to builtins.length");
     v.mkInt(args[0]->listSize());
 }

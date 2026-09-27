@@ -365,6 +365,7 @@ TEST_F(LibExprTest, mapAttrsShapeSharingSurvivesGC)
        GC behavior, not something this prototype's shape-sharing changes
        could or should try to work around. */
 }
+
 #endif
 
 } // namespace nix

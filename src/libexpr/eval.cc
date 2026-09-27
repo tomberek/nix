@@ -46,7 +46,6 @@
 #include <mutex>
 
 #include <nlohmann/json.hpp>
-#include <boost/container/small_vector.hpp>
 #include <boost/unordered/concurrent_flat_map.hpp>
 
 #include "nix/util/strings-inline.hh"
@@ -3141,7 +3140,29 @@ void EvalState::printStatistics()
         {"shapeSharedNumber", memstats.nrShapeSharedAttrsets.load()},
         {"shapeSharedValues", memstats.nrShapeSharedValues.load()},
         {"shapeSharedBytes", bShapeShared},
+        {"attrValuesOnShapeShared", memstats.nrAttrValuesOnShapeShared.load()},
+        {"attrValuesOnShapeSharedElements", memstats.nrAttrValuesOnShapeSharedElements.load()},
+        {"listToAttrsCalls", memstats.nrListToAttrsCalls.load()},
+        {"listToAttrsOnMapArg", memstats.nrListToAttrsOnMapArg.load()},
+        {"listToAttrsOnMapArgElements", memstats.nrListToAttrsOnMapArgElements.load()},
+        {"mapOnAttrValuesArg", memstats.nrMapOnAttrValuesArg.load()},
+        {"mapOnAttrValuesArgElements", memstats.nrMapOnAttrValuesArgElements.load()},
+        {"lengthOnAttrNamesOrValuesArg", memstats.nrLengthOnAttrNamesOrValuesArg.load()},
+        {"elemOnAttrNamesArg", memstats.nrElemOnAttrNamesArg.load()},
+        {"elemOnAttrNamesArgElements", memstats.nrElemOnAttrNamesArgElements.load()},
     };
+    {
+        auto & h = topObj["sizeHistograms"];
+        h = json::object();
+        json attrsetHist = json::array(), listHist = json::array();
+        for (size_t i = 0; i < sizeHistogramBuckets; i++) {
+            attrsetHist.push_back(memstats.attrsetSizeHistogram[i].load());
+            listHist.push_back(memstats.listSizeHistogram[i].load());
+        }
+        h["buckets"] = {"0", "1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65-128", "129-256", "257-512", "513+"};
+        h["attrsets"] = attrsetHist;
+        h["lists"] = listHist;
+    }
     topObj["sizes"] = {
         {"Env", sizeof(Env)},
         {"Value", sizeof(Value)},
