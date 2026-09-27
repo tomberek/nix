@@ -25,11 +25,11 @@ struct AttrSetGetTest : LibExprTest
 
 namespace {
 // A handful of sizes chosen to straddle the SIMD-linear-scan / binary-search
-// crossover (see Bindings::simdLinearScanMaxSize == 256) from both sides,
+// crossover (see Bindings::simdLinearScanMaxSize == 320) from both sides,
 // plus the usual small-N edge cases.
 const std::vector<size_t> testSizes = {
     0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 100, 200,
-    255, 256, 257, 300, 500, 1000, 4096,
+    256, 319, 320, 321, 500, 1000, 4096,
 };
 } // namespace
 
@@ -91,7 +91,7 @@ TEST_F(AttrSetGetTest, presentAndAbsentKeysAtManySizes)
 TEST_F(AttrSetGetTest, layeredChainFindsRightLayerAndOverride)
 {
     // Base layer: sizes straddling the crossover.
-    for (size_t baseSize : {size_t{0}, size_t{3}, size_t{16}, size_t{300}}) {
+    for (size_t baseSize : {size_t{0}, size_t{3}, size_t{16}, size_t{400}}) {
         for (size_t topSize : {size_t{0}, size_t{2}, size_t{20}}) {
             std::mt19937 rng(baseSize * 10000 + topSize);
 

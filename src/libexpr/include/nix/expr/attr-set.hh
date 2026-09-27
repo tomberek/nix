@@ -543,9 +543,20 @@ private:
      * scan comparing 4 `Symbol` (uint32) lanes at once via SSE2 trades
      * O(log n) mispredicted branches for O(n/4) branch-light SIMD compares,
      * which wins for small n despite the worse asymptotic complexity.
-     * Measured empirically (see task notes) to win up to ~300-500 entries,
-     * with a noisy crossover after that; `simdLinearScanMaxSize` is kept
-     * well under the crossover for margin.
+     *
+     * The crossover is asymmetric and workload-mix-dependent: measured with
+     * a standalone benchmark (matching this TU's release compile flags,
+     * many independent attrset instances + a long non-repeating query
+     * stream, to avoid artificially teaching the branch predictor one
+     * fixed array -- see task notes) present-key lookups keep favoring the
+     * SIMD scan out past 500 entries (~-13% to -30% vs. binary search),
+     * while absent-key lookups are roughly a wash from ~210-260 entries
+     * and a clear, growing loss for the SIMD scan from ~270 on (+5% at
+     * 270, +15% by 320, +30%+ by 450). Under a conservative 50/50
+     * present/absent weighting, the blended win/loss crossover lands
+     * around ~350-360; `simdLinearScanMaxSize` is kept comfortably under
+     * that for margin (and real workloads, which are usually
+     * present-lookup-dominated, have even more headroom than this).
      */
     static std::optional<size_type> simdFindIndex(const Symbol * first, size_type n, Symbol name) noexcept
     {
@@ -564,7 +575,7 @@ private:
         return std::nullopt;
     }
 
-    static constexpr size_type simdLinearScanMaxSize = 256;
+    static constexpr size_type simdLinearScanMaxSize = 320;
 #endif
 
     /**
