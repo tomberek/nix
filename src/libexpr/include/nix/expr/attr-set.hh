@@ -132,6 +132,12 @@ private:
     static constexpr unsigned maxLayers = 16;
 
     /**
+     * Below this many attrs, Bindings::get uses a linear scan instead of
+     * binary search -- see its doc comment.
+     */
+    static constexpr size_type linearScanThreshold = 8;
+
+    /**
      * Lazily compute and memoize numAttrsInChain for a layered Bindings --
      * see its doc comment. Only ever called from @ref size / @ref empty,
      * on demand.
@@ -418,6 +424,20 @@ public:
         auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
             auto first = chunk.attrs;
             auto last = first + chunk.numAttrs;
+            /* Most Bindings are tiny (the overwhelming majority have <=4 attrs
+               in practice). A sorted linear scan with early-exit beats
+               std::lower_bound's pointer-jumping at this size -- sequential
+               access, no midpoint arithmetic, and it still stops as soon as
+               it passes where the key would sort. */
+            if (chunk.numAttrs <= linearScanThreshold) {
+                for (const Attr * i = first; i != last; ++i) {
+                    if (i->name == key.name)
+                        return i;
+                    if (key.name < i->name)
+                        return nullptr;
+                }
+                return nullptr;
+            }
             const Attr * i = std::lower_bound(first, last, key);
             if (i != last && i->name == key.name)
                 return i;
