@@ -13,10 +13,6 @@
 #include <ranges>
 #include <optional>
 
-#if defined(__x86_64__) && defined(__SSE2__)
-#  include <emmintrin.h>
-#endif
-
 namespace nix {
 
 class EvalMemory;
@@ -531,76 +527,6 @@ public:
         numAttrsInChain = numAttrs;
     }
 
-private:
-#if defined(__x86_64__) && defined(__SSE2__)
-    /**
-     * Branch-light SIMD linear scan over `first[0..n)`, used by findIndex()
-     * for small-to-medium chunks in place of binary search.
-     *
-     * Binary search's data-dependent, sequentially-dependent comparisons
-     * don't predict well (each step's branch outcome depends on the
-     * previous one, so the CPU can't speculate ahead reliably). A linear
-     * scan comparing 4 `Symbol` (uint32) lanes at once via SSE2 trades
-     * O(log n) mispredicted branches for O(n/4) branch-light SIMD compares,
-     * which wins for small n despite the worse asymptotic complexity.
-     *
-     * The crossover is asymmetric and workload-mix-dependent: measured with
-     * a standalone benchmark (matching this TU's release compile flags,
-     * many independent attrset instances + a long non-repeating query
-     * stream, to avoid artificially teaching the branch predictor one
-     * fixed array -- see task notes) present-key lookups keep favoring the
-     * SIMD scan out past 500 entries (~-13% to -30% vs. binary search),
-     * while absent-key lookups are roughly a wash from ~210-260 entries
-     * and a clear, growing loss for the SIMD scan from ~270 on (+5% at
-     * 270, +15% by 320, +30%+ by 450). Under a conservative 50/50
-     * present/absent weighting, the blended win/loss crossover lands
-     * around ~350-360; `simdLinearScanMaxSize` is kept comfortably under
-     * that for margin (and real workloads, which are usually
-     * present-lookup-dominated, have even more headroom than this).
-     */
-    static std::optional<size_type> simdFindIndex(const Symbol * first, size_type n, Symbol name) noexcept
-    {
-        const __m128i key = _mm_set1_epi32(static_cast<int>(name.getId()));
-        size_type i = 0;
-        for (; i + 4 <= n; i += 4) {
-            __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i *>(first + i));
-            __m128i cmp = _mm_cmpeq_epi32(key, data);
-            int mask = _mm_movemask_ps(_mm_castsi128_ps(cmp));
-            if (mask)
-                return i + static_cast<size_type>(__builtin_ctz(static_cast<unsigned>(mask)));
-        }
-        for (; i < n; ++i)
-            if (first[i] == name)
-                return i;
-        return std::nullopt;
-    }
-
-    static constexpr size_type simdLinearScanMaxSize = 320;
-#endif
-
-    /**
-     * Find the index of `name` within the first `n` entries of a single
-     * (unlayered) chunk's dense, sorted `names` array, or std::nullopt if
-     * absent. Dispatches to a SIMD linear scan for small-to-medium chunks
-     * (see simdFindIndex()) and falls back to (scalar) binary search
-     * otherwise -- either because the chunk is large enough that binary
-     * search's better asymptotics win out, or because this isn't an
-     * x86_64/SSE2 target, in which case binary search is used
-     * unconditionally.
-     */
-    static std::optional<size_type> findIndex(const Symbol * first, size_type n, Symbol name) noexcept
-    {
-#if defined(__x86_64__) && defined(__SSE2__)
-        if (n <= simdLinearScanMaxSize)
-            return simdFindIndex(first, n, name);
-#endif
-        auto last = first + n;
-        auto i = std::lower_bound(first, last, name);
-        if (i != last && *i == name)
-            return static_cast<size_type>(i - first);
-        return std::nullopt;
-    }
-
 public:
     /**
      * Get attribute by name, or std::nullopt if no such attribute exists.
@@ -609,24 +535,55 @@ public:
      * to point into anymore), but supports the usual
      * `if (auto attr = bindings->get(name)) { ...attr->value...; }`
      * pointer-like usage via std::optional's own operator-> / operator*.
+     *
+     * Defined out-of-line in attr-set.cc (unlike the rest of this small,
+     * hot class) rather than in-class/implicitly inline. Two reasons, both
+     * load-bearing:
+     *
+     * - `get()` is called from ~44 sites across libexpr; profiling of the
+     *   *unmodified* function already shows it is never actually inlined
+     *   into any of them even as an ordinary inline function (LTO's
+     *   inline-unit-growth budget is exhausted by the call count long
+     *   before it would prioritize duplicating this ~450-byte function),
+     *   so moving the definition out-of-line costs nothing that wasn't
+     *   already true.
+     *
+     * - `get()` carries `__attribute__((target_clones("avx2","default")))`
+     *   (@see attr-set.cc) to let its AVX2 comparison path be fully
+     *   inlined *within* the "avx2" clone specifically (verified via
+     *   -fopt-info-inline), rather than living behind a separate
+     *   target("avx2")-attributed leaf function called from a single,
+     *   non-multiversioned get() -- the structure a prior attempt used
+     *   (see git history), which lost more from blocking that call's
+     *   inlining than it gained from the wider SIMD compare. Empirically
+     *   (small standalone repro, not just theory -- see task notes),
+     *   `target_clones` on a function still *defined inline in a header*
+     *   and included from multiple translation units fails to deduplicate
+     *   across those TUs under LTO: each TU keeps its own private
+     *   (`.lto_priv.N`) copy of the whole clone set (resolver + both
+     *   clones) instead of the usual single merged COMDAT instance --
+     *   real, measured code bloat, reproduced even with `-flto=1` (a
+     *   single LTO partition, ruling out WHOPR partitioning as the
+     *   cause). Giving `get()` a single, ordinary (non-vague-linkage)
+     *   out-of-line definition sidesteps that entirely: there is only
+     *   ever one definition to clone in the first place.
      */
-    std::optional<Attr> get(Symbol name) const noexcept
-    {
-        auto getInChunk = [name](const Bindings & chunk) -> std::optional<Attr> {
-            if (auto idx = findIndex(chunk.namesPtr(), chunk.numAttrs, name))
-                return Attr(chunk.namesPtr()[*idx], chunk.valuesPtr()[*idx], chunk.posPtr()[*idx]);
-            return std::nullopt;
-        };
+    std::optional<Attr> get(Symbol name) const noexcept;
 
-        const Bindings * currentChunk = this;
-        while (currentChunk) {
-            if (auto attr = getInChunk(*currentChunk))
-                return attr;
-            currentChunk = currentChunk->baseLayer;
-        }
-
-        return std::nullopt;
-    }
+    /**
+     * Test-only hook: force get()'s internal AVX2-vs-SSE2 dispatch decision
+     * (@see attr-set.cc), independent of what the CPU actually running the
+     * tests supports. `std::nullopt` restores real runtime detection.
+     *
+     * This does *not* -- and cannot -- force which of get()'s two
+     * target_clones (ifunc-resolved at process load time, once, before
+     * main()) is called; it only overrides a secondary runtime check
+     * *inside* whichever clone was actually resolved, letting tests
+     * exercise the SSE2/scalar fallback logic on AVX2-capable test
+     * hardware. Not for production use. A no-op on non-x86_64/SSE2
+     * targets (there is no dispatch to override there).
+     */
+    static void setAvx2OverrideForTesting(std::optional<bool> avx2IsAvailable) noexcept;
 
     /**
      * Test whether an attribute by this name exists anywhere in the layer
