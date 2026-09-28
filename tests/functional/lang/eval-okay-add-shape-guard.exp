@@ -1,0 +1,1 @@
+{ eq1 = true; eq2 = true; eq3 = true; eq4 = true; eq5 = true; mappedTypes = [ "int" "float" "float" "string" "int" ]; mappedValues = true; seq1types = [ "int" "float" "int" ]; seq1values = true; seq2types = [ "float" "int" "float" ]; seq2values = true; seq3types = [ "int" "string" "int" ]; seq3values = true; seq4types = [ "path" "int" "path" ]; seq4values = true; }

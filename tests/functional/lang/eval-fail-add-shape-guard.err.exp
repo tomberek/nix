@@ -1,0 +1,30 @@
+error:
+       … while calling the 'deepSeq' builtin
+         at /pwd/lang/eval-fail-add-shape-guard.nix:8:3:
+            7| in
+            8|   builtins.deepSeq results results
+             |   ^
+            9|
+
+       … while evaluating list element at index 2
+
+       … from call site
+         at /pwd/lang/eval-fail-add-shape-guard.nix:6:18:
+            5|   # normal cascade and throw the usual type error -- not misuse the stale int/int fast path.
+            6|   results = map (x: 1 + x) [ 1 2 "foo" ];
+             |                  ^
+            7| in
+
+       … while calling anonymous lambda
+         at /pwd/lang/eval-fail-add-shape-guard.nix:6:18:
+            5|   # normal cascade and throw the usual type error -- not misuse the stale int/int fast path.
+            6|   results = map (x: 1 + x) [ 1 2 "foo" ];
+             |                  ^
+            7| in
+
+       error: cannot add a string to an integer
+       at /pwd/lang/eval-fail-add-shape-guard.nix:6:25:
+            5|   # normal cascade and throw the usual type error -- not misuse the stale int/int fast path.
+            6|   results = map (x: 1 + x) [ 1 2 "foo" ];
+             |                         ^
+            7| in
