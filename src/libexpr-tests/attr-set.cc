@@ -12,69 +12,29 @@ namespace nix {
  * Correctness check for Bindings::get()'s per-chunk search primitive
  * (SIMD linear scan for small/medium chunks, scalar binary search for
  * large ones and non-x86_64/SSE2 targets -- see findIndex() in
- * attr-set.cc). Builds attrsets of many sizes (straddling both the
- * SSE2/binary-search and AVX2/binary-search crossovers in both directions)
- * with randomized attribute names, and checks Bindings::get() against a
- * plain reference: every inserted name must resolve to its own value, and
- * names never inserted must be absent. Also covers layered (`//`-merged)
- * chains, which walk multiple chunks and must still find/skip the right
- * per-chunk entries.
- *
- * Every case runs under each of `avx2Overrides` (@see
- * Bindings::setAvx2OverrideForTesting): this forces get()'s *internal*
- * AVX2-vs-SSE2/scalar branch regardless of which choice would otherwise be
- * made, exercising the SSE2 and scalar-binary-search logic even on this
- * (AVX2-capable) test machine, where an un-overridden run would only ever
- * take the AVX2 branch. Note this does *not* -- and cannot -- force which
- * of get()'s two `target_clones` ifunc clones actually runs (that is
- * resolved once, before main(), based on real CPU features); it only
- * re-exercises the alternate logical branch from within whichever clone
- * the loader picked. On this AVX2-capable test machine that means the
- * literal "default" clone's own compiled code is never directly exercised
- * by these tests -- a known gap, noted in the task report.
+ * attr-set.hh). Builds attrsets of many sizes (straddling the SIMD/binary
+ * search crossover in both directions) with randomized attribute names,
+ * and checks Bindings::get() against a plain reference: every inserted
+ * name must resolve to its own value, and names never inserted must be
+ * absent. Also covers layered (`//`-merged) chains, which walk multiple
+ * chunks and must still find/skip the right per-chunk entries.
  */
 struct AttrSetGetTest : LibExprTest
 {
 };
 
 namespace {
-// A handful of sizes chosen to straddle the SSE2-linear-scan / binary-search
-// crossover (Bindings::simdLinearScanMaxSize == 320) and the
-// AVX2-linear-scan / binary-search crossover (avx2LinearScanMaxSize == 640)
-// from both sides, plus the usual small-N edge cases.
+// A handful of sizes chosen to straddle the SIMD-linear-scan / binary-search
+// crossover (see Bindings::simdLinearScanMaxSize == 320) from both sides,
+// plus the usual small-N edge cases.
 const std::vector<size_t> testSizes = {
-    0,   1,   2,   3,   4,   5,   7,   8,   9,   15,  16,  17,  31,
-    32,  33,  63,  64,  100, 200, 256, 319, 320, 321, 500, 639, 640,
-    641, 700, 900, 1000, 4096,
+    0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 100, 200,
+    256, 319, 320, 321, 500, 1000, 4096,
 };
-
-/**
- * RAII guard that forces Bindings::get()'s internal AVX2 dispatch decision
- * for the duration of a scope, restoring real detection on destruction.
- */
-struct Avx2OverrideGuard
-{
-    explicit Avx2OverrideGuard(std::optional<bool> avx2IsAvailable)
-    {
-        Bindings::setAvx2OverrideForTesting(avx2IsAvailable);
-    }
-
-    ~Avx2OverrideGuard()
-    {
-        Bindings::setAvx2OverrideForTesting(std::nullopt);
-    }
-};
-
-// std::nullopt: real (un-overridden) detection. false/true: forced, to
-// exercise both logical branches regardless of what this test machine
-// actually supports (@see Avx2OverrideGuard / Bindings::setAvx2OverrideForTesting).
-const std::vector<std::optional<bool>> avx2Overrides = {std::nullopt, false, true};
 } // namespace
 
 TEST_F(AttrSetGetTest, presentAndAbsentKeysAtManySizes)
 {
-    for (auto avx2Override : avx2Overrides) {
-    Avx2OverrideGuard guard(avx2Override);
     for (size_t size : testSizes) {
         for (unsigned seed = 0; seed < 5; ++seed) {
             std::mt19937 rng(size * 1000 + seed);
@@ -126,13 +86,10 @@ TEST_F(AttrSetGetTest, presentAndAbsentKeysAtManySizes)
             EXPECT_FALSE(bindings->get(neverUsed).has_value());
         }
     }
-    }
 }
 
 TEST_F(AttrSetGetTest, layeredChainFindsRightLayerAndOverride)
 {
-    for (auto avx2Override : avx2Overrides) {
-    Avx2OverrideGuard guard(avx2Override);
     // Base layer: sizes straddling the crossover.
     for (size_t baseSize : {size_t{0}, size_t{3}, size_t{16}, size_t{400}}) {
         for (size_t topSize : {size_t{0}, size_t{2}, size_t{20}}) {
@@ -203,7 +160,6 @@ TEST_F(AttrSetGetTest, layeredChainFindsRightLayerAndOverride)
             Symbol neverUsed = makeUniqueSymbol("nope_");
             EXPECT_FALSE(layered->get(neverUsed).has_value());
         }
-    }
     }
 }
 
