@@ -639,9 +639,7 @@ public:
     {
         const Bindings * currentChunk = this;
         while (currentChunk) {
-            auto first = currentChunk->namesPtr();
-            auto last = first + currentChunk->numAttrs;
-            if (std::binary_search(first, last, name))
+            if (findIndex(currentChunk->namesPtr(), currentChunk->numAttrs, name))
                 return true;
             currentChunk = currentChunk->baseLayer;
         }

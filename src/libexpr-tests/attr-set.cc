@@ -9,15 +9,16 @@
 namespace nix {
 
 /**
- * Correctness check for Bindings::get()'s per-chunk search primitive
- * (SIMD linear scan for small/medium chunks, scalar binary search for
- * large ones and non-x86_64/SSE2 targets -- see findIndex() in
+ * Correctness check for Bindings::get()/contains()'s shared per-chunk
+ * search primitive (SIMD linear scan for small/medium chunks, scalar binary
+ * search for large ones and non-x86_64/SSE2 targets -- see findIndex() in
  * attr-set.hh). Builds attrsets of many sizes (straddling the SIMD/binary
  * search crossover in both directions) with randomized attribute names,
- * and checks Bindings::get() against a plain reference: every inserted
- * name must resolve to its own value, and names never inserted must be
- * absent. Also covers layered (`//`-merged) chains, which walk multiple
- * chunks and must still find/skip the right per-chunk entries.
+ * and checks Bindings::get()/contains() against a plain reference: every
+ * inserted name must resolve to its own value (and contains() == true),
+ * and names never inserted must be absent from both. Also covers layered
+ * (`//`-merged) chains, which walk multiple chunks and must still
+ * find/skip the right per-chunk entries.
  */
 struct AttrSetGetTest : LibExprTest
 {
@@ -67,6 +68,7 @@ TEST_F(AttrSetGetTest, presentAndAbsentKeysAtManySizes)
                 EXPECT_EQ(attr->name, sym);
                 ASSERT_NE(attr->value, nullptr);
                 EXPECT_EQ(attr->value->integer().value, val);
+                EXPECT_TRUE(bindings->contains(sym)) << "size=" << size << " seed=" << seed;
             }
 
             // Absent names (never inserted) must not be found.
@@ -76,6 +78,7 @@ TEST_F(AttrSetGetTest, presentAndAbsentKeysAtManySizes)
                     continue;
                 Symbol absentSym = createSymbol(absentName.c_str());
                 EXPECT_FALSE(bindings->get(absentSym).has_value()) << "size=" << size << " seed=" << seed;
+                EXPECT_FALSE(bindings->contains(absentSym)) << "size=" << size << " seed=" << seed;
             }
 
             // A symbol that was never even interned as an attribute name
@@ -84,6 +87,7 @@ TEST_F(AttrSetGetTest, presentAndAbsentKeysAtManySizes)
             // some other slot".
             Symbol neverUsed = createSymbol(("zzz_never_" + std::to_string(size) + "_" + std::to_string(seed)).c_str());
             EXPECT_FALSE(bindings->get(neverUsed).has_value());
+            EXPECT_FALSE(bindings->contains(neverUsed));
         }
     }
 }
@@ -140,6 +144,7 @@ TEST_F(AttrSetGetTest, layeredChainFindsRightLayerAndOverride)
                 auto attr = layered->get(baseAttrs[0].first);
                 ASSERT_TRUE(attr.has_value());
                 EXPECT_EQ(attr->value->integer().value, 9999);
+                EXPECT_TRUE(layered->contains(baseAttrs[0].first));
             }
 
             // Non-overridden base attrs still visible through the chain.
@@ -147,6 +152,7 @@ TEST_F(AttrSetGetTest, layeredChainFindsRightLayerAndOverride)
                 auto attr = layered->get(baseAttrs[i].first);
                 ASSERT_TRUE(attr.has_value());
                 EXPECT_EQ(attr->value->integer().value, baseAttrs[i].second);
+                EXPECT_TRUE(layered->contains(baseAttrs[i].first));
             }
 
             // Top-only attrs visible.
@@ -154,11 +160,13 @@ TEST_F(AttrSetGetTest, layeredChainFindsRightLayerAndOverride)
                 auto attr = layered->get(topAttrs[i].first);
                 ASSERT_TRUE(attr.has_value());
                 EXPECT_EQ(attr->value->integer().value, topAttrs[i].second);
+                EXPECT_TRUE(layered->contains(topAttrs[i].first));
             }
 
             // Something never inserted anywhere is absent.
             Symbol neverUsed = makeUniqueSymbol("nope_");
             EXPECT_FALSE(layered->get(neverUsed).has_value());
+            EXPECT_FALSE(layered->contains(neverUsed));
         }
     }
 }
