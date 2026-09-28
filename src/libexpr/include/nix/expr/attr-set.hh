@@ -531,6 +531,75 @@ public:
         numAttrsInChain = numAttrs;
     }
 
+private:
+#if defined(__x86_64__) && defined(__SSE2__)
+    /**
+     * Branch-light SIMD linear scan over `first[0..n)`, used by findIndex()
+     * for small-to-medium chunks in place of binary search.
+     *
+     * Binary search's data-dependent, sequentially-dependent comparisons
+     * don't predict well (each step's branch outcome depends on the
+     * previous one, so the CPU can't speculate ahead reliably). A linear
+     * scan comparing 4 `Symbol` (uint32) lanes at once via SSE2 trades
+     * O(log n) mispredicted branches for O(n/4) branch-light SIMD compares,
+     * which wins for small n despite the worse asymptotic complexity.
+     *
+     * The crossover is asymmetric and workload-mix-dependent: measured with
+     * a standalone benchmark (matching this TU's release compile flags,
+     * many independent attrset instances + a long non-repeating query
+     * stream, to avoid artificially teaching the branch predictor one
+     * fixed array) present-key lookups keep favoring the SIMD scan out past
+     * 500 entries (~-13% to -30% vs. binary search), while absent-key
+     * lookups are roughly a wash from ~210-260 entries and a clear, growing
+     * loss for the SIMD scan from ~270 on (+5% at 270, +15% by 320, +30%+
+     * by 450). Under a conservative 50/50 present/absent weighting, the
+     * blended win/loss crossover lands around ~350-360; `simdLinearScanMaxSize`
+     * is kept comfortably under that for margin (and real workloads, which
+     * are usually present-lookup-dominated, have even more headroom).
+     */
+    static std::optional<size_type> simdFindIndex(const Symbol * first, size_type n, Symbol name) noexcept
+    {
+        const __m128i key = _mm_set1_epi32(static_cast<int>(name.getId()));
+        size_type i = 0;
+        for (; i + 4 <= n; i += 4) {
+            __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i *>(first + i));
+            __m128i cmp = _mm_cmpeq_epi32(key, data);
+            int mask = _mm_movemask_ps(_mm_castsi128_ps(cmp));
+            if (mask)
+                return i + static_cast<size_type>(__builtin_ctz(static_cast<unsigned>(mask)));
+        }
+        for (; i < n; ++i)
+            if (first[i] == name)
+                return i;
+        return std::nullopt;
+    }
+
+    static constexpr size_type simdLinearScanMaxSize = 320;
+#endif
+
+    /**
+     * Find the index of `name` within the first `n` entries of a single
+     * (unlayered) chunk's dense, sorted `names` array, or std::nullopt if
+     * absent. Dispatches to a SIMD linear scan for small-to-medium chunks
+     * (see simdFindIndex()) and falls back to (scalar) binary search
+     * otherwise -- either because the chunk is large enough that binary
+     * search's better asymptotics win out, or because this isn't an
+     * x86_64/SSE2 target, in which case binary search is used
+     * unconditionally.
+     */
+    static std::optional<size_type> findIndex(const Symbol * first, size_type n, Symbol name) noexcept
+    {
+#if defined(__x86_64__) && defined(__SSE2__)
+        if (n <= simdLinearScanMaxSize)
+            return simdFindIndex(first, n, name);
+#endif
+        auto last = first + n;
+        auto i = std::lower_bound(first, last, name);
+        if (i != last && *i == name)
+            return static_cast<size_type>(i - first);
+        return std::nullopt;
+    }
+
 public:
     /**
      * Get attribute by name, or std::nullopt if no such attribute exists.
@@ -543,13 +612,8 @@ public:
     std::optional<Attr> get(Symbol name) const noexcept
     {
         auto getInChunk = [name](const Bindings & chunk) -> std::optional<Attr> {
-            auto first = chunk.namesPtr();
-            auto last = first + chunk.numAttrs;
-            auto i = std::lower_bound(first, last, name);
-            if (i != last && *i == name) {
-                auto idx = static_cast<size_type>(i - first);
-                return Attr(*i, chunk.valuesPtr()[idx], chunk.posPtr()[idx]);
-            }
+            if (auto idx = findIndex(chunk.namesPtr(), chunk.numAttrs, name))
+                return Attr(chunk.namesPtr()[*idx], chunk.valuesPtr()[*idx], chunk.posPtr()[*idx]);
             return std::nullopt;
         };
 
@@ -561,6 +625,25 @@ public:
         }
 
         return std::nullopt;
+    }
+
+    /**
+     * Test whether an attribute by this name exists anywhere in the layer
+     * chain, without synthesizing an `Attr` (i.e. without touching `pos`/
+     * `values` at all, even on a hit). For callers that only need a yes/no
+     * answer, this avoids the wasted `pos`/`values` reads `get()` would pay
+     * for a result that's immediately discarded. Uses the same per-chunk
+     * search primitive as get() (SIMD linear scan or binary search).
+     */
+    bool contains(Symbol name) const noexcept
+    {
+        const Bindings * currentChunk = this;
+        while (currentChunk) {
+            if (findIndex(currentChunk->namesPtr(), currentChunk->numAttrs, name))
+                return true;
+            currentChunk = currentChunk->baseLayer;
+        }
+        return false;
     }
 
     /**
