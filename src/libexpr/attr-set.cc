@@ -98,8 +98,7 @@ const Bindings * mergeManySpans(EvalMemory & mem, SymbolTable & symbols, std::sp
 
 bool Bindings::compactTopLayers(EvalMemory & mem, SymbolTable & symbols) const
 {
-    /* Need at least k=3 layers to merge plus one remaining ancestor. */
-    if (numLayers < 4)
+    if (numLayers < 3)
         return false;
 
     boost::container::static_vector<const Bindings *, maxLayers> layers;
@@ -107,20 +106,22 @@ bool Bindings::compactTopLayers(EvalMemory & mem, SymbolTable & symbols) const
         layers.push_back(layer);
     size_t N = layers.size();
 
-    if (N < 4)
+    if (N < 3)
         return false;
 
-    /* Choose the prefix length k (3 <= k <= N-1) minimizing cost(k)/(k-2),
+    /* Choose the prefix length k (3 <= k <= N) minimizing cost(k)/(k-2),
        where cost(k) is the total own size of layers[0..k-1] and (k-2) is
        the number of layer-chain slots freed by merging them into one. This
        is the amortized cost per slot freed if we keep re-choosing the same
        k every time the chain fills up again -- see the doc comment on the
        declaration for the full reasoning, including why this needs no
-       special case for a layer that happens to be unusually large. */
+       special case for a layer that happens to be unusually large (or, at
+       k=N, for the deepest/root layer -- including it is only ever chosen
+       when it's cheap enough to be worth it). */
     uint64_t runningSum = (uint64_t) layers[0]->numAttrs + layers[1]->numAttrs + layers[2]->numAttrs;
     size_t bestK = 3;
     uint64_t bestCost = runningSum;
-    for (size_t k = 4; k <= N - 1; ++k) {
+    for (size_t k = 4; k <= N; ++k) {
         runningSum += layers[k - 1]->numAttrs;
         /* runningSum/(k-2) < bestCost/(bestK-2), cross-multiplied to avoid floats. */
         if (runningSum * (bestK - 2) < bestCost * (k - 2)) {
@@ -136,10 +137,16 @@ bool Bindings::compactTopLayers(EvalMemory & mem, SymbolTable & symbols) const
         spans.push_back(std::span<const Attr>(layers[i]->attrs, layers[i]->numAttrs));
     const Bindings * acc = mergeManySpans(mem, symbols, spans);
 
-    const Bindings * remainder = layers[bestK];
-    acc->baseLayer = remainder;
-    acc->numLayers = remainder->numLayers + 1;
-    acc->numAttrsInChain = 0;
+    /* If bestK < N there's a remainder layer for acc to sit on top of; if
+       bestK == N, the whole chain (including the root) got merged and acc
+       is simply flat -- push_back already left its numAttrsInChain correct
+       for that case, nothing further to set. */
+    if (bestK < N) {
+        const Bindings * remainder = layers[bestK];
+        acc->baseLayer = remainder;
+        acc->numLayers = remainder->numLayers + 1;
+        acc->numAttrsInChain = 0;
+    }
 
     baseLayer = acc;
     numLayers = acc->numLayers + 1;
