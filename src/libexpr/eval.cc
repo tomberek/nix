@@ -704,8 +704,8 @@ static void printWithBindings(const SymbolTable & st, const Env & env)
         std::cout << ANSI_MAGENTA;
         auto * bindings = env.values[0]->attrs();
         /* TODO: Don't print the whole attribute set, since it can be quite large. */
-        for (const Attr * attr : bindings->lexicographicOrder(st))
-            std::cout << st[attr->name] << " ";
+        for (const Attr & attr : bindings->lexicographicOrder(st))
+            std::cout << st[attr.name] << " ";
         std::cout << ANSI_NORMAL;
         std::cout << std::endl;
     }
@@ -1482,7 +1482,7 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
 
         for (auto & i : getAttrPath()) {
             state.nrLookups++;
-            const Attr * j;
+            std::optional<Attr> j;
             auto name = getName(i, state, env);
             if (def) {
                 state.forceValue(*vAttrs, pos);
@@ -1557,7 +1557,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 
     for (auto & i : attrPath) {
         state.forceValue(*vAttrs, getPos());
-        const Attr * j;
+        std::optional<Attr> j;
         auto name = getName(i, state, env);
         if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
             vAttrs = j->value;
@@ -1601,7 +1601,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
         vRes = vCur;
     };
 
-    const Attr * functor;
+    std::optional<Attr> functor;
 
     while (args.size() > 0) {
 
@@ -2428,7 +2428,7 @@ bool EvalState::forceBool(Value & v, const PosIdx pos, std::string_view errorCtx
     return v.boolean();
 }
 
-const Attr * EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx)
+std::optional<Attr> EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx)
 {
     auto value = attrSet->get(attrSym);
     if (!value) {

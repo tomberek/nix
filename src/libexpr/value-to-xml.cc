@@ -45,12 +45,12 @@ static void showAttrs(
 
     for (auto & a : attrs.lexicographicOrder(state.symbols)) {
         XMLAttrs xmlAttrs;
-        xmlAttrs["name"] = state.symbols[a->name];
-        if (location && a->pos)
-            posToXML(state, xmlAttrs, state.positions[a->pos]);
+        xmlAttrs["name"] = state.symbols[a.name];
+        if (location && a.pos)
+            posToXML(state, xmlAttrs, state.positions[a.pos]);
 
         XMLOpenElement _(doc, "attr", xmlAttrs);
-        printValueAsXML(state, strict, location, *a->value, doc, context, drvsSeen, a->pos);
+        printValueAsXML(state, strict, location, *a.value, doc, context, drvsSeen, a.pos);
     }
 }
 
