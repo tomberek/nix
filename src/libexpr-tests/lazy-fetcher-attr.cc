@@ -27,8 +27,8 @@ TEST_F(LazyFetcherAttrTest, nonLazyAttrProducesImmediateValue)
     emitTreeAttrs(state, noPos, dummyPath(), input, v, false, false);
     state.forceValue(v, noPos);
 
-    auto * rcAttr = v.attrs()->get(state.symbols.create("revCount"));
-    ASSERT_NE(rcAttr, nullptr);
+    auto rcAttr = v.attrs()->get(state.symbols.create("revCount"));
+    ASSERT_TRUE(rcAttr);
     state.forceValue(*rcAttr->value, noPos);
     EXPECT_EQ(rcAttr->value->integer().value, 5);
 }
@@ -51,8 +51,8 @@ TEST_F(LazyFetcherAttrTest, lazyAttrProducesThunk)
     emitTreeAttrs(state, noPos, dummyPath(), input, v, false, false);
     state.forceValue(v, noPos);
 
-    auto * rcAttr = v.attrs()->get(state.symbols.create("revCount"));
-    ASSERT_NE(rcAttr, nullptr);
+    auto rcAttr = v.attrs()->get(state.symbols.create("revCount"));
+    ASSERT_TRUE(rcAttr);
 
     // Not yet forced, so the lazy function should not have been called
     EXPECT_EQ(calls, 0);
@@ -83,15 +83,15 @@ TEST_F(LazyFetcherAttrTest, lazyFunctionOnlyCalledOnAccess)
     state.forceValue(v, noPos);
 
     // Access lastModified, so should not trigger lazy revCount
-    auto * lmAttr = v.attrs()->get(state.symbols.create("lastModified"));
-    ASSERT_NE(lmAttr, nullptr);
+    auto lmAttr = v.attrs()->get(state.symbols.create("lastModified"));
+    ASSERT_TRUE(lmAttr);
     state.forceValue(*lmAttr->value, noPos);
     EXPECT_EQ(lmAttr->value->integer().value, 1000);
     EXPECT_EQ(calls, 0);
 
     // Now access revCount
-    auto * rcAttr = v.attrs()->get(state.symbols.create("revCount"));
-    ASSERT_NE(rcAttr, nullptr);
+    auto rcAttr = v.attrs()->get(state.symbols.create("revCount"));
+    ASSERT_TRUE(rcAttr);
     state.forceValue(*rcAttr->value, noPos);
     EXPECT_EQ(rcAttr->value->integer().value, 99);
     EXPECT_EQ(calls, 1);

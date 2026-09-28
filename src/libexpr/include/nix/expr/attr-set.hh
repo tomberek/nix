@@ -3,6 +3,7 @@
 
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
+#include "nix/util/comparator.hh"
 
 #include <boost/container/static_vector.hpp>
 #include <boost/iterator/function_output_iterator.hpp>
@@ -12,13 +13,21 @@
 #include <ranges>
 #include <optional>
 
+#if defined(__x86_64__) && defined(__SSE2__)
+#  include <emmintrin.h>
+#endif
+
 namespace nix {
 
 class EvalMemory;
 struct Value;
 
 /**
- * Map one attribute name to its value.
+ * Map one attribute name to its value. This is used as the by-value
+ * "synthesized" return/element type of Bindings's lookup, indexing, and
+ * iteration operations. Bindings itself does *not* store a contiguous array
+ * of Attr (@see Bindings for the actual storage layout); this struct exists
+ * purely as an ergonomic value type to hand data back to callers.
  */
 struct Attr
 {
@@ -53,9 +62,27 @@ static_assert(
 
 /**
  * Bindings contains all the attributes of an attribute set. It is defined
- * by its size and its capacity, the capacity being the number of Attr
- * elements allocated after this structure, while the size corresponds to
+ * by its size and its capacity, the capacity being the number of attribute
+ * slots allocated after this structure, while the size corresponds to
  * the number of elements already inserted in this structure.
+ *
+ * Storage is split into three parallel arrays (a "structure of arrays"),
+ * each sized to `capacity` and placed back-to-back right after the Bindings
+ * header in the same allocation:
+ *
+ *   Symbol   names[capacity]   -- dense, 4 bytes/entry, sorted by name.
+ *   PosIdx   pos[capacity]     -- 4 bytes/entry.
+ *   Value *  values[capacity]  -- 8 bytes/entry, ordinary pointers into
+ *                                 independently heap-allocated Values.
+ *
+ * This keeps the total bytes/entry at 16 (matching `sizeof(Attr)`), while
+ * letting the hot binary-search path in Bindings::get() walk only the dense
+ * `names` array (4x the entries per cache line versus walking full Attr
+ * structs), touching `pos`/`values` only once, on a hit.
+ *
+ * Because there is no longer a contiguous, stable `Attr` array to hand out
+ * pointers into, lookups synthesize an `Attr` by value (@see get(),
+ * @see iterator).
  *
  * Bindings can be efficiently `//`-composed into an intrusive linked list of "layers"
  * that saves on copies and allocations. Each lookup (@see Bindings::get) traverses
@@ -78,7 +105,7 @@ public:
 
 private:
     /**
-     * Number of attributes in the attrs FAM (Flexible Array Member).
+     * Number of attributes actually in use (<= capacity_).
      */
     size_type numAttrs = 0;
 
@@ -96,14 +123,16 @@ private:
     uint32_t numLayers = 1;
 
     /**
+     * Number of slots reserved in each of the three trailing arrays. Needed
+     * to locate the `pos` and `values` arrays, which follow `names` at fixed
+     * offsets of `capacity_ * sizeof(...)` bytes (regardless of `numAttrs`).
+     */
+    size_type capacity_ = 0;
+
+    /**
      * Bindings that this attrset is "layered" on top of.
      */
     const Bindings * baseLayer = nullptr;
-
-    /**
-     * Flexible array member of attributes.
-     */
-    Attr attrs[0];
 
     constexpr Bindings() = default;
     Bindings(const Bindings &) = delete;
@@ -119,6 +148,44 @@ private:
      * Maximum length of the Bindings layer chains.
      */
     static constexpr unsigned maxLayers = 8;
+
+    /* Pointers into the trailing storage allocated right after this
+       Bindings object (@see EvalMemory::allocBindings). Since sizeof(Bindings)
+       is a multiple of alignof(Value*) (guaranteed: Bindings contains a
+       pointer member, so the compiler pads sizeof(Bindings) to a multiple of
+       its own 8-byte alignment), and capacity_ * 8 bytes separate `names`
+       from `values`, `valuesPtr()` is always properly 8-byte aligned
+       regardless of the value of capacity_. */
+
+    Symbol * namesPtr() noexcept
+    {
+        return reinterpret_cast<Symbol *>(this + 1);
+    }
+
+    const Symbol * namesPtr() const noexcept
+    {
+        return reinterpret_cast<const Symbol *>(this + 1);
+    }
+
+    PosIdx * posPtr() noexcept
+    {
+        return reinterpret_cast<PosIdx *>(namesPtr() + capacity_);
+    }
+
+    const PosIdx * posPtr() const noexcept
+    {
+        return reinterpret_cast<const PosIdx *>(namesPtr() + capacity_);
+    }
+
+    Value ** valuesPtr() noexcept
+    {
+        return reinterpret_cast<Value **>(posPtr() + capacity_);
+    }
+
+    Value * const * valuesPtr() const noexcept
+    {
+        return reinterpret_cast<Value * const *>(posPtr() + capacity_);
+    }
 
 public:
     size_type size() const
@@ -143,17 +210,29 @@ public:
         friend class Bindings;
 
     private:
+        /**
+         * A cursor over a single (unlayered) Bindings chunk's dense arrays.
+         * Unlike the old design, there is no stable `Attr *` to point at, so
+         * the cursor tracks a (chunk, idx) position and caches the `name` at
+         * that position (needed as a plain lvalue field for GENERATE_CMP's
+         * use of std::tie, which cannot bind to values returned by value).
+         */
         struct BindingsCursor
         {
             /**
-             * Attr that the cursor currently points to.
+             * The chunk this cursor is iterating.
              */
-            pointer current;
+            const Bindings * chunk;
 
             /**
-             * One past the end pointer to the contiguous buffer of Attrs.
+             * Current position within chunk's arrays.
              */
-            pointer end;
+            size_type idx;
+
+            /**
+             * One-past-the-end position within chunk's arrays.
+             */
+            size_type endIdx;
 
             /**
              * Priority of the value. Lesser values have more priority (i.e. they override
@@ -161,33 +240,35 @@ public:
              */
             uint32_t priority;
 
-            pointer operator->() const noexcept
-            {
-                return current;
-            }
+            /**
+             * Cached chunk->namesPtr()[idx], kept in sync by increment()/consume().
+             */
+            Symbol name;
 
-            reference get() const noexcept
+            Attr get() const noexcept
             {
-                return *current;
+                return Attr(name, chunk->valuesPtr()[idx], chunk->posPtr()[idx]);
             }
 
             bool empty() const noexcept
             {
-                return current == end;
+                return idx == endIdx;
             }
 
             void increment() noexcept
             {
-                ++current;
+                ++idx;
+                if (!empty())
+                    name = chunk->namesPtr()[idx];
             }
 
-            void consume(Symbol name) noexcept
+            void consume(Symbol upTo) noexcept
             {
-                while (!empty() && current->name <= name)
-                    ++current;
+                while (!empty() && name <= upTo)
+                    increment();
             }
 
-            GENERATE_CMP(BindingsCursor, me->current->name, me->priority)
+            GENERATE_CMP(BindingsCursor, me->name, me->priority)
         };
 
         using QueueStorageType = boost::container::static_vector<BindingsCursor, maxLayers>;
@@ -204,7 +285,24 @@ public:
         QueueStorageType cursorHeap;
 
         /**
-         * The attribute the iterator currently points to.
+         * Storage for the Attr synthesized at the iterator's current
+         * position. There's no contiguous Attr array in Bindings to point
+         * into anymore, so each iterator instance owns its own copy.
+         */
+        Attr currentAttr{};
+
+        /**
+         * Identifies the logical position `current` refers to, independent
+         * of `currentAttr`'s storage address (which differs between copies
+         * of an iterator at the same logical position). Used for equality.
+         * nullptr means "at the end".
+         */
+        const Bindings * curChunk = nullptr;
+        size_type curIdx = 0;
+
+        /**
+         * The attribute the iterator currently points to (== &currentAttr),
+         * or nullptr at the end.
          */
         pointer current = nullptr;
 
@@ -229,13 +327,22 @@ public:
 
         iterator & finished() noexcept
         {
+            curChunk = nullptr;
             current = nullptr;
             return *this;
         }
 
+        void syncCurrent(const BindingsCursor & cursor) noexcept
+        {
+            currentAttr = cursor.get();
+            curChunk = cursor.chunk;
+            curIdx = cursor.idx;
+            current = &currentAttr;
+        }
+
         void next(BindingsCursor cursor) noexcept
         {
-            current = &cursor.get();
+            syncCurrent(cursor);
             cursor.increment();
 
             if (!cursor.empty())
@@ -245,9 +352,9 @@ public:
         std::optional<BindingsCursor> consumeAllUntilCurrentName() noexcept
         {
             auto cursor = pop();
-            Symbol lastHandledName = current->name;
+            Symbol lastHandledName = currentAttr.name;
 
-            while (cursor->name <= lastHandledName) {
+            while (cursor.name <= lastHandledName) {
                 cursor.consume(lastHandledName);
                 if (!cursor.empty())
                     push(cursor);
@@ -265,12 +372,13 @@ public:
             : doMerge(attrs.baseLayer)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
-                auto first = layer.attrs;
                 push(
                     BindingsCursor{
-                        .current = first,
-                        .end = first + layer.numAttrs,
+                        .chunk = &layer,
+                        .idx = 0,
+                        .endIdx = layer.numAttrs,
                         .priority = priority++,
+                        .name = layer.namesPtr()[0],
                     });
             };
 
@@ -278,8 +386,8 @@ public:
                 if (attrs.empty())
                     return;
 
-                current = attrs.attrs;
                 pushBindings(attrs);
+                syncCurrent(cursorHeap.front());
 
                 return;
             }
@@ -300,6 +408,27 @@ public:
     public:
         iterator() = default;
 
+        iterator(const iterator & other) noexcept
+            : cursorHeap(other.cursorHeap)
+            , currentAttr(other.currentAttr)
+            , curChunk(other.curChunk)
+            , curIdx(other.curIdx)
+            , current(other.current ? &currentAttr : nullptr)
+            , doMerge(other.doMerge)
+        {
+        }
+
+        iterator & operator=(const iterator & other) noexcept
+        {
+            cursorHeap = other.cursorHeap;
+            currentAttr = other.currentAttr;
+            curChunk = other.curChunk;
+            curIdx = other.curIdx;
+            current = other.current ? &currentAttr : nullptr;
+            doMerge = other.doMerge;
+            return *this;
+        }
+
         reference operator*() const noexcept
         {
             return *current;
@@ -313,9 +442,11 @@ public:
         iterator & operator++() noexcept
         {
             if (!doMerge) {
-                ++current;
-                if (current == cursorHeap.front().end)
+                auto & cursor = cursorHeap.front();
+                cursor.increment();
+                if (cursor.empty())
                     return finished();
+                syncCurrent(cursor);
                 return *this;
             }
 
@@ -339,41 +470,97 @@ public:
 
         bool operator==(const iterator & rhs) const noexcept
         {
-            return current == rhs.current;
+            return curChunk == rhs.curChunk && (curChunk == nullptr || curIdx == rhs.curIdx);
         }
     };
 
     using const_iterator = iterator;
 
-    void push_back(const Attr & attr)
+    /**
+     * A mutable reference-like proxy into the idx-th attribute's slot across
+     * the three parallel arrays. There is no stable `Attr &` backing
+     * Bindings' storage anymore (@see Bindings), so `operator[]` can't just
+     * hand out a reference into a contiguous array; this proxies field
+     * access (`.name`/`.pos`/`.value`) via real references into the arrays,
+     * and supports whole-Attr assignment. Used for positional access into
+     * an unlayered, not-yet-sorted Bindings under construction (@see
+     * ExprAttrs::eval's `__overrides` handling, the sole caller).
+     */
+    struct Ref
     {
-        attrs[numAttrs++] = attr;
-        numAttrsInChain = numAttrs;
+        Symbol & name;
+        PosIdx & pos;
+        Value * & value;
+
+        Ref & operator=(const Attr & attr) noexcept
+        {
+            name = attr.name;
+            pos = attr.pos;
+            value = attr.value;
+            return *this;
+        }
+    };
+
+    Ref operator[](size_type idx) noexcept
+    {
+        if (isLayered()) [[unlikely]]
+            unreachable();
+        return Ref{namesPtr()[idx], posPtr()[idx], valuesPtr()[idx]};
     }
 
     /**
-     * Get attribute by name or nullptr if no such attribute exists.
+     * Read-only positional access, synthesizing an Attr by value. Safe to
+     * bind directly to a `const Attr &` (unlike e.g. `get()`'s
+     * `std::optional<Attr>`, a plain by-value return is a direct
+     * reference-to-temporary binding, so the usual temporary lifetime
+     * extension rules apply).
      */
-    const Attr * get(Symbol name) const noexcept
+    Attr operator[](size_type idx) const noexcept
     {
-        auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
-            auto first = chunk.attrs;
+        if (isLayered()) [[unlikely]]
+            unreachable();
+        return Attr(namesPtr()[idx], valuesPtr()[idx], posPtr()[idx]);
+    }
+
+    void push_back(const Attr & attr)
+    {
+        auto idx = numAttrs++;
+        namesPtr()[idx] = attr.name;
+        posPtr()[idx] = attr.pos;
+        valuesPtr()[idx] = attr.value;
+        numAttrsInChain = numAttrs;
+    }
+
+public:
+    /**
+     * Get attribute by name, or std::nullopt if no such attribute exists.
+     *
+     * Returns a synthesized-by-value Attr (there is no stable `Attr *`
+     * to point into anymore), but supports the usual
+     * `if (auto attr = bindings->get(name)) { ...attr->value...; }`
+     * pointer-like usage via std::optional's own operator-> / operator*.
+     */
+    std::optional<Attr> get(Symbol name) const noexcept
+    {
+        auto getInChunk = [name](const Bindings & chunk) -> std::optional<Attr> {
+            auto first = chunk.namesPtr();
             auto last = first + chunk.numAttrs;
-            const Attr * i = std::lower_bound(first, last, key);
-            if (i != last && i->name == key.name)
-                return i;
-            return nullptr;
+            auto i = std::lower_bound(first, last, name);
+            if (i != last && *i == name) {
+                auto idx = static_cast<size_type>(i - first);
+                return Attr(*i, chunk.valuesPtr()[idx], chunk.posPtr()[idx]);
+            }
+            return std::nullopt;
         };
 
         const Bindings * currentChunk = this;
         while (currentChunk) {
-            const Attr * maybeAttr = getInChunk(*currentChunk);
-            if (maybeAttr)
-                return maybeAttr;
+            if (auto attr = getInChunk(*currentChunk))
+                return attr;
             currentChunk = currentChunk->baseLayer;
         }
 
-        return nullptr;
+        return std::nullopt;
     }
 
     /**
@@ -402,32 +589,20 @@ public:
         return const_iterator();
     }
 
-    Attr & operator[](size_type pos)
-    {
-        if (isLayered()) [[unlikely]]
-            unreachable();
-        return attrs[pos];
-    }
-
-    const Attr & operator[](size_type pos) const
-    {
-        if (isLayered()) [[unlikely]]
-            unreachable();
-        return attrs[pos];
-    }
-
     void sort();
 
     /**
      * Returns the attributes in lexicographically sorted order.
+     *
+     * Returns by value (there is no stable `Attr *` to hand out anymore).
      */
-    std::vector<const Attr *> lexicographicOrder(const SymbolTable & symbols) const
+    std::vector<Attr> lexicographicOrder(const SymbolTable & symbols) const
     {
-        std::vector<const Attr *> res;
+        std::vector<Attr> res;
         res.reserve(size());
-        std::ranges::transform(*this, std::back_inserter(res), [](const Attr & a) { return &a; });
-        std::ranges::sort(res, [&](const Attr * a, const Attr * b) {
-            std::string_view sa = symbols[a->name], sb = symbols[b->name];
+        std::ranges::copy(*this, std::back_inserter(res));
+        std::ranges::sort(res, [&](const Attr & a, const Attr & b) {
+            std::string_view sa = symbols[a.name], sb = symbols[b.name];
             return sa < sb;
         });
         return res;
@@ -485,33 +660,45 @@ private:
             return;
 
         auto & base = *bindings->baseLayer;
-        auto attrs = std::span(bindings->attrs, bindings->numAttrs);
+        auto names = std::span(bindings->namesPtr(), bindings->numAttrs);
 
         Bindings::size_type duplicates = 0;
 
         /* If the base bindings is smaller than the newly added attributes
-           iterate using std::set_intersection to run in O(|base| + |attrs|) =
+           iterate using std::ranges::set_intersection to run in O(|base| + |attrs|) =
            O(|attrs|). Otherwise use an O(|attrs| * log(|base|)) per-attr binary
            search to check for duplicates. Note that if we are in this code path then
            |attrs| <= bindingsUpdateLayerRhsSizeThreshold, which 16 by default. We are
            optimizing for the case when a small attribute set gets "layered" on top of
            a much larger one. When attrsets are already small it's fine to do a linear
            scan, but we should avoid expensive iterations over large "base" attrsets. */
-        if (attrs.size() > base.size()) {
+        if (names.size() > base.size()) {
+            // Classic (non-ranges) set_intersection: `base` yields Attr and
+            // `names` yields Symbol, and getting std::ranges::set_intersection's
+            // projections to satisfy `mergeable` across those two different
+            // value types isn't worth the trouble; a small heterogeneous
+            // comparator does the same job.
+            auto symbolOf = []<typename T>(const T & x) noexcept -> Symbol {
+                if constexpr (std::is_same_v<T, Attr>)
+                    return x.name;
+                else
+                    return x;
+            };
             std::set_intersection(
                 base.begin(),
                 base.end(),
-                attrs.begin(),
-                attrs.end(),
-                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
+                names.begin(),
+                names.end(),
+                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }),
+                [&](const auto & a, const auto & b) { return symbolOf(a) < symbolOf(b); });
         } else {
-            for (const auto & attr : attrs) {
-                if (base.get(attr.name))
+            for (Symbol name : names) {
+                if (base.get(name))
                     ++duplicates;
             }
         }
 
-        bindings->numAttrsInChain = base.numAttrsInChain + attrs.size() - duplicates;
+        bindings->numAttrsInChain = base.numAttrsInChain + names.size() - duplicates;
     }
 
 public:
