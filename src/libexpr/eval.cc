@@ -222,15 +222,24 @@ bool Value::isTrivial() const
                || dynamic_cast<ExprLambda *>(thunk().expr) || dynamic_cast<ExprList *>(thunk().expr));
 }
 
-static Symbol getName(const AttrName & name, EvalState & state, Env & env)
+// Rare path: the attribute name is a dynamic expression (`${...}`) that must be
+// evaluated and forced to a string. Kept out-of-line so its size doesn't count
+// against the inlining budget of the hot `getName` fast path below (which is
+// the common case: a static, already-interned symbol).
+[[gnu::noinline]] static Symbol getNameDynamic(const AttrName & name, EvalState & state, Env & env)
 {
-    if (name.symbol) {
+    Value nameValue;
+    name.expr->eval(state, env, nameValue);
+    state.forceStringNoCtx(nameValue, name.expr->getPos(), "while evaluating an attribute name");
+    return state.symbols.create(nameValue.string_view());
+}
+
+static inline Symbol getName(const AttrName & name, EvalState & state, Env & env)
+{
+    if (name.symbol) [[likely]] {
         return name.symbol;
     } else {
-        Value nameValue;
-        name.expr->eval(state, env, nameValue);
-        state.forceStringNoCtx(nameValue, name.expr->getPos(), "while evaluating an attribute name");
-        return state.symbols.create(nameValue.string_view());
+        return getNameDynamic(name, state, env);
     }
 }
 
