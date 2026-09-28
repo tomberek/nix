@@ -19,6 +19,10 @@
 #include <optional>
 #include <ranges>
 
+#if defined(__x86_64__) && defined(__SSE2__)
+#  include <immintrin.h>
+#endif
+
 namespace nix {
 
 namespace derivation {
@@ -95,6 +99,49 @@ constexpr EscapeMap unescapes = [] {
             map[(unsigned char) *escaped] = char(i);
     return EscapeMap{map};
 }();
+
+#if defined(__x86_64__) && defined(__SSE2__)
+namespace {
+
+/**
+ * Length of the longest prefix of `data[0..n)` containing none of the
+ * 5 characters `printString` must escape (`\n \r \t \\ "`), scanning 16
+ * bytes at a time via SSE2.
+ *
+ * Same rationale as `Bindings::simdFindIndex()`: a branch-light SIMD
+ * compare over the whole block replaces a per-byte table lookup and
+ * branch, and the common case (few or no escapable bytes in a
+ * derivation string field) turns the whole call into one wide compare
+ * plus a single bulk copy of the result.
+ */
+size_t escapeFreePrefixLength(const char * data, size_t n) noexcept
+{
+    const __m128i nl = _mm_set1_epi8('\n');
+    const __m128i cr = _mm_set1_epi8('\r');
+    const __m128i tab = _mm_set1_epi8('\t');
+    const __m128i bs = _mm_set1_epi8('\\');
+    const __m128i dq = _mm_set1_epi8('"');
+
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i));
+        __m128i eq = _mm_or_si128(
+            _mm_or_si128(_mm_cmpeq_epi8(v, nl), _mm_cmpeq_epi8(v, cr)),
+            _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, tab), _mm_cmpeq_epi8(v, bs)), _mm_cmpeq_epi8(v, dq)));
+        int mask = _mm_movemask_epi8(eq);
+        if (mask)
+            return i + static_cast<size_t>(__builtin_ctz(static_cast<unsigned>(mask)));
+    }
+    for (; i < n; ++i) {
+        char c = data[i];
+        if (c == '\n' || c == '\r' || c == '\t' || c == '\\' || c == '"')
+            return i;
+    }
+    return n;
+}
+
+} // namespace
+#endif
 
 } // namespace
 
@@ -564,6 +611,19 @@ Full parse(
 static void printString(std::string & res, std::string_view s)
 {
     res += '"';
+#if defined(__x86_64__) && defined(__SSE2__)
+    while (!s.empty()) {
+        size_t safe = escapeFreePrefixLength(s.data(), s.size());
+        res.append(s.data(), safe);
+        s.remove_prefix(safe);
+        if (s.empty())
+            break;
+        char c = s.front();
+        s.remove_prefix(1);
+        res += '\\';
+        res += *unescapes.lookup(c);
+    }
+#else
     static constexpr auto chunkSize = 1024;
     std::array<char, 2 * chunkSize + 2> buffer;
     while (!s.empty()) {
@@ -582,6 +642,7 @@ static void printString(std::string & res, std::string_view s)
         }
         res.append(buf, p - buf);
     }
+#endif
     res += '"';
 }
 
