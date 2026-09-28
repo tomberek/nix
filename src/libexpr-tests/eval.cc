@@ -245,7 +245,7 @@ TEST_F(LibExprTest, resetFileCacheReleasesValues)
         Value v;
         state.evalFile(file, v);
         ASSERT_EQ(nAttrs, v.type());
-        auto attrs = const_cast<Bindings *>(v.attrs());
+        auto attrs = const_cast<Bindings *>(v.attrs(state.mem));
         *weak = attrs;
         ASSERT_EQ(GC_SUCCESS, GC_GENERAL_REGISTER_DISAPPEARING_LINK(weak, attrs));
     });
