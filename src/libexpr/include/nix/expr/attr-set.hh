@@ -103,13 +103,19 @@ private:
 
     /**
      * Length of the layers list.
+     *
+     * Mutable: @ref compactTopLayers may reduce this (splicing out
+     * compacted layers) without changing this object's identity.
      */
-    uint32_t numLayers = 1;
+    mutable uint32_t numLayers = 1;
 
     /**
      * Bindings that this attrset is "layered" on top of.
+     *
+     * Mutable: @ref compactTopLayers may repoint this to a new,
+     * pre-merged layer (see its doc comment).
      */
-    const Bindings * baseLayer = nullptr;
+    mutable const Bindings * baseLayer = nullptr;
 
     /**
      * Flexible array member of attributes.
@@ -130,6 +136,7 @@ private:
      * Maximum length of the Bindings layer chains.
      */
     static constexpr unsigned maxLayers = 16;
+
 
     /**
      * Below this many attrs, Bindings::get uses a linear scan instead of
@@ -470,6 +477,31 @@ public:
     {
         return numLayers > 1;
     }
+
+    /**
+     * Merge a prefix of this Bindings' topmost layers into one flat layer,
+     * splicing it in place of the layers it replaces, to free up layer-chain
+     * budget for further layering without touching whatever (possibly much
+     * larger) base sits below the compacted prefix.
+     *
+     * The prefix length k is chosen to minimize the amortized cost per
+     * layer-chain slot freed: merging the top k layers costs roughly
+     * `sum(own size of layers 0..k-1)` and frees `k-2` slots (k layers
+     * become `this` + 1 merged layer), so we pick k minimizing
+     * `cost(k) / (k-2)` over all valid k (a plain O(maxLayers) scan, since
+     * the chain is bounded by maxLayers). This self-corrects for a layer
+     * that happens to be large (got layered via the relative-size check
+     * rather than the absolute threshold): including it spikes cost far
+     * more than it grows the slots freed, so the scan naturally stops
+     * before it rather than needing a special case.
+     *
+     * Does not change this object's identity, `get()`/iteration results, or
+     * size -- purely an internal representation change, mutating @ref
+     * baseLayer / @ref numLayers (both `mutable` for exactly this reason).
+     *
+     * Returns true if compaction happened (numLayers decreased).
+     */
+    bool compactTopLayers(EvalMemory & mem, SymbolTable & symbols) const;
 
     const_iterator begin() const
     {

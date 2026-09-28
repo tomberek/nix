@@ -2008,8 +2008,17 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
        optimization completely, so it has to gate the relative-size check too,
        not just the absolute one. */
     auto threshold = state.settings.bindingsUpdateLayerRhsSizeThreshold.get();
-    bool shouldLayer = threshold != 0 && !bindings1.isLayerListFull()
-                        && (bindings2.size() <= threshold || bindings2.size() < bindings1.size());
+    bool sizeOk = threshold != 0 && (bindings2.size() <= threshold || bindings2.size() < bindings1.size());
+
+    /* If the layer chain is full but attrs2 would otherwise qualify, try
+       compacting attrs1's topmost layers (individually small, by
+       construction of the heuristic above) into one first, to free up
+       room without falling back to a full copy of the (possibly much
+       larger) rest of attrs1's chain. */
+    if (sizeOk && bindings1.isLayerListFull())
+        bindings1.compactTopLayers(state.mem, state.symbols);
+
+    bool shouldLayer = sizeOk && !bindings1.isLayerListFull();
 
     if (shouldLayer) {
         auto attrs = state.buildBindings(bindings2.size());
