@@ -222,15 +222,24 @@ bool Value::isTrivial() const
                || dynamic_cast<ExprLambda *>(thunk().expr) || dynamic_cast<ExprList *>(thunk().expr));
 }
 
-static Symbol getName(const AttrName & name, EvalState & state, Env & env)
+// Rare path: the attribute name is a dynamic expression (`${...}`) that must be
+// evaluated and forced to a string. Kept out-of-line so its size doesn't count
+// against the inlining budget of the hot `getName` fast path below (which is
+// the common case: a static, already-interned symbol).
+[[gnu::noinline]] static Symbol getNameDynamic(const AttrName & name, EvalState & state, Env & env)
 {
-    if (name.symbol) {
+    Value nameValue;
+    name.expr->eval(state, env, nameValue);
+    state.forceStringNoCtx(nameValue, name.expr->getPos(), "while evaluating an attribute name");
+    return state.symbols.create(nameValue.string_view());
+}
+
+static inline Symbol getName(const AttrName & name, EvalState & state, Env & env)
+{
+    if (name.symbol) [[likely]] {
         return name.symbol;
     } else {
-        Value nameValue;
-        name.expr->eval(state, env, nameValue);
-        state.forceStringNoCtx(nameValue, name.expr->getPos(), "while evaluating an attribute name");
-        return state.symbols.create(nameValue.string_view());
+        return getNameDynamic(name, state, env);
     }
 }
 
@@ -2135,6 +2144,155 @@ void EvalState::concatLists(Value & v, std::span<Value * const> lists, const Pos
 
 void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
 {
+    // The binary '+' operator is parsed as an ExprConcatStrings with forceString == false and
+    // exactly two operands (see parser.y). forceString == false is also used for path
+    // interpolation (`./a-${foo}-b`, parser.y's `path_start string_parts_interpolated PATH_END`),
+    // which can have any number of parts, so es.size() == 2 alone doesn't imply '+' -- both
+    // conditions are required to identify the binary '+' case. Everything else (that path
+    // interpolation case, and forceString == true string interpolation/adjacent string literals)
+    // falls through to the general N-ary loop below, unchanged.
+    if (!forceString && es.size() == 2) {
+        auto & [pos1, e1] = es[0];
+        auto & [pos2, e2] = es[1];
+
+        Value v1;
+        e1->eval(state, env, v1, "in an operand of '+'");
+        Value v2;
+        e2->eval(state, env, v2, "in an operand of '+'");
+
+        auto t1 = v1.type();
+        auto t2 = v2.type();
+
+        // Fast path: operand types match what we saw last time at this call site. Re-validated
+        // against the actual types above, so a stale/wrong guess just falls through to the
+        // general cascade below -- it can never produce a wrong answer, only miss the cache.
+        if (cachedType1 == t1 && cachedType2 == t2) {
+            if (t1 == nInt && t2 == nInt) {
+                if (auto checked = (v1.integer() + v2.integer()).valueChecked()) {
+                    v.mkInt(NixInt(*checked));
+                    return;
+                }
+                state.error<EvalError>("integer overflow in adding %1% + %2%", v1.integer(), v2.integer())
+                    .atPos(pos2)
+                    .debugThrow();
+            } else if (t1 == nFloat && t2 == nFloat) {
+                NixFloat result = 0;
+                result += v1.fpoint();
+                result += v2.fpoint();
+                v.mkFloat(result);
+                return;
+            } else if (t1 == nInt && t2 == nFloat) {
+                v.mkFloat(v1.integer().value + v2.fpoint());
+                return;
+            } else if (t1 == nFloat && t2 == nInt) {
+                NixFloat result = 0;
+                result += v1.fpoint();
+                result += v2.integer().value;
+                v.mkFloat(result);
+                return;
+            }
+        }
+
+        // General cascade: cache miss, first evaluation at this node, or non-numeric operands.
+        // Mirrors the loop below (and its exact arithmetic/error semantics) specialized to the
+        // two already-evaluated operands required by '+', so e1/e2 are each evaluated exactly
+        // once regardless of which path is taken.
+        NixStringContext context;
+        std::vector<BackedStringView> strings;
+        size_t sSize = 0;
+        NixInt n{0};
+        NixFloat nf = 0;
+        ValueType firstType = t1;
+
+        if (firstType == nInt) {
+            auto newN = n + v1.integer();
+            if (auto checked = newN.valueChecked(); checked.has_value()) {
+                n = NixInt(*checked);
+            } else {
+                state.error<EvalError>("integer overflow in adding %1% + %2%", n, v1.integer())
+                    .atPos(pos1)
+                    .debugThrow();
+            }
+        } else if (firstType == nFloat) {
+            nf += v1.fpoint();
+        } else {
+            strings.reserve(2);
+            auto part =
+                state.coerceToString(pos1, v1, context, "while evaluating a path segment", false, firstType == nString, false);
+            sSize += part->size();
+            strings.emplace_back(std::move(part));
+        }
+
+        if (firstType == nInt) {
+            if (t2 == nInt) {
+                auto newN = n + v2.integer();
+                if (auto checked = newN.valueChecked(); checked.has_value()) {
+                    n = NixInt(*checked);
+                } else {
+                    state.error<EvalError>("integer overflow in adding %1% + %2%", n, v2.integer())
+                        .atPos(pos2)
+                        .debugThrow();
+                }
+            } else if (t2 == nFloat) {
+                // Upgrade the type from int to float;
+                firstType = nFloat;
+                nf = n.value;
+                nf += v2.fpoint();
+            } else
+                state.error<EvalError>("cannot add %1% to an integer", showType(v2))
+                    .atPos(pos2)
+                    .withFrame(env, *this)
+                    .debugThrow();
+        } else if (firstType == nFloat) {
+            if (t2 == nInt) {
+                nf += v2.integer().value;
+            } else if (t2 == nFloat) {
+                nf += v2.fpoint();
+            } else
+                state.error<EvalError>("cannot add %1% to a float", showType(v2))
+                    .atPos(pos2)
+                    .withFrame(env, *this)
+                    .debugThrow();
+        } else {
+            auto part =
+                state.coerceToString(pos2, v2, context, "while evaluating a path segment", false, firstType == nString, true);
+            sSize += part->size();
+            strings.emplace_back(std::move(part));
+        }
+
+        if (firstType == nInt) {
+            v.mkInt(n);
+            cachedType1 = t1;
+            cachedType2 = t2;
+        } else if (firstType == nFloat) {
+            v.mkFloat(nf);
+            cachedType1 = t1;
+            cachedType2 = t2;
+        } else if (firstType == nPath) {
+            if (!context.empty())
+                state.error<EvalError>("a string that refers to a store path cannot be appended to a path")
+                    .atPos(pos)
+                    .withFrame(env, *this)
+                    .debugThrow();
+            std::string resultStr;
+            resultStr.reserve(sSize);
+            for (const auto & part : strings) {
+                resultStr += *part;
+            }
+            v.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
+        } else {
+            auto & resultStr = StringData::alloc(state.mem, sSize);
+            auto * tmp = resultStr.data();
+            for (const auto & part : strings) {
+                std::memcpy(tmp, part->data(), part->size());
+                tmp += part->size();
+            }
+            *tmp = '\0';
+            v.mkStringMove(resultStr, context, state.mem);
+        }
+        return;
+    }
+
     NixStringContext context;
     std::vector<BackedStringView> strings;
     size_t sSize = 0;

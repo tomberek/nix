@@ -772,6 +772,19 @@ struct ExprConcatStrings : Expr
     bool forceString;
     std::span<std::pair<PosIdx, Expr *>> es;
 
+    /**
+     * Monomorphic inline cache for the binary '+' operator (forceString == false, es.size() ==
+     * 2): the operand type pair seen on the previous evaluation at this call site. `nThunk` (a
+     * value's type() never reports this once forced) marks "no cached shape yet". Only ever set
+     * to a pure-numeric (int/float) type pair; always re-validated against the actual operand
+     * types before use in ExprConcatStrings::eval, so a stale or mismatched guess just falls
+     * through to the general cascade -- it cannot produce a wrong answer, only miss the fast
+     * path. Single-threaded evaluator, no races, same rationale as other lazily-cached AST
+     * fields in this codebase.
+     */
+    mutable ValueType cachedType1 = nThunk;
+    mutable ValueType cachedType2 = nThunk;
+
     ExprConcatStrings(
         std::pmr::polymorphic_allocator<char> & alloc,
         const PosIdx & pos,
