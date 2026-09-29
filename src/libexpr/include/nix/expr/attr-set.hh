@@ -83,22 +83,31 @@ private:
     size_type numAttrs = 0;
 
     /**
-     * Number of attributes with unique names in the layer chain.
+     * Number of attributes with unique names in the layer chain -- the
+     * *real* size, whereas @ref numAttrs is just this layer's own count.
      *
-     * This is the *real* user-facing size of bindings, whereas @ref numAttrs is
-     * an implementation detail of the data structure.
+     * Computed lazily (0 = not yet computed, see @ref size /
+     * @ref computeChainSize): many layered accumulators are only ever read
+     * via get() and never need this. 0 is never a real chain size, since
+     * layering only happens between two non-empty Bindings.
      */
-    size_type numAttrsInChain = 0;
+    mutable size_type numAttrsInChain = 0;
 
     /**
      * Length of the layers list.
+     *
+     * Mutable: @ref compactTopLayers may reduce this (splicing out
+     * compacted layers) without changing this object's identity.
      */
-    uint32_t numLayers = 1;
+    mutable uint32_t numLayers = 1;
 
     /**
      * Bindings that this attrset is "layered" on top of.
+     *
+     * Mutable: @ref compactTopLayers may repoint this to a new,
+     * pre-merged layer (see its doc comment).
      */
-    const Bindings * baseLayer = nullptr;
+    mutable const Bindings * baseLayer = nullptr;
 
     /**
      * Flexible array member of attributes.
@@ -116,19 +125,71 @@ private:
     friend class BindingsBuilder;
 
     /**
+     * Lets mergeManySpans (attr-set.cc) size its merge-cursor heap as a
+     * stack-allocated static_vector instead of heap-allocating.
+     */
+    friend const Bindings *
+    mergeManySpans(EvalMemory & mem, SymbolTable & symbols, std::span<const std::span<const Attr>> spans);
+
+    /**
      * Maximum length of the Bindings layer chains.
      */
-    static constexpr unsigned maxLayers = 8;
+    static constexpr unsigned maxLayers = 32;
+
+    /**
+     * Below this many attrs, Bindings::get uses a linear scan instead of
+     * binary search -- see its doc comment.
+     */
+    static constexpr size_type linearScanThreshold = 8;
+
+    /**
+     * Lazily compute and memoize numAttrsInChain for a layered Bindings --
+     * see its doc comment. Only ever called from @ref size / @ref empty,
+     * on demand.
+     */
+    void computeChainSize() const noexcept
+    {
+        auto & base = *baseLayer;
+        auto ownAttrs = std::span(attrs, numAttrs);
+
+        size_type duplicates = 0;
+
+        /* If the base bindings is smaller than the newly added attributes
+           iterate using std::set_intersection to run in O(|base| + |attrs|) =
+           O(|attrs|). Otherwise use an O(|attrs| * log(|base|)) per-attr binary
+           search to check for duplicates. */
+        if (ownAttrs.size() > base.size()) {
+            std::set_intersection(
+                base.begin(),
+                base.end(),
+                ownAttrs.begin(),
+                ownAttrs.end(),
+                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
+        } else {
+            for (const auto & attr : ownAttrs)
+                if (base.get(attr.name))
+                    ++duplicates;
+        }
+
+        numAttrsInChain = base.size() + ownAttrs.size() - duplicates;
+    }
 
 public:
     size_type size() const
     {
+        if (baseLayer && numAttrsInChain == 0)
+            computeChainSize();
         return numAttrsInChain;
     }
 
     bool empty() const
     {
-        return size() == 0;
+        /* A layered chain is never empty (layering only happens between
+           two non-empty Bindings), so this avoids forcing size()'s
+           computation on every `//` for the long-lived "prev" accumulator. */
+        if (baseLayer)
+            return false;
+        return numAttrsInChain == 0;
     }
 
     class iterator
@@ -348,7 +409,10 @@ public:
     void push_back(const Attr & attr)
     {
         attrs[numAttrs++] = attr;
-        numAttrsInChain = numAttrs;
+        // layerOnTopOf runs before push_back for a layered Bindings, so
+        // numAttrsInChain is already reset to the "not computed" sentinel.
+        if (!baseLayer)
+            numAttrsInChain = numAttrs;
     }
 
     /**
@@ -359,6 +423,17 @@ public:
         auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
             auto first = chunk.attrs;
             auto last = first + chunk.numAttrs;
+            /* Most Bindings are tiny; a sorted linear scan with early-exit
+               beats std::lower_bound's pointer-jumping at this size. */
+            if (chunk.numAttrs <= linearScanThreshold) {
+                for (const Attr * i = first; i != last; ++i) {
+                    if (i->name == key.name)
+                        return i;
+                    if (key.name < i->name)
+                        return nullptr;
+                }
+                return nullptr;
+            }
             const Attr * i = std::lower_bound(first, last, key);
             if (i != last && i->name == key.name)
                 return i;
@@ -391,6 +466,20 @@ public:
     {
         return numLayers > 1;
     }
+
+    /**
+     * Merge a run of layers below `this` into one flat layer, to free up
+     * layer-chain budget for further layering. `this`'s own attrs are never
+     * merged: `get()`/iteration always check them first, so a copy would be
+     * dead weight and would also skew the cost model used to pick the run
+     * (see attr-set.cc), which self-corrects for an oversized layer without
+     * needing a special case.
+     *
+     * Mutates only @ref baseLayer / @ref numLayers (both `mutable` for this
+     * reason); doesn't change `get()`, iteration, or size() results.
+     * Returns true if compaction happened.
+     */
+    bool compactTopLayers(EvalMemory & mem, SymbolTable & symbols) const;
 
     const_iterator begin() const
     {
@@ -465,55 +554,6 @@ private:
     {
     }
 
-    bool hasBaseLayer() const noexcept
-    {
-        return bindings->baseLayer;
-    }
-
-    /**
-     * If the bindings gets "layered" on top of another we need to recalculate
-     * the number of unique attributes in the chain.
-     *
-     * This is done by either iterating over the base "layer" and the newly added
-     * attributes and counting duplicates. If the base "layer" is big this approach
-     * is inefficient and we fall back to doing per-element binary search in the base
-     * "layer".
-     */
-    void finishSizeIfNecessary()
-    {
-        if (!hasBaseLayer())
-            return;
-
-        auto & base = *bindings->baseLayer;
-        auto attrs = std::span(bindings->attrs, bindings->numAttrs);
-
-        Bindings::size_type duplicates = 0;
-
-        /* If the base bindings is smaller than the newly added attributes
-           iterate using std::set_intersection to run in O(|base| + |attrs|) =
-           O(|attrs|). Otherwise use an O(|attrs| * log(|base|)) per-attr binary
-           search to check for duplicates. Note that if we are in this code path then
-           |attrs| <= bindingsUpdateLayerRhsSizeThreshold, which 16 by default. We are
-           optimizing for the case when a small attribute set gets "layered" on top of
-           a much larger one. When attrsets are already small it's fine to do a linear
-           scan, but we should avoid expensive iterations over large "base" attrsets. */
-        if (attrs.size() > base.size()) {
-            std::set_intersection(
-                base.begin(),
-                base.end(),
-                attrs.begin(),
-                attrs.end(),
-                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
-        } else {
-            for (const auto & attr : attrs) {
-                if (base.get(attr.name))
-                    ++duplicates;
-            }
-        }
-
-        bindings->numAttrsInChain = base.numAttrsInChain + attrs.size() - duplicates;
-    }
-
 public:
     std::reference_wrapper<EvalMemory> mem;
     std::reference_wrapper<SymbolTable> symbols;
@@ -548,6 +588,8 @@ public:
     {
         bindings->baseLayer = &base;
         bindings->numLayers = base.numLayers + 1;
+        // Reset to the "not computed" sentinel now that it's layered.
+        bindings->numAttrsInChain = 0;
     }
 
     Value & alloc(Symbol name, PosIdx pos = noPos);
@@ -557,13 +599,11 @@ public:
     const Bindings * finish()
     {
         bindings->sort();
-        finishSizeIfNecessary();
         return bindings;
     }
 
     const Bindings * alreadySorted()
     {
-        finishSizeIfNecessary();
         return bindings;
     }
 
