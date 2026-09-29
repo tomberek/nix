@@ -95,13 +95,19 @@ private:
 
     /**
      * Length of the layers list.
+     *
+     * Mutable: @ref compactTopLayers may reduce this (splicing out
+     * compacted layers) without changing this object's identity.
      */
-    uint32_t numLayers = 1;
+    mutable uint32_t numLayers = 1;
 
     /**
      * Bindings that this attrset is "layered" on top of.
+     *
+     * Mutable: @ref compactTopLayers may repoint this to a new,
+     * pre-merged layer (see its doc comment).
      */
-    const Bindings * baseLayer = nullptr;
+    mutable const Bindings * baseLayer = nullptr;
 
     /**
      * Flexible array member of attributes.
@@ -117,6 +123,13 @@ private:
     ~Bindings() = default;
 
     friend class BindingsBuilder;
+
+    /**
+     * Lets mergeManySpans (attr-set.cc) size its merge-cursor heap as a
+     * stack-allocated static_vector instead of heap-allocating.
+     */
+    friend const Bindings *
+    mergeManySpans(EvalMemory & mem, SymbolTable & symbols, std::span<const std::span<const Attr>> spans);
 
     /**
      * Maximum length of the Bindings layer chains.
@@ -453,6 +466,20 @@ public:
     {
         return numLayers > 1;
     }
+
+    /**
+     * Merge a run of layers below `this` into one flat layer, to free up
+     * layer-chain budget for further layering. `this`'s own attrs are never
+     * merged: `get()`/iteration always check them first, so a copy would be
+     * dead weight and would also skew the cost model used to pick the run
+     * (see attr-set.cc), which self-corrects for an oversized layer without
+     * needing a special case.
+     *
+     * Mutates only @ref baseLayer / @ref numLayers (both `mutable` for this
+     * reason); doesn't change `get()`, iteration, or size() results.
+     * Returns true if compaction happened.
+     */
+    bool compactTopLayers(EvalMemory & mem, SymbolTable & symbols) const;
 
     const_iterator begin() const
     {
