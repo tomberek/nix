@@ -477,6 +477,10 @@ public:
           as a right operand in an [attribute set update expression](@docroot@/language/operators.md#update),
           uses a more space-efficient linked-list representation of attribute sets.
 
+          This only caps the right operand when it's the *larger* side: a right operand
+          smaller than the left operand (e.g. `prev // overlay`) always uses this
+          representation regardless of this setting.
+
           Setting this to larger values generally leads to less memory allocations,
           but may lead to worse evaluation performance.
 
