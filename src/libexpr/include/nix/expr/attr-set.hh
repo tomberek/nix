@@ -134,7 +134,7 @@ private:
     /**
      * Maximum length of the Bindings layer chains.
      */
-    static constexpr unsigned maxLayers = 16;
+    static constexpr unsigned maxLayers = 32;
 
     /**
      * Below this many attrs, Bindings::get uses a linear scan instead of
