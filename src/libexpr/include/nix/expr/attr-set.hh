@@ -264,6 +264,14 @@ public:
          */
         bool doMerge = true;
 
+        /**
+         * Fast path for the common case (~2 layers observed on average): a
+         * plain two-cursor merge instead of cursorHeap's heap machinery.
+         * Falls back to the general k-way merge for 3+ layers.
+         */
+        bool doTwo = false;
+        BindingsCursor cursor0, cursor1;
+
         void push(BindingsCursor cursor) noexcept
         {
             cursorHeap.push_back(cursor);
@@ -312,12 +320,38 @@ public:
             return cursor;
         }
 
+        /**
+         * Advance the two-cursor merge by one step: yield the smaller name
+         * (cursor0 wins ties), skipping a shadowed duplicate in the other
+         * cursor if present.
+         */
+        void advanceTwo() noexcept
+        {
+            bool active0 = cursor0.current != cursor0.end;
+            bool active1 = cursor1.current != cursor1.end;
+
+            if (!active0 && !active1) {
+                current = nullptr;
+                return;
+            }
+
+            if (active0 && (!active1 || cursor0.current->name <= cursor1.current->name)) {
+                current = cursor0.current;
+                ++cursor0.current;
+                if (active1 && cursor1.current->name == current->name)
+                    ++cursor1.current;
+            } else {
+                current = cursor1.current;
+                ++cursor1.current;
+            }
+        }
+
         explicit iterator(const Bindings & attrs) noexcept
             : doMerge(attrs.baseLayer)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
                 auto first = layer.attrs;
-                push(
+                cursorHeap.push_back(
                     BindingsCursor{
                         .current = first,
                         .end = first + layer.numAttrs,
@@ -342,9 +376,19 @@ public:
                 layer = layer->baseLayer;
             }
 
+            if (cursorHeap.size() == 2) {
+                doTwo = true;
+                cursor0 = cursorHeap[0];
+                cursor1 = cursorHeap[1];
+                cursorHeap.clear();
+                advanceTwo();
+                return;
+            }
+
             if (cursorHeap.empty())
                 return;
 
+            std::ranges::make_heap(cursorHeap, comp);
             next(pop());
         }
 
@@ -367,6 +411,11 @@ public:
                 ++current;
                 if (current == cursorHeap.front().end)
                     return finished();
+                return *this;
+            }
+
+            if (doTwo) {
+                advanceTwo();
                 return *this;
             }
 
