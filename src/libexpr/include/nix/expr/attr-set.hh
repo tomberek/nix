@@ -150,22 +150,17 @@ private:
     ~Bindings() = default;
 
     /**
-     * This Bindings' own attrs count: either @ref numAttrs directly, or (if
-     * @ref isBorrowing) @ref borrowedSource's.
+     * This Bindings' own attrs, as a span -- @ref borrowedSource's if
+     * @ref isBorrowing, else @ref attrs / @ref numAttrs directly. Checks
+     * @ref isBorrowing once, not twice like two separate accessors would.
      */
-    size_type ownAttrsCount() const noexcept
+    std::span<const Attr> ownAttrs() const noexcept
     {
-        return isBorrowing() ? borrowedSource()->numAttrs : numAttrs;
-    }
-
-    /**
-     * This Bindings' own attrs: either @ref attrs (the common case, owned,
-     * embedded right after this object) or @ref borrowedSource's (borrowed
-     * from another Bindings, never copied).
-     */
-    const Attr * ownAttrsData() const noexcept
-    {
-        return isBorrowing() ? borrowedSource()->attrs : attrs;
+        if (isBorrowing()) [[unlikely]] {
+            auto * source = borrowedSource();
+            return {source->attrs, source->numAttrs};
+        }
+        return {attrs, numAttrs};
     }
 
     friend class BindingsBuilder;
@@ -183,7 +178,7 @@ private:
     void computeChainSize() const noexcept
     {
         auto & base = *baseLayer;
-        auto ownAttrs = std::span(ownAttrsData(), ownAttrsCount());
+        auto ownAttrs = this->ownAttrs();
 
         size_type duplicates = 0;
 
@@ -359,29 +354,29 @@ public:
             : doMerge(attrs.baseLayer)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
-                auto first = layer.ownAttrsData();
-                push(
-                    BindingsCursor{
-                        .current = first,
-                        .end = first + layer.ownAttrsCount(),
-                        .priority = priority++,
-                    });
+                auto span = layer.ownAttrs();
+                if (!span.empty())
+                    push(
+                        BindingsCursor{
+                            .current = span.data(),
+                            .end = span.data() + span.size(),
+                            .priority = priority++,
+                        });
+                return span;
             };
 
             if (!doMerge) {
                 if (attrs.empty())
                     return;
 
-                current = attrs.ownAttrsData();
-                pushBindings(attrs);
+                current = pushBindings(attrs).data();
 
                 return;
             }
 
             const Bindings * layer = &attrs;
             while (layer) {
-                if (layer->ownAttrsCount() != 0)
-                    pushBindings(*layer);
+                pushBindings(*layer);
                 layer = layer->baseLayer;
             }
 
@@ -454,8 +449,9 @@ public:
     const Attr * get(Symbol name) const noexcept
     {
         auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
-            auto first = chunk.ownAttrsData();
-            auto last = first + chunk.ownAttrsCount();
+            auto span = chunk.ownAttrs();
+            const Attr * first = span.data();
+            const Attr * last = first + span.size();
             const Attr * i = std::lower_bound(first, last, key);
             if (i != last && i->name == key.name)
                 return i;
