@@ -22,6 +22,22 @@ Bindings * EvalMemory::allocBindings(size_t capacity)
     return new (allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity)) Bindings();
 }
 
+/* Allocate a Bindings that borrows source's attrs instead of copying them,
+   with base as its baseLayer -- see Bindings::isBorrowing. Stores source's
+   own address, not an interior pointer: this codebase runs Boehm with
+   GC_set_all_interior_pointers(0), which only tracks the former. */
+Bindings * EvalMemory::allocBorrowingBindings(const Bindings & source, const Bindings & base)
+{
+    assert(!source.isLayered());
+    stats.nrAttrsets++;
+    /* No new Attr storage, so no nrAttrsInAttrsets bump. */
+    auto * b = new (allocBytes(sizeof(Bindings) + sizeof(const Bindings *))) Bindings();
+    *reinterpret_cast<const Bindings **>(static_cast<void *>(b->attrs)) = &source;
+    b->baseLayer = &base;
+    b->numLayers = base.numLayers + 1;
+    return b;
+}
+
 Value & BindingsBuilder::alloc(Symbol name, PosIdx pos)
 {
     auto value = mem.get().allocValue();

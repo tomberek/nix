@@ -2014,6 +2014,16 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         return;
     }
 
+    /* attrs2 is bigger but flat: borrow its attrs instead of falling back
+       to a full copy just because it's the higher-priority side. Not
+       available if attrs2 is itself layered. */
+    bool shouldBorrow = threshold != 0 && !bindings1.isLayerListFull() && !bindings2.isLayered();
+
+    if (shouldBorrow) {
+        v.mkAttrs(state.mem.allocBorrowingBindings(bindings2, bindings1));
+        return;
+    }
+
     auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
 
     /* Merge the sets, preferring values from the second set.  Make

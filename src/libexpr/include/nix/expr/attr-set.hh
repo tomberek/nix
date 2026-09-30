@@ -113,9 +113,33 @@ private:
     const Bindings * baseLayer = nullptr;
 
     /**
-     * Flexible array member of attributes.
+     * Flexible array member of attributes -- or, for a borrowing Bindings
+     * (see @ref isBorrowing), a single `const Bindings *` in place of the
+     * Attr array.
      */
     Attr attrs[0];
+
+    /**
+     * A borrowing Bindings (see @ref EvalMemory::allocBorrowingBindings)
+     * has no attrs of its own. `numAttrs == 0` with @ref baseLayer set is
+     * otherwise unreachable -- layering always wraps a non-empty own-attrs
+     * array -- so it's a safe marker, with no extra field needed.
+     */
+    bool isBorrowing() const noexcept
+    {
+        return numAttrs == 0 && baseLayer != nullptr;
+    }
+
+    /**
+     * For a borrowing Bindings: the Bindings whose attrs it borrows, read
+     * from the tail allocation. Must be a base-of-allocation pointer, not
+     * an interior one -- this codebase runs Boehm with
+     * `GC_set_all_interior_pointers(0)`, which only tracks the former.
+     */
+    const Bindings * borrowedSource() const noexcept
+    {
+        return *reinterpret_cast<const Bindings * const *>(attrs);
+    }
 
     constexpr Bindings() = default;
     Bindings(const Bindings &) = delete;
@@ -124,6 +148,25 @@ private:
     Bindings & operator=(Bindings &&) = delete;
 
     ~Bindings() = default;
+
+    /**
+     * This Bindings' own attrs count: either @ref numAttrs directly, or (if
+     * @ref isBorrowing) @ref borrowedSource's.
+     */
+    size_type ownAttrsCount() const noexcept
+    {
+        return isBorrowing() ? borrowedSource()->numAttrs : numAttrs;
+    }
+
+    /**
+     * This Bindings' own attrs: either @ref attrs (the common case, owned,
+     * embedded right after this object) or @ref borrowedSource's (borrowed
+     * from another Bindings, never copied).
+     */
+    const Attr * ownAttrsData() const noexcept
+    {
+        return isBorrowing() ? borrowedSource()->attrs : attrs;
+    }
 
     friend class BindingsBuilder;
 
@@ -140,7 +183,7 @@ private:
     void computeChainSize() const noexcept
     {
         auto & base = *baseLayer;
-        auto ownAttrs = std::span(attrs, numAttrs);
+        auto ownAttrs = std::span(ownAttrsData(), ownAttrsCount());
 
         size_type duplicates = 0;
 
@@ -316,11 +359,11 @@ public:
             : doMerge(attrs.baseLayer)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
-                auto first = layer.attrs;
+                auto first = layer.ownAttrsData();
                 push(
                     BindingsCursor{
                         .current = first,
-                        .end = first + layer.numAttrs,
+                        .end = first + layer.ownAttrsCount(),
                         .priority = priority++,
                     });
             };
@@ -329,7 +372,7 @@ public:
                 if (attrs.empty())
                     return;
 
-                current = attrs.attrs;
+                current = attrs.ownAttrsData();
                 pushBindings(attrs);
 
                 return;
@@ -337,7 +380,7 @@ public:
 
             const Bindings * layer = &attrs;
             while (layer) {
-                if (layer->numAttrs != 0)
+                if (layer->ownAttrsCount() != 0)
                     pushBindings(*layer);
                 layer = layer->baseLayer;
             }
@@ -411,8 +454,8 @@ public:
     const Attr * get(Symbol name) const noexcept
     {
         auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
-            auto first = chunk.attrs;
-            auto last = first + chunk.numAttrs;
+            auto first = chunk.ownAttrsData();
+            auto last = first + chunk.ownAttrsCount();
             const Attr * i = std::lower_bound(first, last, key);
             if (i != last && i->name == key.name)
                 return i;
