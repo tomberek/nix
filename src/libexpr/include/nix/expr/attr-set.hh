@@ -8,6 +8,7 @@
 #include <boost/iterator/function_output_iterator.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <ranges>
 #include <optional>
@@ -90,8 +91,16 @@ private:
      * @ref computeChainSize): many layered accumulators are only ever read
      * via get() and never need this. 0 is never a real chain size, since
      * layering only happens between two non-empty Bindings.
+     *
+     * Atomic (relaxed) rather than a plain `mutable`: the computed value is
+     * deterministic, so concurrent writers racing to compute and store it
+     * would always agree on the value, but a plain non-atomic write would
+     * still be a data race (undefined behavior) under any future
+     * multi-threaded evaluator. Relaxed ordering is enough since no other
+     * memory access needs to be ordered against this one -- it's a pure
+     * function of already-fixed data, not a synchronization point.
      */
-    mutable size_type numAttrsInChain = 0;
+    mutable std::atomic<size_type> numAttrsInChain{0};
 
     /**
      * Length of the layers list.
@@ -152,15 +161,15 @@ private:
                     ++duplicates;
         }
 
-        numAttrsInChain = base.size() + ownAttrs.size() - duplicates;
+        numAttrsInChain.store(base.size() + ownAttrs.size() - duplicates, std::memory_order_relaxed);
     }
 
 public:
     size_type size() const
     {
-        if (baseLayer && numAttrsInChain == 0)
+        if (baseLayer && numAttrsInChain.load(std::memory_order_relaxed) == 0)
             computeChainSize();
-        return numAttrsInChain;
+        return numAttrsInChain.load(std::memory_order_relaxed);
     }
 
     bool empty() const
@@ -170,7 +179,7 @@ public:
            computation on every `//` for the long-lived "prev" accumulator. */
         if (baseLayer)
             return false;
-        return numAttrsInChain == 0;
+        return numAttrsInChain.load(std::memory_order_relaxed) == 0;
     }
 
     class iterator
@@ -393,7 +402,7 @@ public:
         // layerOnTopOf runs before push_back for a layered Bindings, so
         // numAttrsInChain is already reset to the "not computed" sentinel.
         if (!baseLayer)
-            numAttrsInChain = numAttrs;
+            numAttrsInChain.store(numAttrs, std::memory_order_relaxed);
     }
 
     /**
@@ -545,7 +554,7 @@ public:
         bindings->baseLayer = &base;
         bindings->numLayers = base.numLayers + 1;
         // Reset to the "not computed" sentinel now that it's layered.
-        bindings->numAttrsInChain = 0;
+        bindings->numAttrsInChain.store(0, std::memory_order_relaxed);
     }
 
     Value & alloc(Symbol name, PosIdx pos = noPos);
