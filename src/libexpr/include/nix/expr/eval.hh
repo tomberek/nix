@@ -369,12 +369,6 @@ public:
 
     Bindings * allocBindings(size_t capacity);
 
-    /**
-     * Allocate a Bindings that borrows `source`'s attrs instead of copying
-     * them, with `base` as its baseLayer. See @ref Bindings::isBorrowing.
-     */
-    Bindings * allocBorrowingBindings(const Bindings & source, const Bindings & base);
-
     BindingsBuilder buildBindings(SymbolTable & symbols, size_t capacity)
     {
         return BindingsBuilder(*this, symbols, allocBindings(capacity), capacity);

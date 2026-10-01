@@ -31,6 +31,7 @@
 #include "parser-tab.hh"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
@@ -1996,32 +1997,114 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         return;
     }
 
-    /* Layer attrs2 on attrs1 whenever it's cheaper than a full copy: attrs2
-       smaller than attrs1 (the common `prev // overlay` pattern), or under
-       the absolute threshold. threshold == 0 disables both checks. */
+    /* Layer the smaller side on top of the bigger side, instead of a full
+       copy -- whichever side ends up as the "own" layer is cheap to build
+       (bounded by the smaller side's size), and the bigger side is never
+       copied, just referenced as baseLayer. threshold == 0 disables this
+       entirely (full-copy fallback below). */
     auto threshold = state.settings.bindingsUpdateLayerRhsSizeThreshold.get();
-    bool shouldLayer = threshold != 0 && !bindings1.isLayerListFull()
-                       && (bindings2.size() <= threshold || bindings2.size() < bindings1.size());
 
-    if (shouldLayer) {
-        auto attrs = state.buildBindings(bindings2.size());
-        attrs.layerOnTopOf(bindings1);
+    if (threshold != 0) {
+        /* attrs2 (the winner) is the smaller-or-under-threshold side: it
+           always wins outright, so copy it into the own-slot verbatim (no
+           filtering needed) and reference attrs1 as baseLayer -- the common
+           `prev // overlay` pattern. */
+        if (!bindings1.isLayerListFull() && (bindings2.size() <= threshold || bindings2.size() < bindings1.size())) {
+            auto attrs = state.buildBindings(bindings2.size());
+            attrs.layerOnTopOf(bindings1);
 
-        std::ranges::copy(bindings2, std::back_inserter(attrs));
-        v.mkAttrs(attrs.alreadySorted());
+            std::ranges::copy(bindings2, std::back_inserter(attrs));
+            v.mkAttrs(attrs.alreadySorted());
 
-        state.nrOpUpdateValuesCopied += bindings2.size();
-        return;
-    }
+            state.nrOpUpdateValuesCopied += bindings2.size();
+            return;
+        }
 
-    /* attrs2 is bigger but flat: borrow its attrs instead of falling back
-       to a full copy just because it's the higher-priority side. Not
-       available if attrs2 is itself layered. */
-    bool shouldBorrow = threshold != 0 && !bindings1.isLayerListFull() && !bindings2.isLayered();
+        /* Otherwise attrs2 (the winner) is the bigger-or-equal side: filter
+           attrs1 (the loser) down to its own exclusive keys -- those not
+           shadowed by attrs2 -- and copy just that into the own-slot,
+           referencing attrs2 as baseLayer. A key present in both is
+           excluded from attrs1's own-slot, so it falls through to attrs2
+           and attrs2 correctly wins. attrs2 itself is never copied,
+           regardless of how big it is or whether it's flat or already
+           layered.
 
-    if (shouldBorrow) {
-        v.mkAttrs(state.mem.allocBorrowingBindings(bindings2, bindings1));
-        return;
+           Same tradeoff as Bindings::computeChainSize: a per-element binary
+           search costs O(attrs1 * log(attrs2)), cheap when attrs2 is much
+           bigger; a linear merge-join costs O(attrs1 + attrs2), cheaper
+           once the two are comparably sized and log(attrs2) stops being a
+           small factor. Pick whichever is analytically cheaper. (A
+           galloping-search hybrid of the two was tried and measured as a
+           wash-to-slight-regression against this simpler choice on real
+           workloads -- not worth the complexity.)
+
+           Only worth it above minFilterSize: avoiding attrs2's copy isn't
+           free even once construction is cheap -- the result stays a
+           2-layer chain forever, so every *future* get() on it walks both
+           layers instead of one flat array. Below the threshold, a flat
+           full copy keeps all future lookups single-layer-cheap, which
+           matters more than the one-time copy it costs now.
+
+           Also gated on attrs1's own (pre-filter) size via
+           maxFilterBaseSize: attrs1.size() is a cheap upper bound on the
+           own-slot's post-filter size, which is what every future lookup
+           pays as its "miss in own-slot before falling to attrs2" tax.
+           Measured on real workloads: the own-slot is usually tiny (tens
+           of elements) for the biggest attrs2 events, but a long tail of
+           medium-attrs2 events can carry an own-slot in the thousands --
+           those pay a real, repeated tax disproportionate to their
+           (smaller) memory win. Capping attrs1's size excludes just that
+           tail, falling back to a flat full copy for it instead. */
+        static const size_t minFilterSize = [] {
+            if (auto * s = getenv("NIX_MIN_FILTER_SIZE"))
+                return (size_t) atoi(s);
+            return (size_t) 1024;
+        }();
+        static const size_t maxFilterBaseSize = [] {
+            if (auto * s = getenv("NIX_MAX_FILTER_BASE_SIZE"))
+                return (size_t) atoi(s);
+            return (size_t) 500;
+        }();
+        if (!bindings2.isLayerListFull() && bindings2.size() >= minFilterSize
+            && bindings1.size() <= maxFilterBaseSize) {
+            auto attrs = state.buildBindings(bindings1.size());
+            attrs.layerOnTopOf(bindings2);
+
+            size_t copied = 0;
+            auto log2Size2 = std::bit_width(bindings2.size());
+            if (bindings1.size() * log2Size2 <= bindings1.size() + bindings2.size()) {
+                for (auto & attr : bindings1) {
+                    if (!bindings2.get(attr.name)) {
+                        attrs.insert(attr);
+                        ++copied;
+                    }
+                }
+            } else {
+                auto i = bindings1.begin();
+                auto j = bindings2.begin();
+                while (i != bindings1.end() && j != bindings2.end()) {
+                    if (i->name == j->name) {
+                        ++i;
+                        ++j;
+                    } else if (i->name < j->name) {
+                        attrs.insert(*i);
+                        ++copied;
+                        ++i;
+                    } else {
+                        ++j;
+                    }
+                }
+                while (i != bindings1.end()) {
+                    attrs.insert(*i);
+                    ++copied;
+                    ++i;
+                }
+            }
+            v.mkAttrs(attrs.alreadySorted());
+
+            state.nrOpUpdateValuesCopied += copied;
+            return;
+        }
     }
 
     auto attrs = state.buildBindings(bindings1.size() + bindings2.size());

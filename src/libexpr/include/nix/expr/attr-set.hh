@@ -113,33 +113,9 @@ private:
     const Bindings * baseLayer = nullptr;
 
     /**
-     * Flexible array member of attributes -- or, for a borrowing Bindings
-     * (see @ref isBorrowing), a single `const Bindings *` in place of the
-     * Attr array.
+     * Flexible array member of attributes.
      */
     Attr attrs[0];
-
-    /**
-     * A borrowing Bindings (see @ref EvalMemory::allocBorrowingBindings)
-     * has no attrs of its own. `numAttrs == 0` with @ref baseLayer set is
-     * otherwise unreachable -- layering always wraps a non-empty own-attrs
-     * array -- so it's a safe marker, with no extra field needed.
-     */
-    bool isBorrowing() const noexcept
-    {
-        return numAttrs == 0 && baseLayer != nullptr;
-    }
-
-    /**
-     * For a borrowing Bindings: the Bindings whose attrs it borrows, read
-     * from the tail allocation. Must be a base-of-allocation pointer, not
-     * an interior one -- this codebase runs Boehm with
-     * `GC_set_all_interior_pointers(0)`, which only tracks the former.
-     */
-    const Bindings * borrowedSource() const noexcept
-    {
-        return *reinterpret_cast<const Bindings * const *>(attrs);
-    }
 
     constexpr Bindings() = default;
     Bindings(const Bindings &) = delete;
@@ -150,16 +126,10 @@ private:
     ~Bindings() = default;
 
     /**
-     * This Bindings' own attrs, as a span -- @ref borrowedSource's if
-     * @ref isBorrowing, else @ref attrs / @ref numAttrs directly. Checks
-     * @ref isBorrowing once, not twice like two separate accessors would.
+     * This Bindings' own attrs, as a span.
      */
     std::span<const Attr> ownAttrs() const noexcept
     {
-        if (isBorrowing()) [[unlikely]] {
-            auto * source = borrowedSource();
-            return {source->attrs, source->numAttrs};
-        }
         return {attrs, numAttrs};
     }
 
