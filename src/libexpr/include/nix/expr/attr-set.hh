@@ -12,6 +12,7 @@
 #include <functional>
 #include <ranges>
 #include <optional>
+#include <vector>
 
 namespace nix {
 
@@ -85,20 +86,10 @@ private:
 
     /**
      * Number of attributes with unique names in the layer chain -- the
-     * *real* size, whereas @ref numAttrs is just this layer's own count.
-     *
-     * Computed lazily (0 = not yet computed, see @ref size /
-     * @ref computeChainSize): many layered accumulators are only ever read
-     * via get() and never need this. 0 is never a real chain size, since
-     * layering only happens between two non-empty Bindings.
-     *
-     * Atomic (relaxed) rather than a plain `mutable`: the computed value is
-     * deterministic, so concurrent writers racing to compute and store it
-     * would always agree on the value, but a plain non-atomic write would
-     * still be a data race (undefined behavior) under any future
-     * multi-threaded evaluator. Relaxed ordering is enough since no other
-     * memory access needs to be ordered against this one -- it's a pure
-     * function of already-fixed data, not a synchronization point.
+     * real size, vs. @ref numAttrs which is just this layer's own count.
+     * Computed lazily (0 = not yet computed; never a real chain size,
+     * since layering requires two non-empty Bindings). Atomic since
+     * concurrent writers may race to compute and store it.
      */
     mutable std::atomic<size_type> numAttrsInChain{0};
 
@@ -124,6 +115,14 @@ private:
     Bindings & operator=(Bindings &&) = delete;
 
     ~Bindings() = default;
+
+    /**
+     * This Bindings' own attrs, as a span.
+     */
+    std::span<const Attr> ownAttrs() const noexcept
+    {
+        return {attrs, numAttrs};
+    }
 
     friend class BindingsBuilder;
 
@@ -264,6 +263,14 @@ public:
          */
         bool doMerge = true;
 
+        /**
+         * Fast path for the common case (~2 layers observed on average): a
+         * plain two-cursor merge instead of cursorHeap's heap machinery.
+         * Falls back to the general k-way merge for 3+ layers.
+         */
+        bool doTwo = false;
+        BindingsCursor cursor0, cursor1;
+
         void push(BindingsCursor cursor) noexcept
         {
             cursorHeap.push_back(cursor);
@@ -312,12 +319,38 @@ public:
             return cursor;
         }
 
+        /**
+         * Advance the two-cursor merge by one step: yield the smaller name
+         * (cursor0 wins ties), skipping a shadowed duplicate in the other
+         * cursor if present.
+         */
+        void advanceTwo() noexcept
+        {
+            bool active0 = cursor0.current != cursor0.end;
+            bool active1 = cursor1.current != cursor1.end;
+
+            if (!active0 && !active1) {
+                current = nullptr;
+                return;
+            }
+
+            if (active0 && (!active1 || cursor0.current->name <= cursor1.current->name)) {
+                current = cursor0.current;
+                ++cursor0.current;
+                if (active1 && cursor1.current->name == current->name)
+                    ++cursor1.current;
+            } else {
+                current = cursor1.current;
+                ++cursor1.current;
+            }
+        }
+
         explicit iterator(const Bindings & attrs) noexcept
             : doMerge(attrs.baseLayer)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
                 auto first = layer.attrs;
-                push(
+                cursorHeap.push_back(
                     BindingsCursor{
                         .current = first,
                         .end = first + layer.numAttrs,
@@ -342,9 +375,19 @@ public:
                 layer = layer->baseLayer;
             }
 
+            if (cursorHeap.size() == 2) {
+                doTwo = true;
+                cursor0 = cursorHeap[0];
+                cursor1 = cursorHeap[1];
+                cursorHeap.clear();
+                advanceTwo();
+                return;
+            }
+
             if (cursorHeap.empty())
                 return;
 
+            std::ranges::make_heap(cursorHeap, comp);
             next(pop());
         }
 
@@ -367,6 +410,11 @@ public:
                 ++current;
                 if (current == cursorHeap.front().end)
                     return finished();
+                return *this;
+            }
+
+            if (doTwo) {
+                advanceTwo();
                 return *this;
             }
 
@@ -445,6 +493,51 @@ public:
     {
         return numLayers > 1;
     }
+
+    /**
+     * The Bindings this one is layered on top of, or nullptr if not
+     * layered.
+     */
+    const Bindings * baseLayerPtr() const noexcept
+    {
+        return baseLayer;
+    }
+
+    /**
+     * How close in size an overlay must be to this layer's own attrs
+     * (within this ratio either way) for @ref absorbInto to apply.
+     */
+    static constexpr unsigned absorbRatio = 2;
+
+    /**
+     * Whether `overlay` is comparably sized to this layer's own attrs
+     * and this layer is already layered -- i.e. whether to fold
+     * `overlay` in via @ref absorbInto instead of stacking it as a new
+     * layer. Cheap: no allocation.
+     */
+    bool canAbsorb(const Bindings & overlay) const noexcept
+    {
+        if (!baseLayer)
+            return false;
+        auto overlaySize = overlay.size();
+        return overlaySize <= (size_type) numAttrs * absorbRatio && numAttrs <= overlaySize * absorbRatio;
+    }
+
+    /**
+     * Exact post-dedup size of this layer's own attrs merged with
+     * `overlay` -- the capacity @ref absorbInto needs. Only call after
+     * @ref canAbsorb.
+     */
+    size_t absorbedSize(const Bindings & overlay) const noexcept;
+
+    /**
+     * Merge-join this layer's own attrs with `overlay` into `attrs`
+     * (already layered onto @ref baseLayerPtr()), instead of stacking
+     * `overlay` as a new layer -- bounds chain depth logarithmically
+     * rather than linearly in the number of merges. Only call after
+     * @ref canAbsorb. Returns the count inserted.
+     */
+    size_t absorbInto(const Bindings & overlay, BindingsBuilder & attrs) const;
 
     const_iterator begin() const
     {

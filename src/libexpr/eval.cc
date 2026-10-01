@@ -31,6 +31,7 @@
 #include "parser-tab.hh"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
@@ -1980,6 +1981,66 @@ void ExprOpImpl::eval(EvalState & state, Env & env, Value & v)
         || state.evalBool(env, e2, "in the right operand of '->'"));
 }
 
+namespace {
+
+/* Out of line and noinline: this path shares a function with
+   ExprOpUpdate::eval's hot shouldLayer path, and inlining it measurably
+   slowed that unrelated path down (icache/branch-predictor pressure),
+   even though shouldLayer never touches this code. */
+[[gnu::noinline]] std::optional<size_t>
+tryFilterAndLayer(EvalState & state, Value & v, const Bindings & bindings1, const Bindings & bindings2)
+{
+    /* Filter attrs1 down to keys not shadowed by attrs2, and layer that
+       on top of attrs2 instead of copying it. Picks binary search or a
+       linear merge-join, whichever is cheaper for the sizes involved.
+       minFilterSize/maxFilterBaseSize bound the cost: below them, a flat
+       copy keeps future lookups single-layer-cheap instead of paying a
+       permanent two-layer lookup tax. */
+    constexpr size_t minFilterSize = 1024;
+    constexpr size_t maxFilterBaseSize = 500;
+    if (bindings2.isLayerListFull() || bindings2.size() < minFilterSize || bindings1.size() > maxFilterBaseSize)
+        return std::nullopt;
+
+    auto attrs = state.buildBindings(bindings1.size());
+    attrs.layerOnTopOf(bindings2);
+
+    size_t copied = 0;
+    auto log2Size2 = std::bit_width(bindings2.size());
+    if (bindings1.size() * log2Size2 <= bindings1.size() + bindings2.size()) {
+        for (auto & attr : bindings1) {
+            if (!bindings2.get(attr.name)) {
+                attrs.insert(attr);
+                ++copied;
+            }
+        }
+    } else {
+        auto i = bindings1.begin();
+        auto j = bindings2.begin();
+        while (i != bindings1.end() && j != bindings2.end()) {
+            if (i->name == j->name) {
+                ++i;
+                ++j;
+            } else if (i->name < j->name) {
+                attrs.insert(*i);
+                ++copied;
+                ++i;
+            } else {
+                ++j;
+            }
+        }
+        while (i != bindings1.end()) {
+            attrs.insert(*i);
+            ++copied;
+            ++i;
+        }
+    }
+    v.mkAttrs(attrs.alreadySorted());
+
+    return copied;
+}
+
+} // namespace
+
 void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
@@ -1996,22 +2057,44 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         return;
     }
 
-    /* Layer attrs2 on attrs1 whenever it's cheaper than a full copy: attrs2
-       smaller than attrs1 (the common `prev // overlay` pattern), or under
-       the absolute threshold. threshold == 0 disables both checks. */
+    /* Layer the smaller side on top of the bigger side instead of
+       copying: the "own" layer costs only the smaller size to build, and
+       the bigger side is just referenced as baseLayer. threshold == 0
+       disables this (full-copy fallback below). */
     auto threshold = state.settings.bindingsUpdateLayerRhsSizeThreshold.get();
-    bool shouldLayer = threshold != 0 && !bindings1.isLayerListFull()
-                       && (bindings2.size() <= threshold || bindings2.size() < bindings1.size());
 
-    if (shouldLayer) {
-        auto attrs = state.buildBindings(bindings2.size());
-        attrs.layerOnTopOf(bindings1);
+    if (threshold != 0) {
+        /* attrs2 is small: layer it on attrs1 (the common
+           `prev // overlay` pattern), or fold it into attrs1's top
+           layer via canAbsorb/absorbInto if comparably sized. */
+        if (!bindings1.isLayerListFull() && (bindings2.size() <= threshold || bindings2.size() < bindings1.size())) {
+            if (bindings1.canAbsorb(bindings2)) {
+                auto attrs = state.buildBindings(bindings1.absorbedSize(bindings2));
+                attrs.layerOnTopOf(*bindings1.baseLayerPtr());
 
-        std::ranges::copy(bindings2, std::back_inserter(attrs));
-        v.mkAttrs(attrs.alreadySorted());
+                auto copied = bindings1.absorbInto(bindings2, attrs);
+                v.mkAttrs(attrs.alreadySorted());
 
-        state.nrOpUpdateValuesCopied += bindings2.size();
-        return;
+                state.nrOpUpdateValuesCopied += copied;
+                return;
+            }
+
+            auto attrs = state.buildBindings(bindings2.size());
+            attrs.layerOnTopOf(bindings1);
+
+            std::ranges::copy(bindings2, std::back_inserter(attrs));
+            v.mkAttrs(attrs.alreadySorted());
+
+            state.nrOpUpdateValuesCopied += bindings2.size();
+            return;
+        }
+
+        /* Otherwise attrs2 is the bigger-or-equal side -- see
+           tryFilterAndLayer for the mechanism and its size gates. */
+        if (auto copied = tryFilterAndLayer(state, v, bindings1, bindings2)) {
+            state.nrOpUpdateValuesCopied += *copied;
+            return;
+        }
     }
 
     auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
