@@ -12,6 +12,7 @@
 #include <functional>
 #include <ranges>
 #include <optional>
+#include <vector>
 
 namespace nix {
 
@@ -502,6 +503,66 @@ public:
     bool isLayered() const noexcept
     {
         return numLayers > 1;
+    }
+
+    /**
+     * For a layered Bindings: the Bindings it's layered on top of. nullptr
+     * if not layered.
+     */
+    const Bindings * baseLayerPtr() const noexcept
+    {
+        return baseLayer;
+    }
+
+    /**
+     * How close in size an overlay must be to this layer's own attrs for
+     * @ref tryAbsorb to fold them together instead of stacking a new
+     * layer -- "comparably sized" means within this ratio either way.
+     */
+    static constexpr unsigned absorbRatio = 2;
+
+    /**
+     * Try to fold `overlay` into this layer's own attrs, instead of
+     * stacking it as a new layer on top -- used by ExprOpUpdate::eval's
+     * shouldLayer path right before it would otherwise call layerOnTopOf.
+     * Keeps chain depth bounded by roughly log(number of merges) instead
+     * of growing by one layer per merge: a run of similarly-sized
+     * overlays (the case that makes a plain growing chain expensive to
+     * fully iterate later, e.g. attrNames on a long module-system-style
+     * accumulation) gets folded together into one bigger layer, each
+     * fold roughly doubling that layer's size, so depth grows
+     * logarithmically instead of linearly in the number of merges.
+     *
+     * Only applies when this layer is itself already layered (nothing to
+     * absorb into otherwise) and `overlay` is "comparably sized" to this
+     * layer's own attrs -- within @ref absorbRatio either way. Chains of
+     * overlays with wildly different sizes don't trigger this and layer
+     * normally, same as before this existed.
+     *
+     * Returns the combined, sorted, deduplicated replacement for this
+     * layer's own attrs (this layer's own-exclusive keys, i.e. not
+     * shadowed by overlay, plus all of overlay's), ready to be layered
+     * directly onto @ref baseLayerPtr() -- or nullopt if absorption
+     * doesn't apply, in which case the caller should layer normally.
+     */
+    std::optional<std::vector<Attr>> tryAbsorb(const Bindings & overlay) const
+    {
+        if (!baseLayer)
+            return std::nullopt;
+
+        auto overlaySize = overlay.size();
+        if (overlaySize > (size_type) numAttrs * absorbRatio || numAttrs > overlaySize * absorbRatio)
+            return std::nullopt;
+
+        std::vector<Attr> combined;
+        combined.reserve((size_t) numAttrs + overlaySize);
+        for (auto & attr : ownAttrs())
+            if (!overlay.get(attr.name))
+                combined.push_back(attr);
+        for (auto & attr : overlay)
+            combined.push_back(attr);
+        std::sort(combined.begin(), combined.end());
+        return combined;
     }
 
     const_iterator begin() const

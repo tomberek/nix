@@ -2106,8 +2106,29 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         /* attrs2 (the winner) is the smaller-or-under-threshold side: it
            always wins outright, so copy it into the own-slot verbatim (no
            filtering needed) and reference attrs1 as baseLayer -- the common
-           `prev // overlay` pattern. */
+           `prev // overlay` pattern.
+
+           Unless attrs1's own top layer is comparably sized to attrs2 (see
+           Bindings::tryAbsorb) -- a run of similarly-sized overlays is
+           exactly the pattern that otherwise grows the chain by one layer
+           per merge, making a later full iteration (attrNames, etc.) pay
+           for walking the whole chain via the general k-way merge instead
+           of a flat array. Folding them together as they arrive keeps
+           chain depth bounded logarithmically instead of linearly in the
+           number of merges, with no fixed depth cutoff. */
         if (!bindings1.isLayerListFull() && (bindings2.size() <= threshold || bindings2.size() < bindings1.size())) {
+            if (auto combined = bindings1.tryAbsorb(bindings2)) {
+                auto attrs = state.buildBindings(combined->size());
+                attrs.layerOnTopOf(*bindings1.baseLayerPtr());
+
+                for (auto & attr : *combined)
+                    attrs.insert(attr);
+                v.mkAttrs(attrs.alreadySorted());
+
+                state.nrOpUpdateValuesCopied += combined->size();
+                return;
+            }
+
             auto attrs = state.buildBindings(bindings2.size());
             attrs.layerOnTopOf(bindings1);
 
