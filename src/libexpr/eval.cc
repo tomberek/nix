@@ -1981,6 +1981,104 @@ void ExprOpImpl::eval(EvalState & state, Env & env, Value & v)
         || state.evalBool(env, e2, "in the right operand of '->'"));
 }
 
+namespace {
+
+/* Out of line and noinline so this (large, rarely-taken) code doesn't bloat
+   ExprOpUpdate::eval's body -- that function's common shouldLayer path is
+   hot, and sharing a function with a lot of rarely-taken code measurably
+   slowed it down (icache/branch-predictor pressure), even though that path
+   never touches this code at all. Returns false if attrs2 doesn't qualify,
+   leaving the full-copy fallback in ExprOpUpdate::eval to handle it. */
+[[gnu::noinline]] std::optional<size_t>
+tryFilterAndLayer(EvalState & state, Value & v, const Bindings & bindings1, const Bindings & bindings2)
+{
+    /* attrs2 (the winner) is the bigger-or-equal side: filter attrs1 (the
+       loser) down to its own exclusive keys -- those not shadowed by
+       attrs2 -- and copy just that into the own-slot, referencing attrs2
+       as baseLayer. A key present in both is excluded from attrs1's
+       own-slot, so it falls through to attrs2 and attrs2 correctly wins.
+       attrs2 itself is never copied, regardless of how big it is or
+       whether it's flat or already layered.
+
+       Same tradeoff as Bindings::computeChainSize: a per-element binary
+       search costs O(attrs1 * log(attrs2)), cheap when attrs2 is much
+       bigger; a linear merge-join costs O(attrs1 + attrs2), cheaper once
+       the two are comparably sized and log(attrs2) stops being a small
+       factor. Pick whichever is analytically cheaper. (A galloping-search
+       hybrid of the two was tried and measured as a wash-to-slight-
+       regression against this simpler choice on real workloads -- not
+       worth the complexity.)
+
+       Only worth it above minFilterSize: avoiding attrs2's copy isn't free
+       even once construction is cheap -- the result stays a 2-layer chain
+       forever, so every *future* get() on it walks both layers instead of
+       one flat array. Below the threshold, a flat full copy keeps all
+       future lookups single-layer-cheap, which matters more than the
+       one-time copy it costs now.
+
+       Also gated on attrs1's own (pre-filter) size via maxFilterBaseSize:
+       attrs1.size() is a cheap upper bound on the own-slot's post-filter
+       size, which is what every future lookup pays as its "miss in
+       own-slot before falling to attrs2" tax. Measured on real workloads:
+       the own-slot is usually tiny (tens of elements) for the biggest
+       attrs2 events, but a long tail of medium-attrs2 events can carry an
+       own-slot in the thousands -- those pay a real, repeated tax
+       disproportionate to their (smaller) memory win. Capping attrs1's
+       size excludes just that tail, falling back to a flat full copy for
+       it instead. */
+    static const size_t minFilterSize = [] {
+        if (auto * s = getenv("NIX_MIN_FILTER_SIZE"))
+            return (size_t) atoi(s);
+        return (size_t) 1024;
+    }();
+    static const size_t maxFilterBaseSize = [] {
+        if (auto * s = getenv("NIX_MAX_FILTER_BASE_SIZE"))
+            return (size_t) atoi(s);
+        return (size_t) 500;
+    }();
+    if (bindings2.isLayerListFull() || bindings2.size() < minFilterSize || bindings1.size() > maxFilterBaseSize)
+        return std::nullopt;
+
+    auto attrs = state.buildBindings(bindings1.size());
+    attrs.layerOnTopOf(bindings2);
+
+    size_t copied = 0;
+    auto log2Size2 = std::bit_width(bindings2.size());
+    if (bindings1.size() * log2Size2 <= bindings1.size() + bindings2.size()) {
+        for (auto & attr : bindings1) {
+            if (!bindings2.get(attr.name)) {
+                attrs.insert(attr);
+                ++copied;
+            }
+        }
+    } else {
+        auto i = bindings1.begin();
+        auto j = bindings2.begin();
+        while (i != bindings1.end() && j != bindings2.end()) {
+            if (i->name == j->name) {
+                ++i;
+                ++j;
+            } else if (i->name < j->name) {
+                attrs.insert(*i);
+                ++copied;
+                ++i;
+            } else {
+                ++j;
+            }
+        }
+        while (i != bindings1.end()) {
+            attrs.insert(*i);
+            ++copied;
+            ++i;
+        }
+    }
+    v.mkAttrs(attrs.alreadySorted());
+
+    return copied;
+}
+
+} // namespace
+
 void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
@@ -2020,89 +2118,13 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
             return;
         }
 
-        /* Otherwise attrs2 (the winner) is the bigger-or-equal side: filter
-           attrs1 (the loser) down to its own exclusive keys -- those not
-           shadowed by attrs2 -- and copy just that into the own-slot,
-           referencing attrs2 as baseLayer. A key present in both is
-           excluded from attrs1's own-slot, so it falls through to attrs2
-           and attrs2 correctly wins. attrs2 itself is never copied,
-           regardless of how big it is or whether it's flat or already
-           layered.
-
-           Same tradeoff as Bindings::computeChainSize: a per-element binary
-           search costs O(attrs1 * log(attrs2)), cheap when attrs2 is much
-           bigger; a linear merge-join costs O(attrs1 + attrs2), cheaper
-           once the two are comparably sized and log(attrs2) stops being a
-           small factor. Pick whichever is analytically cheaper. (A
-           galloping-search hybrid of the two was tried and measured as a
-           wash-to-slight-regression against this simpler choice on real
-           workloads -- not worth the complexity.)
-
-           Only worth it above minFilterSize: avoiding attrs2's copy isn't
-           free even once construction is cheap -- the result stays a
-           2-layer chain forever, so every *future* get() on it walks both
-           layers instead of one flat array. Below the threshold, a flat
-           full copy keeps all future lookups single-layer-cheap, which
-           matters more than the one-time copy it costs now.
-
-           Also gated on attrs1's own (pre-filter) size via
-           maxFilterBaseSize: attrs1.size() is a cheap upper bound on the
-           own-slot's post-filter size, which is what every future lookup
-           pays as its "miss in own-slot before falling to attrs2" tax.
-           Measured on real workloads: the own-slot is usually tiny (tens
-           of elements) for the biggest attrs2 events, but a long tail of
-           medium-attrs2 events can carry an own-slot in the thousands --
-           those pay a real, repeated tax disproportionate to their
-           (smaller) memory win. Capping attrs1's size excludes just that
-           tail, falling back to a flat full copy for it instead. */
-        static const size_t minFilterSize = [] {
-            if (auto * s = getenv("NIX_MIN_FILTER_SIZE"))
-                return (size_t) atoi(s);
-            return (size_t) 1024;
-        }();
-        static const size_t maxFilterBaseSize = [] {
-            if (auto * s = getenv("NIX_MAX_FILTER_BASE_SIZE"))
-                return (size_t) atoi(s);
-            return (size_t) 500;
-        }();
-        if (!bindings2.isLayerListFull() && bindings2.size() >= minFilterSize
-            && bindings1.size() <= maxFilterBaseSize) {
-            auto attrs = state.buildBindings(bindings1.size());
-            attrs.layerOnTopOf(bindings2);
-
-            size_t copied = 0;
-            auto log2Size2 = std::bit_width(bindings2.size());
-            if (bindings1.size() * log2Size2 <= bindings1.size() + bindings2.size()) {
-                for (auto & attr : bindings1) {
-                    if (!bindings2.get(attr.name)) {
-                        attrs.insert(attr);
-                        ++copied;
-                    }
-                }
-            } else {
-                auto i = bindings1.begin();
-                auto j = bindings2.begin();
-                while (i != bindings1.end() && j != bindings2.end()) {
-                    if (i->name == j->name) {
-                        ++i;
-                        ++j;
-                    } else if (i->name < j->name) {
-                        attrs.insert(*i);
-                        ++copied;
-                        ++i;
-                    } else {
-                        ++j;
-                    }
-                }
-                while (i != bindings1.end()) {
-                    attrs.insert(*i);
-                    ++copied;
-                    ++i;
-                }
-            }
-            v.mkAttrs(attrs.alreadySorted());
-
-            state.nrOpUpdateValuesCopied += copied;
+        /* Otherwise attrs2 (the winner) is the bigger-or-equal side -- see
+           tryFilterAndLayer's doc comment for the mechanism and the two
+           size gates it applies. Kept out of line so this (rarely taken)
+           logic doesn't bloat this function's body and slow down the
+           shouldLayer path above, which is by far the common case. */
+        if (auto copied = tryFilterAndLayer(state, v, bindings1, bindings2)) {
+            state.nrOpUpdateValuesCopied += *copied;
             return;
         }
     }
