@@ -31,6 +31,7 @@
 #include "parser-tab.hh"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
@@ -1980,6 +1981,85 @@ void ExprOpImpl::eval(EvalState & state, Env & env, Value & v)
         || state.evalBool(env, e2, "in the right operand of '->'"));
 }
 
+namespace {
+
+/* Out of line and noinline: this path shares a function with
+   ExprOpUpdate::eval's hot shouldLayer path, and inlining it measurably
+   slowed that unrelated path down (icache/branch-predictor pressure),
+   even though shouldLayer never touches this code. */
+[[gnu::noinline]] std::optional<size_t>
+tryFilterAndLayer(EvalState & state, Value & v, const Bindings & bindings1, const Bindings & bindings2)
+{
+    /* attrs2 (the winner) is the bigger-or-equal side: filter attrs1 (the
+       loser) down to its own exclusive keys -- those not shadowed by
+       attrs2 -- and layer just that on top of attrs2. attrs2 is never
+       copied, regardless of size or whether it's itself layered.
+
+       Picks whichever is analytically cheaper: a per-element binary
+       search (O(attrs1 * log(attrs2))) or a linear merge-join
+       (O(attrs1 + attrs2)).
+
+       Only worth it above minFilterSize: the result stays a 2-layer
+       chain forever, so every future lookup walks both layers instead
+       of one flat array. Below the threshold, a flat copy keeps future
+       lookups single-layer-cheap.
+
+       maxFilterBaseSize caps attrs1's own (pre-filter) size, since
+       that bounds the "miss in own-slot before falling through to
+       attrs2" cost every future lookup on the result pays. */
+    static const size_t minFilterSize = [] {
+        if (auto * s = getenv("NIX_MIN_FILTER_SIZE"))
+            return (size_t) atoi(s);
+        return (size_t) 1024;
+    }();
+    static const size_t maxFilterBaseSize = [] {
+        if (auto * s = getenv("NIX_MAX_FILTER_BASE_SIZE"))
+            return (size_t) atoi(s);
+        return (size_t) 500;
+    }();
+    if (bindings2.isLayerListFull() || bindings2.size() < minFilterSize || bindings1.size() > maxFilterBaseSize)
+        return std::nullopt;
+
+    auto attrs = state.buildBindings(bindings1.size());
+    attrs.layerOnTopOf(bindings2);
+
+    size_t copied = 0;
+    auto log2Size2 = std::bit_width(bindings2.size());
+    if (bindings1.size() * log2Size2 <= bindings1.size() + bindings2.size()) {
+        for (auto & attr : bindings1) {
+            if (!bindings2.get(attr.name)) {
+                attrs.insert(attr);
+                ++copied;
+            }
+        }
+    } else {
+        auto i = bindings1.begin();
+        auto j = bindings2.begin();
+        while (i != bindings1.end() && j != bindings2.end()) {
+            if (i->name == j->name) {
+                ++i;
+                ++j;
+            } else if (i->name < j->name) {
+                attrs.insert(*i);
+                ++copied;
+                ++i;
+            } else {
+                ++j;
+            }
+        }
+        while (i != bindings1.end()) {
+            attrs.insert(*i);
+            ++copied;
+            ++i;
+        }
+    }
+    v.mkAttrs(attrs.alreadySorted());
+
+    return copied;
+}
+
+} // namespace
+
 void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
@@ -1996,22 +2076,35 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         return;
     }
 
-    /* Layer attrs2 on attrs1 whenever it's cheaper than a full copy: attrs2
-       smaller than attrs1 (the common `prev // overlay` pattern), or under
-       the absolute threshold. threshold == 0 disables both checks. */
+    /* Layer the smaller side on top of the bigger side, instead of a full
+       copy -- whichever side ends up as the "own" layer is cheap to build
+       (bounded by the smaller side's size), and the bigger side is never
+       copied, just referenced as baseLayer. threshold == 0 disables this
+       entirely (full-copy fallback below). */
     auto threshold = state.settings.bindingsUpdateLayerRhsSizeThreshold.get();
-    bool shouldLayer = threshold != 0 && !bindings1.isLayerListFull()
-                       && (bindings2.size() <= threshold || bindings2.size() < bindings1.size());
 
-    if (shouldLayer) {
-        auto attrs = state.buildBindings(bindings2.size());
-        attrs.layerOnTopOf(bindings1);
+    if (threshold != 0) {
+        /* attrs2 (the winner) is the smaller-or-under-threshold side: it
+           always wins outright, so copy it into the own-slot verbatim (no
+           filtering needed) and reference attrs1 as baseLayer -- the common
+           `prev // overlay` pattern. */
+        if (!bindings1.isLayerListFull() && (bindings2.size() <= threshold || bindings2.size() < bindings1.size())) {
+            auto attrs = state.buildBindings(bindings2.size());
+            attrs.layerOnTopOf(bindings1);
 
-        std::ranges::copy(bindings2, std::back_inserter(attrs));
-        v.mkAttrs(attrs.alreadySorted());
+            std::ranges::copy(bindings2, std::back_inserter(attrs));
+            v.mkAttrs(attrs.alreadySorted());
 
-        state.nrOpUpdateValuesCopied += bindings2.size();
-        return;
+            state.nrOpUpdateValuesCopied += bindings2.size();
+            return;
+        }
+
+        /* Otherwise attrs2 is the bigger-or-equal side -- see
+           tryFilterAndLayer for the mechanism and its size gates. */
+        if (auto copied = tryFilterAndLayer(state, v, bindings1, bindings2)) {
+            state.nrOpUpdateValuesCopied += *copied;
+            return;
+        }
     }
 
     auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
