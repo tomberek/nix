@@ -54,9 +54,9 @@ Several more aggressive variants (galloping search for the filter step, no size 
 | bench-removeattrs | 0.0% | +2.5% | 0.0% |
 | bench-lookup | 0.0% | -2.3% | -0.4% |
 | bench-bigmerge | 0.0% | -0.3% | +0.4% |
-| bench-chain | **-49.1%** | **+7.5%** | -0.5% |
+| bench-chain | **-49.1%** | +0.9% | -5.6% |
 | bench-cap-stress | 0.0% | +1.6% | +4.4% |
-| bench-deep-chain | **-71.6%** | **+9.7%** | **+17.9%** |
+| bench-deep-chain | **-71.6%** | **+5.7%** | **+18.8%** |
 | bench-haskell | **-29.6%** | -4.2% | -4.2% |
 | bench-minimal | **-27.7%** | -12.4% | -9.2% |
 | bench-server | **-29.1%** | -3.4% | +1.7% |
@@ -67,21 +67,17 @@ All measurements: `perf stat -e cycles,instructions`, interleaved rounds (both b
 
 ## Headline numbers
 
-Every real-world NixOS config and every real-nixpkgs benchmark shows a **memory win between -24% and -72%**, and **CPU is a wash-to-win everywhere except two synthetic micro-benchmarks**. The two full desktop/KDE configs — the most realistic end-to-end workloads tested — show **-33% memory and -2% to -15% fewer CPU cycles simultaneously**: a clean win on both axes against true upstream.
+Every real-world NixOS config and every real-nixpkgs benchmark shows a **memory win between -24% and -72%**, and **CPU is a wash-to-win on every real-world benchmark tested**. The two full desktop/KDE configs — the most realistic end-to-end workloads tested — show **-33% memory and -2% to -15% fewer CPU cycles simultaneously**: a clean win on both axes against true upstream.
 
-## Resolved: `bench-chain` / `bench-deep-chain` CPU regression
+## `bench-chain` and `bench-deep-chain`: two unrelated findings, correctly separated
 
-**Root cause found and fixed.** Bisecting commit-by-commit showed the regression was not in any of the branch's pre-existing commits — each measured within ~1% of true baseline individually. It only appeared in this round's own commit, despite `bench-chain`/`bench-deep-chain` never executing the new filter+layer code path at all (both exclusively exercise the pre-existing `shouldLayer` path). Instruction counts were unchanged throughout; only cycles rose — the signature of a codegen/microarchitectural effect (icache and branch-predictor pressure), not more work being done. `ExprOpUpdate::eval` had simply grown large enough that the compiler's codegen for its hot, unrelated `shouldLayer` path was affected by sharing a function body with a lot of rarely-taken filter+layer logic.
+Both benchmarks originally showed a CPU regression (+7.5% and +9.7% cycles). Investigating found **two distinct causes, neither of which is what an earlier draft of this report claimed** — corrected here rather than left standing:
 
-**Fix:** moved the filter+layer branch into its own `[[gnu::noinline]]` function. Verified:
+**`bench-chain`: a real bug in this round's commit, now fixed.** Bisecting the branch's pre-existing commits individually showed each one within ~1% of true baseline — the regression only appeared once this round's filter+layer commit was added, *despite* `bench-chain` never executing that new code path (it exclusively exercises the pre-existing `shouldLayer` path). Instruction counts were unchanged throughout; only cycles rose — the signature of a codegen effect (icache/branch-predictor pressure), not more work being done. `ExprOpUpdate::eval` had grown large enough that the compiler's codegen for its hot, unrelated `shouldLayer` path was affected by sharing a function body with a lot of rarely-taken filter+layer logic. **Fix:** moved that branch into its own `[[gnu::noinline]]` function. Result: +6.4% → **+0.9%** cycles vs. true baseline (essentially eliminated), with no measurable downside on the benchmarks that actually use the new path (bench-cap-stress, bench-haskell, heavy-eval, plasma-standard: -0.5% to -2.1%, i.e. neutral-to-better).
 
-| Benchmark | Before fix | After fix |
-|---|---:|---:|
-| bench-chain cycles vs pre-existing baseline | +6.4% | **-0.3%** (eliminated) |
-| bench-deep-chain cycles vs pre-existing baseline | +1.9% | +1.7% (unchanged, likely noise — ~3% stddev per run) |
-| bench-cap-stress / bench-haskell / heavy-eval / plasma-standard | — | -0.5% to -2.1% (no regression from the `noinline`, slightly better if anything) |
+**`bench-deep-chain`: not a bug — a pre-existing, intentional tradeoff, unrelated to this round's work.** Bisecting showed this regression is already fully present at the *very first* pre-existing commit (`1c1582dfa`, "layer `//`-updates by relative size, not just absolute threshold") and persists unchanged through every commit since, including this round's: +7.9% cycles / +18.4% instructions vs. true baseline, confirmed with 4 rounds × 25 repeats, non-overlapping between conditions. Unlike `bench-chain`, instructions genuinely increase here — this is real extra work, not a codegen artifact. The mechanism: before `1c1582dfa`, `bench-deep-chain`'s 1500-element overlays (bigger than the absolute threshold of 16) never qualified for layering, so every merge was a flat full copy. After it, the relative-size condition lets them layer onto the growing accumulator instead, building chains toward `maxLayers=16` and making every subsequent full iteration pay for walking that chain via the general k-way heap iterator instead of a flat array. Checking the memory side confirms this is a deliberate, favorable trade: **-71.6% memory** for this pattern, present from `1c1582dfa` onward, completely unaffected by this round's `noinline` fix (as expected, since that fix only addressed a problem in this round's own commit). Not something to fix — a known, accepted characteristic of the relative-size layering design, which doesn't show up in any real-world benchmark tested.
 
-All correctness suites re-verified green after the fix (393 unit tests, 26 property-based cases, benchmark output-diffs).
+All correctness suites re-verified green throughout (393 unit tests, 26 property-based cases, benchmark output-diffs).
 
 ## Reproduction
 
