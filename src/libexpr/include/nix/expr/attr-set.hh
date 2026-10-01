@@ -12,6 +12,7 @@
 #include <functional>
 #include <ranges>
 #include <optional>
+#include <vector>
 
 namespace nix {
 
@@ -124,6 +125,14 @@ private:
     Bindings & operator=(Bindings &&) = delete;
 
     ~Bindings() = default;
+
+    /**
+     * This Bindings' own attrs, as a span.
+     */
+    std::span<const Attr> ownAttrs() const noexcept
+    {
+        return {attrs, numAttrs};
+    }
 
     friend class BindingsBuilder;
 
@@ -493,6 +502,57 @@ public:
     bool isLayered() const noexcept
     {
         return numLayers > 1;
+    }
+
+    /**
+     * The Bindings this one is layered on top of, or nullptr if not
+     * layered.
+     */
+    const Bindings * baseLayerPtr() const noexcept
+    {
+        return baseLayer;
+    }
+
+    /**
+     * How close in size an overlay must be to this layer's own attrs for
+     * @ref tryAbsorb to fold them together instead of stacking a new
+     * layer, within this ratio either way.
+     */
+    static constexpr unsigned absorbRatio = 2;
+
+    /**
+     * Fold `overlay` into this layer's own attrs instead of stacking it
+     * as a new layer, when the two are comparably sized (within @ref
+     * absorbRatio) and this layer is itself already layered. Keeps
+     * chain depth bounded logarithmically rather than linearly in the
+     * number of merges: a run of similarly-sized overlays, which would
+     * otherwise grow the chain by one layer per merge and make a later
+     * full iteration (attrNames, etc.) walk the whole chain, gets
+     * folded together instead.
+     *
+     * Returns the combined, sorted replacement for this layer's own
+     * attrs, ready to be layered directly onto @ref baseLayerPtr() --
+     * or nullopt if absorption doesn't apply, in which case the caller
+     * should layer normally.
+     */
+    std::optional<std::vector<Attr>> tryAbsorb(const Bindings & overlay) const
+    {
+        if (!baseLayer)
+            return std::nullopt;
+
+        auto overlaySize = overlay.size();
+        if (overlaySize > (size_type) numAttrs * absorbRatio || numAttrs > overlaySize * absorbRatio)
+            return std::nullopt;
+
+        std::vector<Attr> combined;
+        combined.reserve((size_t) numAttrs + overlaySize);
+        for (auto & attr : ownAttrs())
+            if (!overlay.get(attr.name))
+                combined.push_back(attr);
+        for (auto & attr : overlay)
+            combined.push_back(attr);
+        std::sort(combined.begin(), combined.end());
+        return combined;
     }
 
     const_iterator begin() const

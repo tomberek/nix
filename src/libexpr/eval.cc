@@ -2084,11 +2084,25 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     auto threshold = state.settings.bindingsUpdateLayerRhsSizeThreshold.get();
 
     if (threshold != 0) {
-        /* attrs2 (the winner) is the smaller-or-under-threshold side: it
-           always wins outright, so copy it into the own-slot verbatim (no
-           filtering needed) and reference attrs1 as baseLayer -- the common
-           `prev // overlay` pattern. */
+        /* attrs2 (the winner) is the smaller-or-under-threshold side: copy
+           it into the own-slot verbatim and reference attrs1 as baseLayer
+           -- the common `prev // overlay` pattern -- unless attrs1's own
+           top layer can absorb attrs2 instead (see Bindings::tryAbsorb),
+           which keeps a run of similarly-sized overlays from growing the
+           chain by one layer per merge. */
         if (!bindings1.isLayerListFull() && (bindings2.size() <= threshold || bindings2.size() < bindings1.size())) {
+            if (auto combined = bindings1.tryAbsorb(bindings2)) {
+                auto attrs = state.buildBindings(combined->size());
+                attrs.layerOnTopOf(*bindings1.baseLayerPtr());
+
+                for (auto & attr : *combined)
+                    attrs.insert(attr);
+                v.mkAttrs(attrs.alreadySorted());
+
+                state.nrOpUpdateValuesCopied += combined->size();
+                return;
+            }
+
             auto attrs = state.buildBindings(bindings2.size());
             attrs.layerOnTopOf(bindings1);
 
