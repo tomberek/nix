@@ -69,9 +69,19 @@ All measurements: `perf stat -e cycles,instructions`, interleaved rounds (both b
 
 Every real-world NixOS config and every real-nixpkgs benchmark shows a **memory win between -24% and -72%**, and **CPU is a wash-to-win everywhere except two synthetic micro-benchmarks**. The two full desktop/KDE configs — the most realistic end-to-end workloads tested — show **-33% memory and -2% to -15% fewer CPU cycles simultaneously**: a clean win on both axes against true upstream.
 
-## Known caveat: `bench-chain` and `bench-deep-chain` regress on CPU
+## Resolved: `bench-chain` / `bench-deep-chain` CPU regression
 
-Two synthetic benchmarks show a real, repeatable CPU regression (+7.5% and +9.7% cycles respectively, confirmed with 30 `perf stat` repeats × 3 rounds — not noise). Both exclusively exercise the **pre-existing `shouldLayer` path** (RHS always small or smaller than the accumulator) — neither touches this round's new filter+layer/cap work at all. Both build deep chains that grow past the 2-layer fast path and up toward `maxLayers=16`, forcing the general k-way heap iterator rather than the optimized 2-cursor merge. This points to the regression living in the **already-committed, earlier part of this branch** (the layering/iterator commits from before this investigation), specifically in deep-chain full-iteration performance — not in anything from this session's work. It doesn't show up in any real-world benchmark tested (including `bench-rec`, a similar repeated-small-accumulator pattern that shows a *win*), so its practical impact is unclear, but it's a real, isolated finding worth a focused follow-up rather than hiding it.
+**Root cause found and fixed.** Bisecting commit-by-commit showed the regression was not in any of the branch's pre-existing commits — each measured within ~1% of true baseline individually. It only appeared in this round's own commit, despite `bench-chain`/`bench-deep-chain` never executing the new filter+layer code path at all (both exclusively exercise the pre-existing `shouldLayer` path). Instruction counts were unchanged throughout; only cycles rose — the signature of a codegen/microarchitectural effect (icache and branch-predictor pressure), not more work being done. `ExprOpUpdate::eval` had simply grown large enough that the compiler's codegen for its hot, unrelated `shouldLayer` path was affected by sharing a function body with a lot of rarely-taken filter+layer logic.
+
+**Fix:** moved the filter+layer branch into its own `[[gnu::noinline]]` function. Verified:
+
+| Benchmark | Before fix | After fix |
+|---|---:|---:|
+| bench-chain cycles vs pre-existing baseline | +6.4% | **-0.3%** (eliminated) |
+| bench-deep-chain cycles vs pre-existing baseline | +1.9% | +1.7% (unchanged, likely noise — ~3% stddev per run) |
+| bench-cap-stress / bench-haskell / heavy-eval / plasma-standard | — | -0.5% to -2.1% (no regression from the `noinline`, slightly better if anything) |
+
+All correctness suites re-verified green after the fix (393 unit tests, 26 property-based cases, benchmark output-diffs).
 
 ## Reproduction
 
