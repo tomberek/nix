@@ -682,7 +682,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
 
         if (bindings) {
             Env * inheritEnv = bindings->inheritFromExprs ? bindings->buildInheritFromEnv(*state, *env) : nullptr;
-            for (auto & [symbol, def] : *bindings->attrs) {
+            for (auto & [symbol, def] : *bindings->boundAttrs) {
                 Value & v(*state->allocValue());
                 v.mkThunk(def.chooseByKind(env, env, inheritEnv), def.e);
                 addVarToScope(symbol, v);
