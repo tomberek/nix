@@ -834,7 +834,7 @@ static void prim_genericClosure(EvalState & state, CallSite callSite, Value * co
             throw;
         }
 
-        const Attr * key;
+        std::optional<Attr> key;
         try {
             key = state.getAttr(state.s.key, e->attrs(), "");
         } catch (Error & err) {
@@ -1548,9 +1548,9 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
     outputs.insert("out");
 
     for (auto & i : attrs->lexicographicOrder(state.symbols)) {
-        if (i->name == state.s.ignoreNulls)
+        if (i.name == state.s.ignoreNulls)
             continue;
-        auto key = state.symbols[i->name];
+        auto key = state.symbols[i.name];
         vomit("processing attribute '%1%'", key);
 
         // Like `warn`, but with the position of the attribute and the derivation name as an added trace.
@@ -1558,7 +1558,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             ErrorInfo info{
                 .level = lvlWarn,
                 .msg = std::move(msg),
-                .pos = state.positions[i->pos],
+                .pos = state.positions[i.pos],
             };
             info.traces.push_back(Trace{.hint = HintFmt{"while evaluating derivation '%1%'", drvName}});
             logWarning(info);
@@ -1607,20 +1607,20 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             const std::string_view context_below("");
 
             if (ignoreNulls) {
-                state.forceValue(*i->value, noPos);
-                if (i->value->type() == nNull)
+                state.forceValue(*i.value, noPos);
+                if (i.value->type() == nNull)
                     continue;
             }
 
-            switch (i->name.getId()) {
+            switch (i.name.getId()) {
             case EvalState::s.contentAddressed.getId():
-                if (state.forceBool(*i->value, pos, context_below)) {
+                if (state.forceBool(*i.value, pos, context_below)) {
                     contentAddressed = true;
                     experimentalFeatureSettings.require(Xp::CaDerivations);
                 }
                 break;
             case EvalState::s.impure.getId():
-                if (state.forceBool(*i->value, pos, context_below)) {
+                if (state.forceBool(*i.value, pos, context_below)) {
                     isImpure = true;
                     experimentalFeatureSettings.require(Xp::ImpureDerivations);
                 }
@@ -1628,8 +1628,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             /* The `args' attribute is special: it supplies the
                command-line arguments to the builder. */
             case EvalState::s.args.getId():
-                state.forceList(*i->value, pos, context_below);
-                for (auto elem : i->value->listView()) {
+                state.forceList(*i.value, pos, context_below);
+                for (auto elem : i.value->listView()) {
                     auto s = state
                                  .coerceToString(
                                      pos, *elem, context, "while evaluating an element of the argument list", true)
@@ -1643,32 +1643,32 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
                 if (jsonObject) {
 
-                    if (i->name == state.s.structuredAttrs)
+                    if (i.name == state.s.structuredAttrs)
                         continue;
 
-                    jsonObject->structuredAttrs.emplace(key, printValueAsJSON(state, true, *i->value, pos, context));
+                    jsonObject->structuredAttrs.emplace(key, printValueAsJSON(state, true, *i.value, pos, context));
 
-                    switch (i->name.getId()) {
+                    switch (i.name.getId()) {
                     case EvalState::s.builder.getId():
-                        drv.builder = state.forceString(*i->value, context, pos, context_below);
+                        drv.builder = state.forceString(*i.value, context, pos, context_below);
                         break;
                     case EvalState::s.system.getId():
-                        drv.platform = state.forceStringNoCtx(*i->value, pos, context_below);
+                        drv.platform = state.forceStringNoCtx(*i.value, pos, context_below);
                         break;
                     case EvalState::s.outputHash.getId():
-                        outputHash = state.forceStringNoCtx(*i->value, pos, context_below);
+                        outputHash = state.forceStringNoCtx(*i.value, pos, context_below);
                         break;
                     case EvalState::s.outputHashAlgo.getId():
-                        outputHashAlgo = parseHashAlgoOpt(state.forceStringNoCtx(*i->value, pos, context_below));
+                        outputHashAlgo = parseHashAlgoOpt(state.forceStringNoCtx(*i.value, pos, context_below));
                         break;
                     case EvalState::s.outputHashMode.getId():
-                        handleHashMode(state.forceStringNoCtx(*i->value, pos, context_below));
+                        handleHashMode(state.forceStringNoCtx(*i.value, pos, context_below));
                         break;
                     case EvalState::s.outputs.getId(): {
                         /* Require 'outputs' to be a list of strings. */
-                        state.forceList(*i->value, pos, context_below);
+                        state.forceList(*i.value, pos, context_below);
                         Strings ss;
-                        for (auto elem : i->value->listView())
+                        for (auto elem : i.value->listView())
                             ss.emplace_back(state.forceStringNoCtx(*elem, pos, context_below));
                         handleOutputs(ss);
                         break;
@@ -1679,8 +1679,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                            enabled. */
                         if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
                             break;
-                        state.forceList(*i->value, pos, context_below);
-                        for (auto elem : i->value->listView()) {
+                        state.forceList(*i.value, pos, context_below);
+                        for (auto elem : i.value->listView()) {
                             auto name = state.forceString(*elem, context, pos, context_below);
                             if (name == drvFeatureBuilderRpcV0) {
                                 isSubmittingOutputs = true;
@@ -1693,7 +1693,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                         break;
                     }
 
-                    switch (i->name.getId()) {
+                    switch (i.name.getId()) {
                     case EvalState::s.allowedReferences.getId():
                     case EvalState::s.allowedRequisites.getId():
                     case EvalState::s.disallowedReferences.getId():
@@ -1709,7 +1709,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                     }
 
                 } else {
-                    auto s = state.coerceToString(noPos, *i->value, context, context_below, true).toOwned();
+                    auto s = state.coerceToString(noPos, *i.value, context, context_below, true).toOwned();
 
                     /* Re-interpret the attribute's value as a list of
                        strings.
@@ -1719,13 +1719,13 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                        strings without spaces to begin with. */
                     auto forceStringList = [&] { return tokenizeString<Strings>(s); };
 
-                    if (i->name == state.s.json) {
+                    if (i.name == state.s.json) {
                         warnAttr(HintFmt(
                             "setting structured attributes via '__json' is deprecated, and may be disallowed in future versions of Nix. Set '__structuredAttrs = true' instead."));
                         drv.structuredAttrs = StructuredAttrs::parse(s);
                     } else {
                         drv.env.emplace(key, s);
-                        switch (i->name.getId()) {
+                        switch (i.name.getId()) {
                         case EvalState::s.builder.getId():
                             drv.builder = std::move(s);
                             break;
@@ -1768,7 +1768,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
         } catch (Error & e) {
             e.addTrace(
-                state.positions[i->pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
+                state.positions[i.pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
             throw;
         }
     }
@@ -3131,10 +3131,21 @@ static void prim_attrNames(EvalState & state, CallSite callSite, Value * const *
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.attrNames");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    auto & bindings = *args[0]->attrs();
+    auto list = state.buildList(bindings.size());
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
-        list[n] = Value::toPtr(state.symbols[i.name]);
+    // Only `name` is ever read below, but the general iterator synthesizes a
+    // full Attr (touching `pos`/`values` too) on every step. When the
+    // Bindings isn't layered, walk the dense `names` array directly instead
+    // so the copy only touches the one array it actually needs.
+    if (!bindings.isLayered()) {
+        auto dense = bindings.denseView();
+        for (Bindings::size_type n = 0; n < dense.size; ++n)
+            list[n] = Value::toPtr(state.symbols[dense.names[n]]);
+    } else {
+        for (const auto & [n, i] : enumerate(bindings))
+            list[n] = Value::toPtr(state.symbols[i.name]);
+    }
 
     std::sort(list.begin(), list.end(), [](Value * v1, Value * v2) { return v1->string_view() < v2->string_view(); });
 
@@ -3160,18 +3171,43 @@ static void prim_attrValues(EvalState & state, CallSite callSite, Value * const 
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.attrValues");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    auto & bindings = *args[0]->attrs();
+    auto list = state.buildList(bindings.size());
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
+    // Only `name` (as a sort key) and `value` (the payload) are ever read
+    // below -- `pos` is dead weight here. Bindings no longer stores a
+    // contiguous Attr array we could point into directly, so copy into a
+    // locally-owned, stable array first and (ab)use pointers into *that* for
+    // the sort; but when the Bindings isn't layered, source that copy from
+    // the dense `names`/`values` arrays directly instead of going through
+    // the general iterator, which would synthesize (and thus touch) `pos`
+    // for every entry despite it never being used.
+    struct NameValue
+    {
+        Symbol name;
+        Value * value;
+    };
+    std::vector<NameValue> attrs;
+    attrs.reserve(bindings.size());
+    if (!bindings.isLayered()) {
+        auto dense = bindings.denseView();
+        for (Bindings::size_type n = 0; n < dense.size; ++n)
+            attrs.push_back({dense.names[n], dense.values[n]});
+    } else {
+        for (auto & i : bindings)
+            attrs.push_back({i.name, i.value});
+    }
+
+    for (const auto & [n, i] : enumerate(attrs))
         list[n] = (Value *) &i;
 
     std::sort(list.begin(), list.end(), [&](Value * v1, Value * v2) {
-        std::string_view s1 = state.symbols[((Attr *) v1)->name], s2 = state.symbols[((Attr *) v2)->name];
+        std::string_view s1 = state.symbols[((NameValue *) v1)->name], s2 = state.symbols[((NameValue *) v2)->name];
         return s1 < s2;
     });
 
     for (auto & v : list)
-        v = ((Attr *) v)->value;
+        v = ((NameValue *) v)->value;
 
     v.mkList(list);
 }
@@ -3293,7 +3329,7 @@ static void prim_hasAttr(EvalState & state, CallSite callSite, Value * const * a
     auto attr =
         state.forceStringNoCtx(*args[0], noPos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.hasAttr");
-    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)));
+    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)).has_value());
 }
 
 static RegisterPrimOp primop_hasAttr({
@@ -3349,8 +3385,38 @@ static void prim_removeAttrs(EvalState & state, CallSite callSite, Value * const
        to sort v.attrs because it's a subset of an already sorted
        vector. */
     auto attrs = state.buildBindings(args[0]->attrs()->size());
-    std::set_difference(
-        args[0]->attrs()->begin(), args[0]->attrs()->end(), names.begin(), names.end(), std::back_inserter(attrs));
+
+    if (!args[0]->attrs()->isLayered()) {
+        /* Fast path: scan the dense names() array directly instead of
+           going through the general Attr-synthesizing iterator below.
+           That iterator reads pos/values on every step it takes (even
+           for attributes about to be discarded by set_difference), which
+           is wasted work for every *removed* attribute. Here pos/values
+           are only touched for attributes that actually survive, which
+           need them for the output anyway. */
+        auto view = args[0]->attrs()->denseView();
+        size_t ni = 0;
+        for (size_t i = 0; i < view.size; ++i) {
+            while (ni < names.size() && names[ni].name < view.names[i])
+                ++ni;
+            if (ni < names.size() && names[ni].name == view.names[i]) {
+                ++ni;
+                continue;
+            }
+            attrs.push_back(Attr(view.names[i], view.values[i], view.pos[i]));
+        }
+    } else {
+        /* A layered chain's attributes can live in any layer, so the
+           dense-view fast path above isn't applicable; fall back to the
+           general merge-aware iterator. */
+        std::set_difference(
+            args[0]->attrs()->begin(),
+            args[0]->attrs()->end(),
+            names.begin(),
+            names.end(),
+            std::back_inserter(attrs));
+    }
+
     v.mkAttrs(attrs.alreadySorted());
 }
 
@@ -3381,11 +3447,34 @@ static void prim_listToAttrs(EvalState & state, CallSite callSite, Value * const
 {
     state.forceList(*args[0], noPos, "while evaluating the argument passed to builtins.listToAttrs");
 
-    // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
+    // Step 1. Collect (name, list-slot) pairs into scratch storage and sort by
+    // name, using the list-slot address as a tiebreaker. Since slot addresses
+    // increase monotonically with list position, this makes the sort
+    // effectively stable (first occurrence of a name wins) without paying for
+    // std::stable_sort.
+    //
+    // Bindings no longer supports writing into it before it's sorted (there's
+    // no contiguous, mutable Attr array to (ab)use as scratch), so unlike the
+    // old implementation this uses a separate scratch vector instead of
+    // reusing the result Bindings' own backing storage.
     auto listView = args[0]->listView();
     size_t listSize = listView.size();
-    auto & bindings = *state.mem.allocBindings(listSize);
-    using ElemPtr = decltype(&bindings[0].value);
+
+    struct Entry
+    {
+        Symbol name;
+        PosIdx pos;
+        // Actually a Value * *, i.e. the address of the list slot; stored as
+        // a plain Value * (bit_cast both ways) to sidestep having to spell
+        // out the exact (const-qualified) reference type that enumerate()
+        // hands back for a ListView element.
+        Value * slotBits;
+    };
+    // The address of a ListView element (as yielded by enumerate(listView),
+    // which zips in a reference to the underlying Value * slot).
+    using ElemPtr = Value * const *;
+    std::vector<Entry> entries;
+    entries.reserve(listSize);
 
     for (const auto & [n, v2] : enumerate(listView)) {
         state.forceAttrs(*v2, noPos, "while evaluating an element of the list passed to builtins.listToAttrs");
@@ -3396,34 +3485,27 @@ static void prim_listToAttrs(EvalState & state, CallSite callSite, Value * const
             *j->value,
             j->pos,
             "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs");
-        auto sym = state.symbols.create(name);
 
-        // (ab)use Attr to store a Value * * instead of a Value *, so that we can stabilize the sort using the Value * *
-        bindings[n] = Attr(sym, std::bit_cast<Value *>(&v2));
+        entries.push_back({state.symbols.create(name), j->pos, std::bit_cast<Value *>(&v2)});
     }
 
-    std::sort(&bindings[0], &bindings[listSize], [](const Attr & a, const Attr & b) {
-        // Note that .value is actually a Value * * that corresponds to the position in the list
-        return a < b || (!(a > b) && std::bit_cast<ElemPtr>(a.value) < std::bit_cast<ElemPtr>(b.value));
+    std::sort(entries.begin(), entries.end(), [](const Entry & a, const Entry & b) {
+        return a.name < b.name
+               || (a.name == b.name && std::bit_cast<ElemPtr>(a.slotBits) < std::bit_cast<ElemPtr>(b.slotBits));
     });
 
-    // Step 2. Unpack the bindings in place and skip name-value pairs with duplicate names
+    // Step 2. Build the result, skipping name-value pairs with duplicate names
+    // (the first, i.e. lowest list index, occurrence of a name wins).
+    auto & bindings = *state.mem.allocBindings(listSize);
     Symbol prev;
-    for (size_t n = 0; n < listSize; n++) {
-        auto attr = bindings[n];
-        if (prev == attr.name) {
+    for (auto & entry : entries) {
+        if (prev == entry.name)
             continue;
-        }
-        // Note that .value is actually a Value * *; see earlier comments
-        Value * v2 = *std::bit_cast<ElemPtr>(attr.value);
+        Value * v2 = *std::bit_cast<ElemPtr>(entry.slotBits);
 
         auto j = state.getAttr(state.s.value, v2->attrs(), "in a {name=...; value=...;} pair");
-        prev = attr.name;
+        prev = entry.name;
         bindings.push_back({prev, j->value, j->pos});
-    }
-    // help GC and clear end of allocated array
-    for (size_t n = bindings.size(); n < listSize; n++) {
-        bindings[n] = Attr{};
     }
     v.mkAttrs(&bindings);
 }
@@ -3509,16 +3591,37 @@ static void prim_intersectAttrs(EvalState & state, CallSite callSite, Value * co
     // Finally one could run try a simultaneous scan, count misses and fall back
     // to double binary search when the counter hit some threshold and/or ratio.
 
+    // In both branches below, only the *smaller* operand's `name` is ever
+    // used, for the lookup key -- its `pos`/`value` are never read (the
+    // output always comes from `right`, per the `e2`-wins semantics above).
+    // The general iterator would synthesize (and thus touch) those fields
+    // for every element regardless, so when the smaller operand isn't
+    // layered, walk its dense `names` array directly instead.
     if (left.size() < right.size()) {
-        for (auto & l : left) {
-            auto r = right.get(l.name);
-            if (r)
-                attrs.insert(*r);
+        if (!left.isLayered()) {
+            auto dense = left.denseView();
+            for (Bindings::size_type n = 0; n < dense.size; ++n) {
+                auto r = right.get(dense.names[n]);
+                if (r)
+                    attrs.insert(*r);
+            }
+        } else {
+            for (auto & l : left) {
+                auto r = right.get(l.name);
+                if (r)
+                    attrs.insert(*r);
+            }
         }
     } else {
+        // Here the roles are reversed: `right` is the smaller operand we
+        // scan, but its `Attr` (not just its name) is what ends up in the
+        // output, so there's nothing to save on the `right`-side traversal.
+        // The one wasted read is on the `left.get()` side: its result is
+        // used only as a yes/no existence check, so `contains()` (skips
+        // synthesizing an Attr, i.e. skips touching `left`'s `pos`/`values`
+        // even on a hit) replaces it.
         for (auto & r : right) {
-            auto l = left.get(r.name);
-            if (l)
+            if (left.contains(r.name))
                 attrs.insert(r);
         }
     }
@@ -3629,13 +3732,27 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindings(args[1]->attrs()->size());
+    auto & bindings = *args[1]->attrs();
+    auto attrs = state.buildBindings(bindings.size());
 
-    for (auto & i : *args[1]->attrs()) {
-        Value * vName = Value::toPtr(state.symbols[i.name]);
+    // Only `name` and `value` are ever read below (the output's positions
+    // are unrelated to the input's, so `pos` is never touched) -- but the
+    // general iterator synthesizes it anyway on every step. Source straight
+    // from the dense arrays when unlayered.
+    auto mapOne = [&](Symbol name, Value * value) {
+        Value * vName = Value::toPtr(state.symbols[name]);
         Value * vFun2 = state.allocValue();
         vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+        attrs.alloc(name).mkApp(vFun2, value);
+    };
+
+    if (!bindings.isLayered()) {
+        auto dense = bindings.denseView();
+        for (Bindings::size_type n = 0; n < dense.size; ++n)
+            mapOne(dense.names[n], dense.values[n]);
+    } else {
+        for (auto & i : bindings)
+            mapOne(i.name, i.value);
     }
 
     v.mkAttrs(attrs.alreadySorted());
@@ -3662,12 +3779,21 @@ static RegisterPrimOp primop_mapAttrs({
 
 static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
-    // we will first count how many values are present for each given key.
-    // we then allocate a single attrset and pre-populate it with lists of
-    // appropriate sizes, stash the pointers to the list elements of each,
-    // and populate the lists. after that we replace the list in the every
-    // attribute with the merge function application. this way we need not
-    // use (slightly slower) temporary storage the GC does not know about.
+    // We need the union of all keys across every input attrset, in sorted
+    // order, plus a per-key value list holding one entry per input that has
+    // that key (in input order). Each input's keys are already available as
+    // a sorted sequence (the dense `names[]` array for an unlayered input,
+    // or Bindings' own iterator -- which does its own layer-priority-aware
+    // merge internally -- for a layered one), so the union can be built by
+    // walking all N inputs' sorted sequences in lockstep (a k-way merge)
+    // instead of funneling every key through a std::map's O(log K)
+    // tree-node allocation and pointer-chasing.
+    //
+    // As before, we do this in two passes: pass 1 sizes each key's value
+    // list, pass 2 fills it. Both passes perform the exact same merge over
+    // the exact same (unmodified) inputs, so they visit keys in identical
+    // order; pass 2 can therefore index straight into pass 1's result by a
+    // running counter, with no per-key lookup at all.
 
     struct Item
     {
@@ -3676,40 +3802,172 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
         std::optional<ListBuilder> list;
     };
 
-    std::map<Symbol, Item, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, Item>>> attrsSeen;
-
     state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.zipAttrsWith");
     state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.zipAttrsWith");
     const auto listItems = args[1]->listView();
 
-    for (auto & vElem : listItems) {
+    for (auto & vElem : listItems)
         state.forceAttrs(
             *vElem, noPos, "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith");
-        for (auto & attr : *vElem->attrs())
-            attrsSeen.try_emplace(attr.name).first->second.size++;
-    }
 
-    for (auto & [sym, elem] : attrsSeen)
-        elem.list.emplace(state.buildList(elem.size));
+    // A cursor over one input's (name, value) sequence in ascending name
+    // order. Only `name` and `value` are ever read -- `pos` is never
+    // needed. An unlayered input's dense `names`/`values` arrays are walked
+    // directly; a layered input has no such array of its own (its
+    // attributes can live in any layer), so it's walked via Bindings' own
+    // iterator, which already does the correct layer-priority-aware merge
+    // for a single input -- that logic is reused as-is, not reimplemented.
+    // The (large: it embeds a small priority-queue of per-layer sub-cursors)
+    // iterator pair is heap-allocated and only touched for layered inputs,
+    // so a Cursor for the common, unlayered case stays small -- scanning all
+    // N cursors on every merge step (see `nextGroup` below) stays cache-friendly
+    // even for N in the dozens.
+    struct LayeredState
+    {
+        Bindings::const_iterator it, itEnd;
+    };
 
-    for (auto & vElem : listItems) {
-        for (auto & attr : *vElem->attrs()) {
-            auto & item = attrsSeen.at(attr.name);
-            (*item.list)[item.pos++] = attr.value;
+    struct Cursor
+    {
+        const Symbol * names = nullptr;
+        Value * const * values = nullptr;
+        Bindings::size_type idx = 0, end = 0;
+        std::unique_ptr<LayeredState> layered;
+
+        explicit Cursor(const Bindings & bindings)
+        {
+            if (bindings.isLayered()) {
+                layered = std::make_unique<LayeredState>(LayeredState{bindings.begin(), bindings.end()});
+            } else {
+                auto dense = bindings.denseView();
+                names = dense.names;
+                values = dense.values;
+                end = dense.size;
+            }
+        }
+
+        bool empty() const noexcept
+        {
+            return layered ? layered->it == layered->itEnd : idx == end;
+        }
+
+        Symbol name() const noexcept
+        {
+            return layered ? layered->it->name : names[idx];
+        }
+
+        Value * value() const noexcept
+        {
+            return layered ? layered->it->value : values[idx];
+        }
+
+        void advance() noexcept
+        {
+            if (layered)
+                ++layered->it;
+            else
+                ++idx;
+        }
+    };
+
+    auto makeCursors = [&] {
+        std::vector<Cursor> cursors;
+        cursors.reserve(listItems.size());
+        for (auto & vElem : listItems)
+            cursors.emplace_back(*vElem->attrs());
+        return cursors;
+    };
+
+    // Finds, in a single linear scan over all cursors (N is a handful of
+    // input attrsets in practice, so this beats a heap's bookkeeping), both
+    // the lexicographically-least current name and every cursor currently
+    // sitting on it (in input order) -- one scan rather than a `findMin`
+    // scan followed by a separate tie-collection scan, since for large N
+    // scanning the (cache-resident but not free) cursor array twice per
+    // merge step is exactly the cost this rewrite exists to cut. `tied` is
+    // caller-owned so repeated calls reuse its buffer instead of
+    // allocating a fresh vector every merge step. Returns `nullopt` once
+    // every cursor is exhausted.
+    auto nextGroup = [](std::vector<Cursor> & cursors, std::vector<size_t> & tied) -> std::optional<Symbol> {
+        tied.clear();
+        std::optional<Symbol> minName;
+        for (size_t i = 0; i < cursors.size(); ++i) {
+            if (cursors[i].empty())
+                continue;
+            auto n = cursors[i].name();
+            if (!minName || n < *minName) {
+                minName = n;
+                tied.clear();
+                tied.push_back(i);
+            } else if (n == *minName) {
+                tied.push_back(i);
+            }
+        }
+        return minName;
+    };
+
+    // Pass 1: merge once just to learn the sorted key union and each key's
+    // total count across all inputs. `names`/`sizes` hold plain data (no
+    // GC-traced pointers), so they can grow freely (via ordinary vector
+    // doubling) as the merge discovers keys -- reserving the N*K upper
+    // bound up front would badly over-allocate whenever inputs overlap
+    // heavily (many inputs, few distinct keys).
+    std::vector<Symbol> names;
+    std::vector<size_t> sizes;
+    {
+        auto cursors = makeCursors();
+        std::vector<size_t> tied;
+        while (auto minName = nextGroup(cursors, tied)) {
+            names.push_back(*minName);
+            sizes.push_back(tied.size());
+            for (auto i : tied)
+                cursors[i].advance();
         }
     }
 
-    auto attrs = state.buildBindings(attrsSeen.size());
+    // Only now, with the final key count known, do we allocate the
+    // GC-traced storage for the per-key `Value *` lists -- sized exactly
+    // once and never grown afterwards (only default-constructed, then
+    // filled in place via `emplace`/indexing), since `traceable_allocator`
+    // (needed so the GC can see the `Value *`s reachable through
+    // `Item::list`) only implements the pre-C++11, copy-only
+    // `construct(pointer, const T &)` and `Item` (via `ListBuilder`) is
+    // move-only: growing this vector would need to move existing elements
+    // into a new buffer, which that allocator has no valid way to do.
+    std::vector<Item, traceable_allocator<Item>> items(names.size());
+    for (size_t i = 0; i < items.size(); ++i)
+        items[i].list.emplace(state.buildList(sizes[i]));
 
-    for (auto & [sym, elem] : attrsSeen) {
-        auto name = Value::toPtr(state.symbols[sym]);
+    // Pass 2: merge again, over the same unmodified inputs, so the exact
+    // same sequence of keys (and, for each key, the exact same set of
+    // inputs, in the same input order) is visited as in pass 1. `unionIdx`
+    // therefore walks `items` in lockstep with the merge, needing no
+    // per-key lookup.
+    {
+        auto cursors = makeCursors();
+        std::vector<size_t> tied;
+        size_t unionIdx = 0;
+        while (nextGroup(cursors, tied)) {
+            auto & item = items[unionIdx++];
+            for (auto i : tied) {
+                (*item.list)[item.pos++] = cursors[i].value();
+                cursors[i].advance();
+            }
+        }
+    }
+
+    auto attrs = state.buildBindings(names.size());
+
+    for (size_t i = 0; i < names.size(); ++i) {
+        auto & item = items[i];
+        auto name = Value::toPtr(state.symbols[names[i]]);
         auto call1 = state.allocValue();
         call1->mkApp(args[0], name);
         auto call2 = state.allocValue();
         auto arg = state.allocValue();
-        arg->mkList(*elem.list);
+        arg->mkList(*item.list);
         call2->mkApp(call1, arg);
-        attrs.insert(sym, call2);
+        attrs.insert(names[i], call2);
     }
 
     v.mkAttrs(attrs.alreadySorted());

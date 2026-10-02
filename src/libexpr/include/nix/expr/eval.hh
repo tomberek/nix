@@ -753,7 +753,7 @@ public:
     /**
      * Get attribute from an attribute set and throw an error if it doesn't exist.
      */
-    const Attr * getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx);
+    std::optional<Attr> getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx);
 
     template<typename... Args>
     [[gnu::noinline]]
@@ -1170,6 +1170,9 @@ private:
     Counter nrAvoided;
     Counter nrOpUpdates;
     Counter nrOpUpdateValuesCopied;
+    Counter nrFormalsMergeFast;
+    Counter nrFormalsMergeFallbackLayered;
+    Counter nrFormalsMergeFallbackSizeGate;
     Counter nrListConcats;
     Counter nrPrimOpCalls;
     Counter nrFunctionCalls;

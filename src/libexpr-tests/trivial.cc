@@ -77,11 +77,11 @@ TEST_F(TrivialExpressionTest, updateAttrs)
     auto v = eval("{ a = 1; } // { b = 2; a = 3; }");
     ASSERT_THAT(v, IsAttrsOfSize(2));
     auto a = v.attrs()->get(createSymbol("a"));
-    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a);
     ASSERT_THAT(*a->value, IsIntEq(3));
 
     auto b = v.attrs()->get(createSymbol("b"));
-    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(b);
     ASSERT_THAT(*b->value, IsIntEq(2));
 }
 
@@ -179,7 +179,7 @@ TEST_P(AttrSetMergeTrvialExpressionTest, attrsetMergeLazy)
     ASSERT_THAT(v, IsAttrsOfSize(1));
 
     auto a = v.attrs()->get(createSymbol("a"));
-    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a);
 
     ASSERT_THAT(*a->value, IsThunk());
     state.forceValue(*a->value, noPos);
@@ -187,11 +187,11 @@ TEST_P(AttrSetMergeTrvialExpressionTest, attrsetMergeLazy)
     ASSERT_THAT(*a->value, IsAttrsOfSize(2));
 
     auto b = a->value->attrs()->get(createSymbol("b"));
-    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(b);
     ASSERT_THAT(*b->value, IsIntEq(1));
 
     auto c = a->value->attrs()->get(createSymbol("c"));
-    ASSERT_NE(c, nullptr);
+    ASSERT_TRUE(c);
     ASSERT_THAT(*c->value, IsIntEq(2));
 }
 
@@ -333,7 +333,7 @@ TEST_F(TrivialExpressionTest, bindOr)
     auto v = eval("{ or = 1; }");
     ASSERT_THAT(v, IsAttrsOfSize(1));
     auto b = v.attrs()->get(createSymbol("or"));
-    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(b);
     ASSERT_THAT(*b->value, IsIntEq(1));
 }
 
@@ -353,6 +353,28 @@ TEST_F(TrivialExpressionTest, tooManyFormals)
         [&]() { eval(expr); },
         ::testing::ThrowsMessage<Error>(::nix::testing::HasSubstrIgnoreANSIMatcher(
             "too many formal arguments, implementation supports at most 65535")));
+}
+
+TEST_F(TrivialExpressionTest, formalsFromLayeredArgs)
+{
+    // `//` with a small RHS layers `extra` on top of `base` (see
+    // ExprOpUpdate::eval's shouldLayer heuristic) instead of copying into a
+    // flat Bindings. callFunction's formals-binding fast path must not scan
+    // only the top layer's names[] in that case -- it must fall back to the
+    // layer-chain-aware Bindings::get() -- or attributes that live only in
+    // the base layer would be silently missed.
+    auto v = eval(
+        "let base = { a = 1; b = 2; }; extra = { c = 3; }; merged = base // extra; "
+        "f = { a, b, c, d ? 40 }: a + b + c + d; in f merged");
+    ASSERT_THAT(v, IsIntEq(46));
+}
+
+TEST_F(TrivialExpressionTest, formalsMissingRequiredArg)
+{
+    ASSERT_THAT(
+        [&]() { eval("({ a, b }: a + b) { a = 1; }"); },
+        ::testing::ThrowsMessage<Error>(
+            ::nix::testing::HasSubstrIgnoreANSIMatcher("called without required argument 'b'")));
 }
 
 } /* namespace nix */

@@ -236,6 +236,24 @@ static Symbol getName(const AttrName & name, EvalState & state, Env & env)
 
 static constexpr size_t BASE_ENV_SIZE = 128;
 
+/**
+ * Gate for the destructured-formals fast merge path in `EvalState::callFunction`.
+ *
+ * The linear two-pointer merge is O(argAttrs.size() + formals.size()); when
+ * the argument attrset is much larger than the formal list, that degrades
+ * toward O(argAttrs.size()) just to resolve a handful of formals, which is
+ * worse than the O(formals.size() * log(argAttrs.size())) per-formal
+ * `get()` fallback. Benchmarking found a real ~1.15x win at a ~2x
+ * size ratio and a real 2.7-4.4x regression at a ~667x ratio, so only take
+ * the merge path when the argument attrset isn't more than this many times
+ * larger than the formal count. This is a first-pass heuristic picked from
+ * two data points, not deeply tuned -- and it's a narrow internal
+ * implementation detail (unlike `bindingsUpdateLayerRhsSizeThreshold`, which
+ * changes an externally-visible memory/perf tradeoff), so a plain constant
+ * is used instead of an `EvalSettings` knob.
+ */
+static constexpr size_t FORMALS_MERGE_MAX_SIZE_RATIO = 8;
+
 EvalMemory::EvalMemory()
 {
     assertGCInitialized();
@@ -704,8 +722,8 @@ static void printWithBindings(const SymbolTable & st, const Env & env)
         std::cout << ANSI_MAGENTA;
         auto * bindings = env.values[0]->attrs();
         /* TODO: Don't print the whole attribute set, since it can be quite large. */
-        for (const Attr * attr : bindings->lexicographicOrder(st))
-            std::cout << st[attr->name] << " ";
+        for (const Attr & attr : bindings->lexicographicOrder(st))
+            std::cout << st[attr.name] << " ";
         std::cout << ANSI_NORMAL;
         std::cout << std::endl;
     }
@@ -1482,7 +1500,7 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
 
         for (auto & i : getAttrPath()) {
             state.nrLookups++;
-            const Attr * j;
+            std::optional<Attr> j;
             auto name = getName(i, state, env);
             if (def) {
                 state.forceValue(*vAttrs, pos);
@@ -1557,7 +1575,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 
     for (auto & i : attrPath) {
         state.forceValue(*vAttrs, getPos());
-        const Attr * j;
+        std::optional<Attr> j;
         auto name = getName(i, state, env);
         if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
             vAttrs = j->value;
@@ -1601,7 +1619,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
         vRes = vCur;
     };
 
-    const Attr * functor;
+    std::optional<Attr> functor;
 
     while (args.size() > 0) {
 
@@ -1629,25 +1647,72 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
                 /* For each formal argument, get the actual argument.  If
                    there is no matching actual argument but the formal
-                   argument has a default, use the default. */
+                   argument has a default, use the default.
+
+                   Formals are sorted by name at parse time (@see
+                   ParserState::validateFormals), so when the argument
+                   Bindings is a single, unlayered chunk we can walk both
+                   sorted sequences with a two-pointer merge in one O(n + m)
+                   pass instead of paying one O(log n) binary search per
+                   formal via `get()`. A layered (`//`-merged) argument
+                   attrset can't use this: its attributes may live in any
+                   layer, not just the top one, so we fall back to the
+                   layer-chain-aware `get()` for that case. We also fall back
+                   when the argument attrset is much larger than the formal
+                   list (see FORMALS_MERGE_MAX_SIZE_RATIO), since the merge's
+                   O(n + m) cost stops paying for itself once n dominates. */
                 size_t attrsUsed = 0;
-                for (auto & i : formals->formals) {
-                    auto j = args[0]->attrs()->get(i.name);
-                    if (!j) {
-                        if (!i.def) {
-                            error<TypeError>(
-                                "function '%1%' called without required argument '%2%'",
-                                (lambda.name ? std::string(symbols[lambda.name]) : "anonymous lambda"),
-                                symbols[i.name])
-                                .atPos(lambda.pos)
-                                .withTrace(pos, "from call site")
-                                .withFrame(*vCur.lambda().env, lambda)
-                                .debugThrow();
+                const Bindings & argAttrs = *args[0]->attrs();
+                bool useMerge = !argAttrs.isLayered()
+                                && argAttrs.size() <= formals->formals.size() * FORMALS_MERGE_MAX_SIZE_RATIO;
+                if (argAttrs.isLayered())
+                    nrFormalsMergeFallbackLayered++;
+                else if (!useMerge)
+                    nrFormalsMergeFallbackSizeGate++;
+                else
+                    nrFormalsMergeFast++;
+                if (useMerge) {
+                    auto view = argAttrs.denseView();
+                    Bindings::size_type ai = 0;
+                    for (auto & i : formals->formals) {
+                        while (ai < view.size && view.names[ai] < i.name)
+                            ++ai;
+                        if (ai < view.size && view.names[ai] == i.name) {
+                            attrsUsed++;
+                            env2.values[displ++] = view.values[ai++];
+                        } else {
+                            if (!i.def) {
+                                error<TypeError>(
+                                    "function '%1%' called without required argument '%2%'",
+                                    (lambda.name ? std::string(symbols[lambda.name]) : "anonymous lambda"),
+                                    symbols[i.name])
+                                    .atPos(lambda.pos)
+                                    .withTrace(pos, "from call site")
+                                    .withFrame(*vCur.lambda().env, lambda)
+                                    .debugThrow();
+                            }
+                            env2.values[displ++] = i.def->maybeThunk(*this, env2);
                         }
-                        env2.values[displ++] = i.def->maybeThunk(*this, env2);
-                    } else {
-                        attrsUsed++;
-                        env2.values[displ++] = j->value;
+                    }
+                } else {
+                    for (auto & i : formals->formals) {
+                        auto j = argAttrs.get(i.name);
+                        if (!j) {
+                            if (!i.def) {
+                                error<TypeError>(
+                                    "function '%1%' called without required argument '%2%'",
+                                    (lambda.name ? std::string(symbols[lambda.name]) : "anonymous lambda"),
+                                    symbols[i.name])
+                                    .atPos(lambda.pos)
+                                    .withTrace(pos, "from call site")
+                                    .withFrame(*vCur.lambda().env, lambda)
+                                    .debugThrow();
+                            }
+                            env2.values[displ++] = i.def->maybeThunk(*this, env2);
+                        } else {
+                            attrsUsed++;
+                            env2.values[displ++] = j->value;
+                        }
                     }
                 }
 
@@ -2341,23 +2406,54 @@ void EvalState::forceValueDeep(Value & v)
         state.forceValue(v, v.determinePos(noPos));
 
         if (v.type() == nAttrs) {
-            for (auto & i : *v.attrs())
-                try {
-                    // If the value is a thunk, we're evaling. Otherwise no trace necessary.
-                    auto dts = state.debugRepl && i.value->isThunk() ? makeDebugTraceStacker(
-                                                                           state,
-                                                                           *i.value->thunk().expr,
-                                                                           *i.value->thunk().env,
-                                                                           i.pos,
-                                                                           "while evaluating the attribute '%1%'",
-                                                                           state.symbols[i.name])
-                                                                     : nullptr;
+            // `pos` is only read on the (rare) debug-trace/error paths below,
+            // but the general iterator synthesizes a full Attr -- touching
+            // `pos` too -- on every step regardless. When unlayered, walk
+            // the dense `name`/`value` arrays directly and fetch `pos` only
+            // where it's actually needed (a plain array read, not an
+            // iterator-synthesis cost).
+            auto & bindings = *v.attrs();
+            if (!bindings.isLayered()) {
+                auto dense = bindings.denseView();
+                for (Bindings::size_type idx = 0; idx < dense.size; ++idx) {
+                    Symbol name = dense.names[idx];
+                    Value * value = dense.values[idx];
+                    try {
+                        // If the value is a thunk, we're evaling. Otherwise no trace necessary.
+                        auto dts = state.debugRepl && value->isThunk() ? makeDebugTraceStacker(
+                                                                              state,
+                                                                              *value->thunk().expr,
+                                                                              *value->thunk().env,
+                                                                              dense.pos[idx],
+                                                                              "while evaluating the attribute '%1%'",
+                                                                              state.symbols[name])
+                                                                        : nullptr;
 
-                    recurse(*i.value);
-                } catch (Error & e) {
-                    state.addErrorTrace(e, i.pos, "while evaluating the attribute '%1%'", state.symbols[i.name]);
-                    throw;
+                        recurse(*value);
+                    } catch (Error & e) {
+                        state.addErrorTrace(e, dense.pos[idx], "while evaluating the attribute '%1%'", state.symbols[name]);
+                        throw;
+                    }
                 }
+            } else {
+                for (auto & i : bindings)
+                    try {
+                        // If the value is a thunk, we're evaling. Otherwise no trace necessary.
+                        auto dts = state.debugRepl && i.value->isThunk() ? makeDebugTraceStacker(
+                                                                               state,
+                                                                               *i.value->thunk().expr,
+                                                                               *i.value->thunk().env,
+                                                                               i.pos,
+                                                                               "while evaluating the attribute '%1%'",
+                                                                               state.symbols[i.name])
+                                                                         : nullptr;
+
+                        recurse(*i.value);
+                    } catch (Error & e) {
+                        state.addErrorTrace(e, i.pos, "while evaluating the attribute '%1%'", state.symbols[i.name]);
+                        throw;
+                    }
+            }
         }
 
         else if (v.isList()) {
@@ -2428,7 +2524,7 @@ bool EvalState::forceBool(Value & v, const PosIdx pos, std::string_view errorCtx
     return v.boolean();
 }
 
-const Attr * EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx)
+std::optional<Attr> EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx)
 {
     auto value = attrSet->get(attrSym);
     if (!value) {
@@ -3144,6 +3240,9 @@ void EvalState::printStatistics()
     };
     topObj["nrOpUpdates"] = nrOpUpdates.load();
     topObj["nrOpUpdateValuesCopied"] = nrOpUpdateValuesCopied.load();
+    topObj["nrFormalsMergeFast"] = nrFormalsMergeFast.load();
+    topObj["nrFormalsMergeFallbackLayered"] = nrFormalsMergeFallbackLayered.load();
+    topObj["nrFormalsMergeFallbackSizeGate"] = nrFormalsMergeFallbackSizeGate.load();
     topObj["nrThunks"] = nrThunks.load();
     topObj["nrAvoided"] = nrAvoided.load();
     topObj["nrLookups"] = nrLookups.load();

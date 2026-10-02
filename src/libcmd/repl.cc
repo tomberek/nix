@@ -862,7 +862,7 @@ void NixRepl::addAttrsToScope(Value & attrs)
         if (counter > 0)
             loaded << ", ";
 
-        printIdentifier(loaded, state->symbols[i->name]);
+        printIdentifier(loaded, state->symbols[i.name]);
         counter += 1;
     }
 

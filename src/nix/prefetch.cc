@@ -221,7 +221,7 @@ static int main_nix_prefetch_url(int argc, char ** argv)
             state->forceAttrs(v, noPos, "while evaluating the source attribute to prefetch");
 
             /* Extract the URL. */
-            auto * attr = v.attrs()->get(state->symbols.create("urls"));
+            auto attr = v.attrs()->get(state->symbols.create("urls"));
             if (!attr)
                 throw Error("attribute 'urls' missing");
             state->forceList(*attr->value, noPos, "while evaluating the urls to prefetch");
