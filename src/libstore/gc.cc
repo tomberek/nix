@@ -12,6 +12,7 @@
 #include "nix/util/util.hh"
 #include "nix/util/file-system.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
+#include "nix/util/base-nix-32.hh"
 
 #include "store-config-private.hh"
 
@@ -822,11 +823,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     unreachable. We don't use readDirectory() here so that
                     GCing can start faster. */
                     auto linksName = linksDir.filename();
+                    auto hardlinksName = hardlinksDir.filename();
                     struct dirent * dirent;
                     while (errno = 0, dirent = readdir(dir.get())) {
                         checkInterrupt();
                         std::string name = dirent->d_name;
-                        if (name == "." || name == ".." || name == linksName)
+                        if (name == "." || name == ".." || name == linksName || name == hardlinksName)
                             continue;
 
                         if (auto storePath = maybeParseStorePath(storeDir + "/" + name))
@@ -852,54 +854,113 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         return;
     }
 
-    /* Unlink all files in /nix/store/.links that have a link count of 1,
-       which indicates that there are no other links and so they can be
+    /* Backstop for orphaned `.hardlinks/tracking` marks whose
+       deletion-time cleanup didn't run (crash, or an old binary with
+       no knowledge of marks). Must run before the "deleting unused
+       links" loop below, since dropping an orphaned mark's hardlink
+       is what brings a dead hash's nlink down to 1. */
+    if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
+        try {
+            for (auto & entry : DirectoryIterator{trackingDir}) {
+                checkInterrupt();
+                auto name = entry.path().filename();
+
+                /* Not atomic with a concurrent writer, so tolerate the
+                   same race writeOptimiseMark does. */
+                try {
+                    bool stillValid;
+                    try {
+                        stillValid = isValidPath(StorePath{name.string()});
+                    } catch (BadStorePath &) {
+                        stillValid = false;
+                    }
+                    if (!stillValid)
+                        std::filesystem::remove_all(trackingDir / name);
+                } catch (std::filesystem::filesystem_error &) {
+                }
+            }
+        } catch (SystemError &) {
+            /* trackingDir doesn't exist (e.g. read-only store). */
+        }
+    }
+
+    /* Unlink all files in /nix/store/.links (and the sharded
+       .hardlinks/sha256 farm) that have a link count of 1, which
+       indicates that there are no other links and so they can be
        safely deleted.  FIXME: race condition with optimisePath(): we
        might see a link count of 1 just before optimisePath() increases
        the link count. */
     if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
         printInfo("deleting unused links...");
 
-        AutoCloseDir dir(opendir(linksDir.string().c_str()));
-        if (!dir)
-            throw SysError("opening directory %1%", PathFmt(linksDir));
+        int64_t actualSize = 0, unsharedSize = 0, overhead = 0;
 
-        int64_t actualSize = 0, unsharedSize = 0;
+        auto cleanupLinksDir = [&](const std::filesystem::path & dir) {
+            AutoCloseDir d(opendir(dir.string().c_str()));
+            if (!d)
+                return;
 
-        struct dirent * dirent;
-        while (errno = 0, dirent = readdir(dir.get())) {
-            checkInterrupt();
-            std::string name = dirent->d_name;
-            if (name == "." || name == "..")
-                continue;
-            auto path = linksDir / name;
-
-            auto st = lstat(path);
-
-            if (st.st_nlink != 1) {
-                actualSize += st.st_size;
-                unsharedSize += (st.st_nlink - 1) * st.st_size;
-                continue;
-            }
-
-            printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
-
-            unlink(path);
-
-            /* Do not account for deleted file here. Rely on deletePath()
-               accounting.  */
-        }
-
-        int64_t overhead =
-#ifdef _WIN32
-            0
-#else
-            [&] {
-                auto st = stat(linksDir);
-                return st.st_blocks * 512ULL;
-            }()
+#ifndef _WIN32
+            /* Directory block overhead, folded into this walk since it
+               already visits every shard - a single stat(linksDir)
+               would miss all but one of them. */
+            overhead += stat(dir).st_blocks * 512ULL;
 #endif
-            ;
+
+            struct dirent * dirent;
+            while (errno = 0, dirent = readdir(d.get())) {
+                checkInterrupt();
+                std::string name = dirent->d_name;
+                if (name == "." || name == "..")
+                    continue;
+                auto path = dir / name;
+
+                auto st = lstat(path);
+
+                if (st.st_nlink != 1) {
+                    actualSize += st.st_size;
+                    unsharedSize += (st.st_nlink - 1) * st.st_size;
+                    continue;
+                }
+
+                printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
+
+                unlink(path);
+
+                /* Do not account for deleted file here. Rely on deletePath()
+                   accounting.  */
+            }
+        };
+
+        {
+            AutoCloseDir dir(opendir(linksDir.string().c_str()));
+            if (!dir)
+                throw SysError("opening directory %1%", PathFmt(linksDir));
+        }
+        cleanupLinksDir(linksDir);
+
+        /* .hardlinks/sha256's shards hold the same kind of entries as
+           .links, so the same nlink==1 reclaim logic applies. */
+        forEachShardName([&](std::string_view shard) {
+            checkInterrupt();
+            cleanupLinksDir(shardedLinksDir / shard);
+        });
+        cleanupLinksDir(shardedLinksOverflowDir);
+
+        /* Same treatment for .hardlinks/b3's mode-keyed trees, created
+           only if blake3-links was ever enabled. Skip a mode tree
+           entirely if absent, rather than issuing 2048 guaranteed-
+           ENOENT opendir() calls per mode on every GC run. */
+        for (auto modeDir : {"r", "x", "s"}) {
+            auto dir = b3LinksDir / modeDir;
+            if (!pathExists(dir))
+                continue;
+            forEachShardName([&](std::string_view shard) {
+                checkInterrupt();
+                cleanupLinksDir(dir / shard);
+            });
+            cleanupLinksDir(dir / "overflow");
+        }
 
         printInfo("note: hard linking is currently saving %s", renderSize(unsharedSize - actualSize - overhead));
     }

@@ -50,5 +50,9 @@ nix-collect-garbage
 if test -e "$outPath/foobar"; then false; fi
 
 # Check that the store is empty.
+find "$NIX_STORE_DIR/.hardlinks/sha256" -mindepth 1 -type d -empty -delete
+rmdir "$NIX_STORE_DIR/.hardlinks/sha256"
+rmdir "$NIX_STORE_DIR/.hardlinks/tracking"
+rmdir "$NIX_STORE_DIR/.hardlinks"
 rmdir "$NIX_STORE_DIR/.links"
 rmdir "$NIX_STORE_DIR"

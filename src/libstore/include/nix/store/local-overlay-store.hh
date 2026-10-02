@@ -208,6 +208,17 @@ private:
     void optimiseStore() override;
 
     /**
+     * `deleteStorePath` deletes upper-layer StorePaths outright without
+     * invalidating them, which would silently orphan any mark written
+     * for them. Until marks are integrated with that, disable them
+     * here; hardlink deduplication itself is unaffected.
+     */
+    bool supportsOptimiseMarks() const override
+    {
+        return false;
+    }
+
+    /**
      * Check all paths registered in the upper DB.
      *
      * Note that this includes store objects that reside in either overlayfs layer;
