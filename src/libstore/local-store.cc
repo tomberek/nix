@@ -154,57 +154,23 @@ LocalStore::LocalStore(ref<const Config> config)
     if (!config->readOnly)
         createDirs(trackingDir);
     if (!config->readOnly) {
-        /* Pre-create all 2048 shard directories for Nix32 3-character
-           prefixes of a SHA-256 hash (first character is always '0' or
-           '1' due to Nix32 encoding bias for a 256-bit hash, so this is
-           2 * 32 * 32 = 2048 directories, not 32^3). New content-hash
-           links go here (.hardlinks/sha256/<prefix>/<hash>); the old
-           flat .links/<hash> layout stays valid forever for existing
-           entries but is never written to again.
-
-           This runs on every LocalStore construction, i.e. every nix
-           invocation, not just --optimise - so once the tree exists,
-           skip straight past the 2048-directory loop (a few ms of
-           create_directories() calls even when every directory is
-           already there) via one cheap existence check on a sentinel
-           shard instead. */
+        /* Pre-create the 2048 sha256 shard directories. This runs on
+           every LocalStore construction, not just --optimise, so skip
+           the loop once the tree already exists via one existence
+           check on a sentinel shard. */
         if (!pathExists(shardedLinksDir / "000")) {
             createDirs(shardedLinksOverflowDir);
-            for (size_t first = 0; first < 2; ++first) {
-                for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-                    for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                        char shard[4] = {
-                            BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                        createDirs(shardedLinksDir / shard);
-                    }
-                }
-            }
+            forEachShardName([&](std::string_view shard) { createDirs(shardedLinksDir / shard); });
         }
 
-        /* Same shard/overflow layout as .hardlinks/sha256, but three
-           independent copies - one per mode subdirectory (r/x/s) -
-           since flat BLAKE3 hashing can't distinguish an executable
-           file, a non-executable file, and a symlink with identical
-           bytes the way the NAR-serialization hash sha256 uses can.
-           Only created if blake3-links is enabled: unlike sha256's
-           farm, this isn't on by default, so most stores never pay
-           for these 3 * 2048 = 6144 directories at all. */
+        /* Same layout, three independent copies (one per mode
+           subdirectory). Only created if blake3-links is enabled -
+           most stores never pay for these 6144 directories at all. */
         if (experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links) && !pathExists(b3LinksDir / "r" / "000")) {
             for (auto modeDir : {"r", "x", "s"}) {
                 auto dir = b3LinksDir / modeDir;
                 createDirs(dir / "overflow");
-                for (size_t first = 0; first < 2; ++first) {
-                    for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-                        for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                            char shard[4] = {
-                                BaseNix32::characters[first],
-                                BaseNix32::characters[i],
-                                BaseNix32::characters[j],
-                                '\0'};
-                            createDirs(dir / shard);
-                        }
-                    }
-                }
+                forEachShardName([&](std::string_view shard) { createDirs(dir / shard); });
             }
         }
     }
@@ -502,11 +468,8 @@ void LocalStore::deleteStorePath(const std::filesystem::path & path, uint64_t & 
         return;
     }
 
-    /* Whenever a StorePath is deleted, also remove its
-       `.hardlinks/tracking` mark subtree, if any, as part of the same
-       deletion. Harmless (and a no-op) for garbage that never had a
-       mark. Best-effort: this must never itself throw and abort the
-       caller's GC pass. */
+    /* Also remove the path's `.hardlinks/tracking` mark, if any.
+       Best-effort: must not abort the caller's GC pass. */
     try {
         std::filesystem::remove_all(trackingDir / path.filename());
     } catch (std::filesystem::filesystem_error &) {
@@ -1578,16 +1541,10 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
             }
         };
 
-        for (size_t first = 0; first < 2; ++first) {
-            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                    checkInterrupt();
-                    char shard[4] = {
-                        BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                    checkShardedLinksDir(shardedLinksDir / shard);
-                }
-            }
-        }
+        forEachShardName([&](std::string_view shard) {
+            checkInterrupt();
+            checkShardedLinksDir(shardedLinksDir / shard);
+        });
         checkShardedLinksDir(shardedLinksOverflowDir);
 
         if (experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links)) {
@@ -1639,19 +1596,10 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
             for (auto [modeDirName, expectedMode] :
                  {std::pair{"r", linkModeR}, std::pair{"x", linkModeX}, std::pair{"s", linkModeS}}) {
                 auto dir = b3LinksDir / modeDirName;
-                for (size_t first = 0; first < 2; ++first) {
-                    for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-                        for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                            checkInterrupt();
-                            char shard[4] = {
-                                BaseNix32::characters[first],
-                                BaseNix32::characters[i],
-                                BaseNix32::characters[j],
-                                '\0'};
-                            checkB3LinksDir(dir / shard, expectedMode);
-                        }
-                    }
-                }
+                forEachShardName([&](std::string_view shard) {
+                    checkInterrupt();
+                    checkB3LinksDir(dir / shard, expectedMode);
+                });
                 checkB3LinksDir(dir / "overflow", expectedMode);
             }
         }

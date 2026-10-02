@@ -7,6 +7,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/indirect-root-store.hh"
 #include "nix/util/sync.hh"
+#include "nix/util/base-nix-32.hh"
 
 #include <chrono>
 #include <future>
@@ -17,11 +18,10 @@
 namespace nix {
 
 /**
- * Mode subdirectory names under `.hardlinks/b3/<mode>/...`. Flat
- * content hashing (unlike the NAR-serialization hash `.links`/
- * `.hardlinks/sha256` use) can't distinguish a regular file from an
- * executable file from a symlink with identical bytes, so BLAKE3 links
- * are split into three independent, mode-keyed shard trees instead.
+ * Mode subdirectory names under `.hardlinks/b3/<mode>/...` - flat
+ * content hashing can't distinguish a regular file, an executable,
+ * and a symlink with identical bytes, so BLAKE3 links are split into
+ * three mode-keyed shard trees instead.
  */
 constexpr mode_t linkModeMask = S_IFMT | S_IXUSR;
 
@@ -41,6 +41,23 @@ inline std::string_view linkModeDirName(mode_t mode)
     default:
         throw Error("unexpected mode 0%o for .hardlinks/b3 entry", mode);
     }
+}
+
+/**
+ * Call `f` once per 3-character Nix32 shard name used by the
+ * `.hardlinks/sha256` and `.hardlinks/b3/<mode>` farms (2048 shards:
+ * first character is always '0' or '1', so 2 * 32 * 32, not 32^3).
+ */
+template<typename F>
+void forEachShardName(F && f)
+{
+    for (size_t first = 0; first < 2; ++first)
+        for (size_t i = 0; i < BaseNix32::characters.size(); ++i)
+            for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
+                char shard[4] = {
+                    BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
+                f(std::string_view(shard, 3));
+            }
 }
 
 /**
@@ -459,12 +476,14 @@ protected:
 
     /**
      * Whether `optimisePath_()`'s caller should write
-     * `.hardlinks/tracking` marks. Set to `false` by
-     * `LocalOverlayStore`, whose `deleteStorePath` calls would silently
-     * orphan marks (see its constructor). Hardlink deduplication itself
-     * is unaffected; only the mark/cache layer is disabled.
+     * `.hardlinks/tracking` marks. Overridden to `false` by
+     * `LocalOverlayStore` (see its override) - hardlink deduplication
+     * itself is unaffected, only the mark/cache layer.
      */
-    bool writeOptimiseMarks = true;
+    virtual bool supportsOptimiseMarks() const
+    {
+        return true;
+    }
 
 public:
 
@@ -564,7 +583,6 @@ private:
 
     typedef boost::unordered_flat_set<ino_t> InodeHash;
 
-    InodeHash loadInodeHash();
     Strings readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash);
 
     void optimisePath_(
@@ -577,22 +595,19 @@ private:
         std::optional<std::filesystem::path> & markRelPath);
 
     /**
-     * Write (or rewrite) the `.hardlinks/tracking` mark for `storePath`
+     * Write (or rewrite) the `.hardlinks/tracking` mark for `storePath`,
      * using `markRelPath` as the representative file (relative to
-     * `storePath`, empty if the representative file is `storePath`
-     * itself). No-op if mark-writing is disabled (`writeOptimiseMarks`)
-     * or `markRelPath` is `std::nullopt`. Best-effort: any
-     * `filesystem_error` is caught and swallowed.
+     * `storePath`, empty if `storePath` itself is the representative
+     * file). No-op if `supportsOptimiseMarks()` is false or
+     * `markRelPath` is `std::nullopt`. Best-effort.
      */
     void writeOptimiseMark(const StorePath & storePath, const std::optional<std::filesystem::path> & markRelPath);
 
     /**
-     * True if StorePath `storePath` (whose on-disk path is `realPath`,
-     * i.e. `config->realStoreDir.get() / storePath.to_string()`) already
-     * has a valid `.hardlinks/tracking` mark: a chain of single-entry
-     * directories under `trackingDir` mirroring some file's relative
-     * path within the StorePath, ending in a hardlink whose inode
-     * matches that file's current inode.
+     * True if StorePath `storePath` (on-disk path `realPath`) already
+     * has a valid `.hardlinks/tracking` mark: a single-entry directory
+     * under `trackingDir` naming some file's relative path within the
+     * StorePath, hardlinked to that file's current inode.
      */
     bool hasValidOptimiseMark(const StorePath & storePath, const std::filesystem::path & realPath);
 

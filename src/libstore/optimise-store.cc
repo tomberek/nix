@@ -28,6 +28,14 @@ static void makeWritable(const std::filesystem::path & path)
     chmod(path, st.st_mode | S_IWUSR);
 }
 
+static void warnCorruptedLink(const std::filesystem::path & path)
+{
+    warn("removing corrupted link %s", PathFmt(path));
+    warn(
+        "There may be more corrupted paths."
+        "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
+}
+
 struct MakeReadOnly
 {
     std::filesystem::path path;
@@ -48,29 +56,6 @@ struct MakeReadOnly
         }
     }
 };
-
-LocalStore::InodeHash LocalStore::loadInodeHash()
-{
-    debug("loading hash inodes in memory");
-    InodeHash inodeHash;
-
-    AutoCloseDir dir(opendir(linksDir.string().c_str()));
-    if (!dir)
-        throw SysError("opening directory %1%", PathFmt(linksDir));
-
-    struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
-        checkInterrupt();
-        // We don't care if we hit non-hash files, anything goes
-        inodeHash.insert(dirent->d_ino);
-    }
-    if (errno)
-        throw SysError("reading directory %1%", PathFmt(linksDir));
-
-    printMsg(lvlTalkative, "loaded %1% hash inodes", inodeHash.size());
-
-    return inodeHash;
-}
 
 Strings LocalStore::readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash)
 {
@@ -157,16 +142,11 @@ void LocalStore::optimisePath_(
         return;
     }
 
-    /* Attempt to replace `path` with a hard link to `candidatePath`
-       (already confirmed to hold the same content). Returns true on
-       success (including the "already linked" case) or if the caller
-       should give up on this file entirely (EMLINK on `path` itself,
-       ENOSPC, or a concurrent GC race) - in all of those cases
-       markRelPath is set or the function has already returned, so the
-       caller should return immediately either way. Returns false only
-       when `candidatePath` itself turns out to be full (EMLINK linking
-       *into* it or during the rename) - the only case where trying a
-       different candidate (the next overflow slot) can help. */
+    /* Links `path` to `candidatePath` (same content, already verified).
+       Returns false only if `candidatePath` itself is full (EMLINK) -
+       the caller should try the next overflow slot. Any other outcome
+       (success, already-linked, EMLINK on `path`, GC race) returns
+       true; the caller should stop. */
     auto tryLinkTo = [&](const std::filesystem::path & candidatePath, const PosixStat & stCandidate) -> bool {
         if (st.st_ino == stCandidate.st_ino) {
             debug("%1% is already linked to %2%", PathFmt(path), PathFmt(candidatePath));
@@ -238,19 +218,11 @@ void LocalStore::optimisePath_(
     };
 
     if (experimentalFeatureSettings.isEnabled(Xp::BLAKE3Links)) {
-        /* BLAKE3 hashes flat content, not the NAR serialisation, so
-           executable-bit and symlink-vs-regular-file distinctions have
-           to be encoded separately: hash the symlink target's bytes
-           for a symlink, the file's raw bytes otherwise, and route
-           into one of three independent mode-keyed shard trees
-           (.hardlinks/b3/<r|x|s>/<prefix>/<hash>) rather than relying
-           on the hash itself to disambiguate. This is an alternative
-           dedup backend, not an addition to the sha256 path below: a
-           file is deduped via exactly one of the two farms per
-           optimisePath_() call, controlled by whether blake3-links is
-           enabled when this call happens to run - checked first, so a
-           store with blake3-links enabled never pays for the SHA-256
-           NAR-hash pass below at all. */
+        /* BLAKE3 hashes flat content, so same-byte files with
+           different modes would collide - split into mode-keyed shard
+           trees (.hardlinks/b3/<r|x|s>/...) instead. Alternative to
+           the sha256 path below, not an addition to it: checked first,
+           so it skips the NAR-hash pass entirely when enabled. */
         bool isSymlink = S_ISLNK(st.st_mode);
         Hash b3Hash = isSymlink ? hashString(HashAlgorithm::BLAKE3, readLink(path).string())
                                  : hashFile(HashAlgorithm::BLAKE3, path);
@@ -297,18 +269,13 @@ void LocalStore::optimisePath_(
             if (!stCandidate)
                 continue; /* Concurrently GC'd; try the next slot. */
 
-            /* Same unconditional-size/repair-gated-hash corruption
-               check as the sha256 path, plus a mode check: a
-               same-hash-prefix collision landing in the wrong mode's
-               shard tree would be a real bug elsewhere, not something
-               that should be silently accepted here. */
+            /* Same corruption check as the sha256 path below, plus a
+               mode check (a collision landing in the wrong mode tree
+               would otherwise be silently accepted). */
             if (st.st_size != stCandidate->st_size
                 || (st.st_mode & linkModeMask) != (stCandidate->st_mode & linkModeMask)
                 || (repair && b3Hash != hashCandidate(candidatePath, stCandidate->st_mode))) {
-                warn("removing corrupted link %s", PathFmt(candidatePath));
-                warn(
-                    "There may be more corrupted paths."
-                    "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
+                warnCorruptedLink(candidatePath);
                 unlinkIfExists(candidatePath);
                 continue;
             }
@@ -336,35 +303,32 @@ void LocalStore::optimisePath_(
     std::string hashStr = hash.to_string(HashFormat::Nix32, false);
     debug("%s has hash '%s'", PathFmt(path), hash.to_string(HashFormat::Nix32, true));
 
-    /* Check the old flat .links/<hash> location first - this is where
-       every pre-sharding link still lives, and stays valid forever.
-       New links are never written here anymore; only the sharded farm
-       below (.hardlinks/sha256/<prefix>/<hash>, falling through to
-       numbered overflow replicas once a hash's primary replica hits
-       the ~32000-hardlink ceiling) receives new writes. */
+    /* Check the old flat .links/<hash> first - still valid forever,
+       but never written to again; new links go to the sharded farm
+       below (.hardlinks/sha256/<prefix>/<hash>, with numbered overflow
+       replicas once a shard's hardlink ceiling is hit). */
     std::filesystem::path linkPath = linksDir / hashStr;
-    bool foundInFlatLinks = pathExists(linkPath);
+    auto stLinkAtCheck = maybeLstat(linkPath);
+    bool foundInFlatLinks = stLinkAtCheck.has_value();
 
-    if (foundInFlatLinks) {
-        auto stLink = lstat(linkPath);
-        if (st.st_size != stLink.st_size || (repair && hash != ({
-                                                             hashPath(
-                                                                 makeFSSourceAccessor(linkPath),
-                                                                 FileSerialisationMethod::NixArchive,
-                                                                 HashAlgorithm::SHA256)
-                                                                 .hash;
-                                                         }))) {
-            // XXX: Consider overwriting linkPath with our valid version.
-            warn("removing corrupted link %s", PathFmt(linkPath));
-            warn(
-                "There may be more corrupted paths."
-                "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
-            unlinkIfExists(linkPath);
-            foundInFlatLinks = false;
-        }
+    if (foundInFlatLinks
+        && (st.st_size != stLinkAtCheck->st_size || (repair && hash != ({
+                                                                    hashPath(
+                                                                        makeFSSourceAccessor(linkPath),
+                                                                        FileSerialisationMethod::NixArchive,
+                                                                        HashAlgorithm::SHA256)
+                                                                        .hash;
+                                                                })))) {
+        // XXX: Consider overwriting linkPath with our valid version.
+        warnCorruptedLink(linkPath);
+        unlinkIfExists(linkPath);
+        foundInFlatLinks = false;
     }
 
     if (foundInFlatLinks) {
+        /* Re-stat rather than reusing stLinkAtCheck: the repair-mode
+           hash check above can take a while, during which a
+           concurrent GC could have removed linkPath. */
         auto stLink = maybeLstat(linkPath);
         if (!stLink)
             return; /* Concurrent GC race; a later pass will dedup it. */
@@ -377,18 +341,12 @@ void LocalStore::optimisePath_(
     }
 
     {
-        /* Not in the old flat layout (or it was just removed above as
-           corrupted) - use the sharded farm. Shard prefix is the first
-           3 characters of the Nix32-encoded hash (2048 shards, first
-           character always '0' or '1'); once the primary replica in
-           that shard hits the hardlink ceiling, fall through to
-           numbered overflow replicas (.hardlinks/sha256/overflow/<hash>.NNN,
-           up to 999) rather than giving up on deduplicating this file.
-           A candidate slot can also turn out to be full only once
-           tryLinkTo() actually attempts to link into it (EMLINK on the
-           create_hard_link or the rename); that's handled by simply
-           continuing this same loop to the next slot, exactly like the
-           "already full at selection time" case below. */
+        /* Not in the flat layout (or just removed above as corrupted)
+           - use the sharded farm. Shard prefix is the hash's first 3
+           Nix32 characters (2048 shards); once a shard's primary
+           replica hits the hardlink ceiling, fall through to numbered
+           overflow replicas (.hardlinks/sha256/overflow/<hash>.NNN, up
+           to 999) rather than give up on this file. */
         std::string shard = hashStr.substr(0, 3);
         std::filesystem::path primaryPath = shardedLinksDir / shard / hashStr;
 
@@ -427,14 +385,9 @@ void LocalStore::optimisePath_(
             if (!stCandidate)
                 continue; /* Concurrently GC'd; try the next slot. */
 
-            /* A size mismatch is corruption regardless of repair mode
-               (mirrors the flat .links check above) - only the more
-               expensive full-content hash check is gated on repair.
-               Checking size unconditionally, but hash only under
-               repair, matters here: without it, a size-mismatched
-               candidate would silently be accepted as this file's
-               dedup target instead of being rejected, corrupting
-               whatever gets hardlinked/renamed onto it next. */
+            /* Size mismatch is corruption regardless of repair mode
+               (mirrors the flat .links check above); the full hash
+               check is gated on repair since it's expensive. */
             if (st.st_size != stCandidate->st_size
                 || (repair
                     && hash
@@ -443,10 +396,7 @@ void LocalStore::optimisePath_(
                                FileSerialisationMethod::NixArchive,
                                HashAlgorithm::SHA256)
                                .hash)) {
-                warn("removing corrupted link %s", PathFmt(candidatePath));
-                warn(
-                    "There may be more corrupted paths."
-                    "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
+                warnCorruptedLink(candidatePath);
                 unlinkIfExists(candidatePath);
                 continue; /* Recreate this slot on the next pass. */
             }
@@ -462,24 +412,17 @@ void LocalStore::optimisePath_(
     }
 }
 
-/* Sentinel mark filename for the empty-relPath case (single-file
-   StorePaths, e.g. .drv files, where the representative file *is* the
-   StorePath itself). An empty string can't be a filesystem entry name,
-   so this can't be represented via percentEncodeMarkName - it needs an
-   explicit out-of-band marker instead. "%" alone can never be produced
-   by percentEncodeMarkName for a non-empty relPath: that function only
-   ever emits a lone '%' as the first byte of a complete "%XX" triple,
-   never on its own. */
+/* Sentinel for the empty-relPath case (single-file StorePaths, e.g.
+   .drv files, whose representative file *is* the StorePath itself). An
+   empty string can't be a filename, so this needs an explicit marker.
+   Safe: percentEncodeMarkName never emits a bare '%' alone, only as
+   the first byte of a full "%XX" triple. */
 static const std::string emptyRelPathMarkName = "%";
 
-/* Encode a relPath into a single filename safe to place directly under
-   trackingDir/<StorePath>/. '/' can't appear in a filename at all, and
-   '%' is escaped too so the encoding round-trips unambiguously. Every
-   other byte (including other reserved shell/filesystem characters)
-   passes through unchanged - relPath components are already validated
-   store-path-safe names, so this only needs to handle the one
-   character '/' introduces when components are joined. Must not be
-   called with an empty relPath - use emptyRelPathMarkName instead. */
+/* Encode relPath into a single filename under trackingDir/<StorePath>/:
+   '/' can't appear in a filename, so escape it (and '%', to keep the
+   encoding unambiguous). Must not be called with an empty relPath -
+   use emptyRelPathMarkName instead. */
 static std::string percentEncodeMarkName(const std::filesystem::path & relPath)
 {
     assert(!relPath.empty());
@@ -525,18 +468,13 @@ static std::optional<std::filesystem::path> percentDecodeMarkName(const std::str
 
 void LocalStore::writeOptimiseMark(const StorePath & storePath, const std::optional<std::filesystem::path> & markRelPath)
 {
-    if (!writeOptimiseMarks || !markRelPath)
+    if (!supportsOptimiseMarks() || !markRelPath)
         return;
 
-    /* relPath is encoded into a single filename (percent-encoding '/'
-       and '%', or the emptyRelPathMarkName sentinel if relPath itself
-       is empty) so a mark is a fixed-depth lookup regardless of how
-       deep the representative file sits, rather than one directory
-       per path component. This trades away being able to reconstruct
-       relPath by just walking directories with `ls`, and caps the
-       encodable relPath length at NAME_MAX: if it doesn't fit, skip
-       writing a mark this round (fail-open, same as the no-candidate
-       case) rather than trying to represent it another way. */
+    /* Encoding relPath into one filename makes a mark a fixed-depth
+       lookup regardless of how deep the representative file sits, at
+       the cost of capping it at NAME_MAX - if it doesn't fit, skip
+       writing a mark this round (fail-open). */
     std::string encoded = markRelPath->empty() ? emptyRelPathMarkName : percentEncodeMarkName(*markRelPath);
     if (encoded.size() > NAME_MAX)
         return;
@@ -545,14 +483,11 @@ void LocalStore::writeOptimiseMark(const StorePath & storePath, const std::optio
     auto tmpDir = makeTempPath(trackingDir, ".tmp-mark");
 
     try {
-        /* Build the new mark subtree in a private temp directory, then
-           atomically rename it into place: this makes a concurrent
-           optimiser writing a different (also valid) representative
-           file for the same StorePath pick one winner or the other,
-           never a two-entry directory with both - the race that an
-           in-place remove_all()+create_hard_link() sequence can't rule
-           out, since std::filesystem::rename() replacing a directory
-           is a single atomic operation. */
+        /* Build the subtree in a private temp dir, then rename it into
+           place atomically: a concurrent optimiser writing a different
+           representative file for the same StorePath picks one winner,
+           never a two-entry directory - rename() replacing a directory
+           is atomic, unlike remove_all()+create_hard_link(). */
         std::filesystem::create_directory(tmpDir);
 
         auto realPath = config->realStoreDir.get() / storePath.to_string();
@@ -565,12 +500,10 @@ void LocalStore::writeOptimiseMark(const StorePath & storePath, const std::optio
         } catch (std::filesystem::filesystem_error & e) {
             if (e.code() != std::errc::directory_not_empty)
                 throw;
-            /* markRoot already holds a stale mark (e.g. left by a
-               crash, a deleted-and-recreated StorePath, or simply the
-               previous valid mark being refreshed) - clear it and
-               retry once. If a concurrent writer re-populates markRoot
-               in between, this retry can also fail; that's absorbed by
-               the catch-all below like any other best-effort race. */
+            /* markRoot already holds a stale mark (crash, deleted-and-
+               recreated StorePath, or a refresh) - clear and retry
+               once. A concurrent re-populate can still lose this race;
+               absorbed by the catch-all below. */
             std::filesystem::remove_all(markRoot);
             std::filesystem::rename(tmpDir, markRoot);
         }
@@ -585,11 +518,8 @@ bool LocalStore::hasValidOptimiseMark(const StorePath & storePath, const std::fi
 {
     auto markRoot = trackingDir / storePath.to_string();
 
-    /* A genuine mark directory has exactly one entry, by construction.
-       Any deviation - missing, extra entries, unreadable - is treated
-       fail-safe: "unreadable, re-optimise". One opendir/readdir round
-       regardless of how deep the encoded relPath's original directory
-       chain would have been. */
+    /* A genuine mark directory has exactly one entry. Any deviation -
+       missing, extra entries, unreadable - is fail-safe: re-optimise. */
     std::string onlyEntry;
     size_t count = 0;
     try {
@@ -631,25 +561,21 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
 
     auto paths = queryAllValidPaths();
 
-    /* No longer seeded via loadInodeHash(): hasValidOptimiseMark()
-       below skips most StorePaths outright, so that upfront full scan
-       of .links would cost more than it saves. Still shared across the
-       whole run (not reset per StorePath), so the inodeHash.count()
-       fast path in optimisePath_ can fire for an inode inserted while
-       processing an earlier StorePath. */
+    /* hasValidOptimiseMark() below skips most StorePaths outright, so
+       there's no upfront seeding of inodeHash - it's still shared
+       across the whole run, so the fast path in optimisePath_ can
+       still fire for an inode inserted while processing an earlier
+       StorePath. */
     InodeHash inodeHash;
 
     act.progress(0, paths.size());
 
     uint64_t done = 0;
 
-    /* Registering each path as a temp root one at a time means
-       acquiring/releasing the GC lock once per path, which shows up as
-       real syscall cost at scale (flock/fcntl in the tens of thousands
-       for a large store) even though the file walk itself is now
-       skipped for marked paths. addTempRoots() already holds the lock
-       once per call regardless of how many paths it's given - call it
-       with chunks instead of one path at a time. */
+    /* addTempRoots() already batches the GC-lock acquisition - call it
+       with chunks instead of one path at a time, which matters at
+       scale even once the file walk itself is skipped for marked
+       paths. */
     constexpr size_t tempRootBatchSize = 256;
     StorePathSet batch;
 

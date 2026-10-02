@@ -855,22 +855,18 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     }
 
     /* Backstop for orphaned `.hardlinks/tracking` marks whose
-       deletion-time cleanup (LocalStore::deleteStorePath) didn't run -
-       a crash, or an old binary deleting a path with no knowledge of
-       `.hardlinks/tracking`. Must run before the "deleting unused
-       links" loop below: dropping an orphaned mark's hardlink is what
-       brings a dead hash's nlink down to where that loop will delete
-       it. */
+       deletion-time cleanup didn't run (crash, or an old binary with
+       no knowledge of marks). Must run before the "deleting unused
+       links" loop below, since dropping an orphaned mark's hardlink
+       is what brings a dead hash's nlink down to 1. */
     if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
         try {
             for (auto & entry : DirectoryIterator{trackingDir}) {
                 checkInterrupt();
                 auto name = entry.path().filename();
 
-                /* Not atomic with a concurrent writer (addToStore()
-                   writes a mark before registering the path as valid),
-                   so tolerate ENOENT/ENOTEMPTY the same way
-                   writeOptimiseMark tolerates the symmetric race. */
+                /* Not atomic with a concurrent writer, so tolerate the
+                   same race writeOptimiseMark does. */
                 try {
                     bool stillValid;
                     try {
@@ -884,7 +880,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 }
             }
         } catch (SystemError &) {
-            /* trackingDir doesn't exist (e.g. read-only store): nothing to sweep. */
+            /* trackingDir doesn't exist (e.g. read-only store). */
         }
     }
 
@@ -905,10 +901,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 return;
 
 #ifndef _WIN32
-            /* Directory block overhead, folded into the same walk that
-               already visits .links, every sha256 shard + overflow,
-               and (if ever enabled) every b3 mode/shard + overflow -
-               a single stat(linksDir) missed all but one of these. */
+            /* Directory block overhead, folded into this walk since it
+               already visits every shard - a single stat(linksDir)
+               would miss all but one of them. */
             overhead += stat(dir).st_blocks * 512ULL;
 #endif
 
@@ -944,40 +939,26 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
         cleanupLinksDir(linksDir);
 
-        /* .hardlinks/sha256's shard directories and its overflow
-           directory hold the same kind of content-hash-named entries
-           as .links, so the same nlink==1 reclaim logic applies -
-           enumerate every pre-created shard plus overflow. */
-        for (size_t first = 0; first < 2; ++first) {
-            for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-                for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                    checkInterrupt();
-                    char shard[4] = {
-                        BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                    cleanupLinksDir(shardedLinksDir / shard);
-                }
-            }
-        }
+        /* .hardlinks/sha256's shards hold the same kind of entries as
+           .links, so the same nlink==1 reclaim logic applies. */
+        forEachShardName([&](std::string_view shard) {
+            checkInterrupt();
+            cleanupLinksDir(shardedLinksDir / shard);
+        });
         cleanupLinksDir(shardedLinksOverflowDir);
 
-        /* .hardlinks/b3's three mode-keyed shard trees (present only
-           if blake3-links was ever enabled - the directories are
-           created lazily on first LocalStore construction with the
-           feature on, not unconditionally like .hardlinks/sha256) get
-           the same treatment. cleanupLinksDir() already no-ops on a
-           directory that doesn't exist. */
+        /* Same treatment for .hardlinks/b3's mode-keyed trees, created
+           only if blake3-links was ever enabled. Skip a mode tree
+           entirely if absent, rather than issuing 2048 guaranteed-
+           ENOENT opendir() calls per mode on every GC run. */
         for (auto modeDir : {"r", "x", "s"}) {
             auto dir = b3LinksDir / modeDir;
-            for (size_t first = 0; first < 2; ++first) {
-                for (size_t i = 0; i < BaseNix32::characters.size(); ++i) {
-                    for (size_t j = 0; j < BaseNix32::characters.size(); ++j) {
-                        checkInterrupt();
-                        char shard[4] = {
-                            BaseNix32::characters[first], BaseNix32::characters[i], BaseNix32::characters[j], '\0'};
-                        cleanupLinksDir(dir / shard);
-                    }
-                }
-            }
+            if (!pathExists(dir))
+                continue;
+            forEachShardName([&](std::string_view shard) {
+                checkInterrupt();
+                cleanupLinksDir(dir / shard);
+            });
             cleanupLinksDir(dir / "overflow");
         }
 
