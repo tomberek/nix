@@ -46,7 +46,6 @@
 #include <mutex>
 
 #include <nlohmann/json.hpp>
-#include <boost/container/small_vector.hpp>
 #include <boost/unordered/concurrent_flat_map.hpp>
 
 #include "nix/util/strings-inline.hh"
@@ -704,8 +703,8 @@ static void printWithBindings(const SymbolTable & st, const Env & env)
         std::cout << ANSI_MAGENTA;
         auto * bindings = env.values[0]->attrs();
         /* TODO: Don't print the whole attribute set, since it can be quite large. */
-        for (const Attr * attr : bindings->lexicographicOrder(st))
-            std::cout << st[attr->name] << " ";
+        for (const Attr & attr : bindings->lexicographicOrder(st))
+            std::cout << st[attr.name] << " ";
         std::cout << ANSI_NORMAL;
         std::cout << std::endl;
     }
@@ -3088,6 +3087,8 @@ void EvalState::printStatistics()
     uint64_t bLists = memstats.nrListElems * sizeof(Value *);
     uint64_t bValues = memstats.nrValues * sizeof(Value);
     uint64_t bAttrsets = memstats.nrAttrsets * sizeof(Bindings) + memstats.nrAttrsInAttrsets * sizeof(Attr);
+    uint64_t bShapeShared =
+        memstats.nrShapeSharedAttrsets * sizeof(Bindings) + memstats.nrShapeSharedValues * sizeof(Value *);
 
 #if NIX_USE_BOEHMGC
     GC_word heapSize, totalBytes;
@@ -3135,7 +3136,33 @@ void EvalState::printStatistics()
         {"number", memstats.nrAttrsets.load()},
         {"bytes", bAttrsets},
         {"elements", memstats.nrAttrsInAttrsets.load()},
+        /* ponytail: prototype-only mapAttrs shape-sharing counters. */
+        {"shapeSharedNumber", memstats.nrShapeSharedAttrsets.load()},
+        {"shapeSharedValues", memstats.nrShapeSharedValues.load()},
+        {"shapeSharedBytes", bShapeShared},
+        {"attrValuesOnShapeShared", memstats.nrAttrValuesOnShapeShared.load()},
+        {"attrValuesOnShapeSharedElements", memstats.nrAttrValuesOnShapeSharedElements.load()},
+        {"listToAttrsCalls", memstats.nrListToAttrsCalls.load()},
+        {"listToAttrsOnMapArg", memstats.nrListToAttrsOnMapArg.load()},
+        {"listToAttrsOnMapArgElements", memstats.nrListToAttrsOnMapArgElements.load()},
+        {"mapOnAttrValuesArg", memstats.nrMapOnAttrValuesArg.load()},
+        {"mapOnAttrValuesArgElements", memstats.nrMapOnAttrValuesArgElements.load()},
+        {"lengthOnAttrNamesOrValuesArg", memstats.nrLengthOnAttrNamesOrValuesArg.load()},
+        {"elemOnAttrNamesArg", memstats.nrElemOnAttrNamesArg.load()},
+        {"elemOnAttrNamesArgElements", memstats.nrElemOnAttrNamesArgElements.load()},
     };
+    {
+        auto & h = topObj["sizeHistograms"];
+        h = json::object();
+        json attrsetHist = json::array(), listHist = json::array();
+        for (size_t i = 0; i < sizeHistogramBuckets; i++) {
+            attrsetHist.push_back(memstats.attrsetSizeHistogram[i].load());
+            listHist.push_back(memstats.listSizeHistogram[i].load());
+        }
+        h["buckets"] = {"0", "1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65-128", "129-256", "257-512", "513+"};
+        h["attrsets"] = attrsetHist;
+        h["lists"] = listHist;
+    }
     topObj["sizes"] = {
         {"Env", sizeof(Env)},
         {"Value", sizeof(Value)},

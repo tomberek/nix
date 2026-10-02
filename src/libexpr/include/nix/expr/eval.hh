@@ -24,6 +24,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
+#include <array>
 #include <map>
 #include <optional>
 #include <functional>
@@ -343,6 +344,26 @@ struct StaticEvalSymbols
     }
 };
 
+/* ponytail: temporary measurement instrumentation. Log2-ish size buckets:
+   0:{0} 1:{1} 2:{2} 3:{3-4} 4:{5-8} 5:{9-16} 6:{17-32} 7:{33-64}
+   8:{65-128} 9:{129-256} 10:{257-512} 11:{513+}. Used to see whether real
+   eval workloads are dominated by many small attrsets/lists or a few big
+   ones, before sizing any further shape/fusion optimization on them. */
+static constexpr size_t sizeHistogramBuckets = 12;
+
+inline size_t sizeHistogramBucket(size_t n) noexcept
+{
+    if (n == 0)
+        return 0;
+    size_t b = 1;
+    size_t threshold = 1;
+    while (n > threshold && b < sizeHistogramBuckets - 1) {
+        threshold *= 2;
+        b++;
+    }
+    return b;
+}
+
 class EvalMemory
 {
 public:
@@ -354,6 +375,45 @@ public:
         Counter nrAttrsets;
         Counter nrAttrsInAttrsets;
         Counter nrListElems;
+        /* ponytail: prototype-only counters for the mapAttrs shape-sharing
+           path (see allocShapeSharedBindings below). Kept separate from
+           nrAttrsets/nrAttrsInAttrsets because the byte cost per slot is
+           different (sizeof(Value*)==8, not sizeof(Attr)==16), so mixing
+           them into the existing counters would make printStatistics's
+           "sets.bytes" figure wrong. */
+        Counter nrShapeSharedAttrsets;
+        Counter nrShapeSharedValues;
+        /* ponytail: temporary measurement instrumentation, not part of the
+           prototype itself -- counts how often builtins.attrValues's
+           argument is already a shape-shared attrset (i.e. how often
+           `attrValues (mapAttrs f x)` occurs), to size the potential
+           payoff of fusing that composition into one primop before
+           investing in it. Remove once that question is answered. */
+        Counter nrAttrValuesOnShapeShared;
+        Counter nrAttrValuesOnShapeSharedElements;
+        /* ponytail: temporary measurement instrumentation -- counts how
+           often listToAttrs's argument is, syntactically, an unevaluated
+           call to `map` (i.e. `listToAttrs (map f list)`), to size a
+           possible construction-side fusion before building it. */
+        Counter nrListToAttrsOnMapArg;
+        Counter nrListToAttrsCalls;
+        Counter nrListToAttrsOnMapArgElements;
+
+        /* ponytail: temporary measurement instrumentation -- three more
+           primop-composition patterns, sized the same way as the two
+           above before building any of them. */
+        Counter nrMapOnAttrValuesArg;
+        Counter nrMapOnAttrValuesArgElements;
+        Counter nrLengthOnAttrNamesOrValuesArg;
+        Counter nrElemOnAttrNamesArg;
+        Counter nrElemOnAttrNamesArgElements;
+
+        /* ponytail: temporary measurement instrumentation -- overall size
+           distribution of every attrset/list created during the eval,
+           independent of any specific fusion candidate. See
+           sizeHistogramBucket() above for bucket boundaries. */
+        std::array<Counter, sizeHistogramBuckets> attrsetSizeHistogram;
+        std::array<Counter, sizeHistogramBuckets> listSizeHistogram;
     };
 
     EvalMemory();
@@ -369,6 +429,40 @@ public:
 
     Bindings * allocBindings(size_t capacity);
 
+    /**
+     * ponytail: prototype-only. Allocates a "shape-shared" Bindings: it
+     * has exactly `capacity` slots, in the exact sorted name/pos order of
+     * `shapeBase` (which must have at least `capacity` entries -- callers
+     * are expected to pass the same size), but only allocates a packed
+     * `Value*[capacity]` array (8 bytes/slot instead of Attr's 16). Only
+     * used by builtins.mapAttrs so far -- an explicit opt-in, not a
+     * change to the general Bindings construction path. See
+     * Bindings::isShapeShared() in attr-set.hh for the representation.
+     *
+     * `shapeBase` is flattened if it is itself shape-shared, so the
+     * stored base always points at a real, GC-block-start Bindings with
+     * an actual Attr array (required for GC safety: Boehm's
+     * interior-pointer support is disabled, so every stored pointer must
+     * point at the exact start of an allocation).
+     */
+    Bindings * allocShapeSharedBindings(const Bindings * shapeBase, size_t capacity)
+    {
+        while (shapeBase->isShapeShared())
+            shapeBase = shapeBase->shapeInfo().shapeBase;
+        if (capacity == 0)
+            return const_cast<Bindings *>(&Bindings::emptyBindings);
+        auto * b = new (allocBytes(
+            sizeof(Bindings) + sizeof(Bindings::ShapeShareInfo) + sizeof(Value *) * capacity)) Bindings();
+        b->numAttrs = capacity;
+        b->numAttrsInChain = capacity;
+        b->numLayers = Bindings::shapeSharedFlag | 1;
+        b->shapeInfo().shapeBase = shapeBase;
+        stats.nrShapeSharedAttrsets++;
+        stats.nrShapeSharedValues += capacity;
+        stats.attrsetSizeHistogram[sizeHistogramBucket(capacity)]++;
+        return b;
+    }
+
     BindingsBuilder buildBindings(SymbolTable & symbols, size_t capacity)
     {
         return BindingsBuilder(*this, symbols, allocBindings(capacity), capacity);
@@ -377,12 +471,61 @@ public:
     ListBuilder buildList(size_t size)
     {
         stats.nrListElems += size;
+        stats.listSizeHistogram[sizeHistogramBucket(size)]++;
         return ListBuilder(*this, size);
     }
 
     const Statistics & getStats() const &
     {
         return stats;
+    }
+
+    /* ponytail: temporary measurement instrumentation, see
+       Statistics::nrAttrValuesOnShapeShared above. */
+    void noteAttrValuesOnShapeSharedArg(size_t n)
+    {
+        stats.nrAttrValuesOnShapeShared++;
+        stats.nrAttrValuesOnShapeSharedElements += n;
+    }
+
+    /* ponytail: temporary measurement instrumentation, see
+       Statistics::nrListToAttrsOnMapArg above. */
+    void noteListToAttrsOnMapArg(size_t n)
+    {
+        stats.nrListToAttrsOnMapArg++;
+        stats.nrListToAttrsOnMapArgElements += n;
+    }
+
+    void noteMapOnAttrValuesArg(size_t n)
+    {
+        stats.nrMapOnAttrValuesArg++;
+        stats.nrMapOnAttrValuesArgElements += n;
+    }
+
+    void noteLengthOnAttrNamesOrValuesArg()
+    {
+        stats.nrLengthOnAttrNamesOrValuesArg++;
+    }
+
+    void noteElemOnAttrNamesArg(size_t n)
+    {
+        stats.nrElemOnAttrNamesArg++;
+        stats.nrElemOnAttrNamesArgElements += n;
+    }
+
+    void noteAttrsetSize(size_t n)
+    {
+        stats.attrsetSizeHistogram[sizeHistogramBucket(n)]++;
+    }
+
+    void noteListSize(size_t n)
+    {
+        stats.listSizeHistogram[sizeHistogramBucket(n)]++;
+    }
+
+    void noteListToAttrsCall()
+    {
+        stats.nrListToAttrsCalls++;
     }
 
     /**
@@ -1170,6 +1313,7 @@ private:
     Counter nrAvoided;
     Counter nrOpUpdates;
     Counter nrOpUpdateValuesCopied;
+
     Counter nrListConcats;
     Counter nrPrimOpCalls;
     Counter nrFunctionCalls;

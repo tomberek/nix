@@ -1,4 +1,8 @@
 error:
        … while evaluating the attribute 'foo'
+         at /pwd/lang/eval-fail-mapAttrs-3.nix:1:34:
+            1| builtins.mapAttrs (x: x + "1") { foo.bar = 1; }
+             |                                  ^
+            2|
 
        error: attempt to call something which is not a function but a string: "foo1"

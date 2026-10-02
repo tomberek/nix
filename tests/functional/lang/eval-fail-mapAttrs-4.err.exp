@@ -1,5 +1,9 @@
 error:
        … while evaluating the attribute 'foo'
+         at /pwd/lang/eval-fail-mapAttrs-4.nix:1:35:
+            1| builtins.mapAttrs (x: y: x + 1) { foo.bar = 1; }
+             |                                   ^
+            2|
 
        … while calling anonymous lambda
          at /pwd/lang/eval-fail-mapAttrs-4.nix:1:23:
