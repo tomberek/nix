@@ -194,7 +194,7 @@ FrameInfo SampleStack::getPrimOpFrameInfo(const PrimOp & primOp, std::span<Value
             try {
                 /* Error context strings don't actually matter, since we ignore all eval errors. */
                 state.forceAttrs(*args[0], pos, "");
-                auto attrs = args[0]->attrs();
+                auto attrs = args[0]->attrs(state.mem);
                 auto nameAttr = state.getAttr(state.s.name, attrs, "");
                 auto drvName = std::string(state.forceStringNoCtx(*nameAttr->value, pos, ""));
                 return DerivationStrictFrameInfo{.callPos = pos, .drvName = std::move(drvName)};
@@ -221,7 +221,8 @@ FrameInfo SampleStack::getFrameInfoFromValueAndPos(const Value & v, std::span<Va
         /* Resolve primOp eagerly. Must not hold on to a reference to a Value. */
         return PrimOpFrameInfo{.expr = v.primOpAppPrimOp(), .callPos = pos};
     else if (state.isFunctor(v)) {
-        const auto functor = v.attrs()->get(state.s.functor);
+        // isFunctor() above already excluded isAttrs2(), so this is safe.
+        const auto functor = v.attrsUnchecked()->get(state.s.functor);
         if (auto pos_ = posCache.lookup(pos); std::holds_alternative<std::monostate>(pos_.origin))
             /* HACK: In case callsite position is unresolved. */
             return FunctorFrameInfo{.pos = functor->pos};

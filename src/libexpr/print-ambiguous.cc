@@ -38,11 +38,11 @@ void printAmbiguous(
         str << "null";
         break;
     case nAttrs: {
-        if (seen && !v.attrs()->empty() && !seen->insert(v.attrs()).second)
+        if (seen && !v.attrs(state.mem)->empty() && !seen->insert(v.attrs(state.mem)).second)
             str << "«repeated»";
         else {
             str << "{ ";
-            for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
+            for (auto & i : v.attrs(state.mem)->lexicographicOrder(state.symbols)) {
                 str << state.symbols[i->name] << " = ";
                 printAmbiguous(state, *i->value, str, seen, context, depth + 1);
                 str << "; ";

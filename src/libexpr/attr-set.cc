@@ -39,6 +39,23 @@ void Bindings::sort()
     std::sort(attrs, attrs + numAttrs);
 }
 
+const Bindings * Value::attrs(EvalMemory & mem) noexcept
+{
+    if (isAttrs2()) {
+        // `name` is interned before `value` in StaticEvalSymbols::preallocate(),
+        // so its Symbol id is always lower -- pushing in that order already
+        // satisfies Bindings' sort invariant, no sort() call needed. Guarded
+        // by a static_assert in case the symbol table is ever reordered.
+        static_assert(EvalState::s.name.getId() < EvalState::s.value.getId());
+        auto pair = nameValuePair();
+        auto bindings = mem.allocBindings(2);
+        bindings->push_back(Attr(EvalState::s.name, pair.name));
+        bindings->push_back(Attr(EvalState::s.value, pair.value));
+        mkAttrs(bindings);
+    }
+    return attrsUnchecked();
+}
+
 Value & Value::mkAttrs(BindingsBuilder & bindings)
 {
     mkAttrs(bindings.finish());

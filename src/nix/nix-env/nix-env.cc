@@ -1259,7 +1259,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
                             } else if (v->type() == nAttrs) {
                                 attrs2["type"] = "strings";
                                 XMLOpenElement m(xml, "meta", attrs2);
-                                for (auto & i : *v->attrs()) {
+                                for (auto & i : *v->attrs(globals.state->mem)) {
                                     if (i.value->type() != nString)
                                         continue;
                                     XMLAttrs attrs3;

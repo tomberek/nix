@@ -88,10 +88,10 @@ findAlongAttrPath(EvalState & state, const std::string & attrPath, const Binding
             if (attr.empty())
                 throw Error("empty attribute name in selection path '%1%'", attrPath);
 
-            auto a = v->attrs()->get(state.symbols.create(attr));
+            auto a = v->attrs(state.mem)->get(state.symbols.create(attr));
             if (!a) {
                 StringSet attrNames;
-                for (auto & attr : *v->attrs())
+                for (auto & attr : *v->attrs(state.mem))
                     attrNames.insert(std::string(state.symbols[attr.name]));
 
                 auto suggestions = Suggestions::bestMatches(attrNames, attr);

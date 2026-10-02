@@ -125,7 +125,7 @@ PackageInfo::Outputs PackageInfo::queryOutputs(bool withPaths, bool onlyOutputsT
                     state->forceAttrs(*out->value, i->pos, "while evaluating an output of a derivation");
 
                     /* And evaluate its ‘outPath’ attribute. */
-                    auto outPath = out->value->attrs()->get(state->s.outPath);
+                    auto outPath = out->value->attrs(state->mem)->get(state->s.outPath);
                     if (!outPath)
                         continue; // FIXME: throw error?
                     NixStringContext context;
@@ -196,7 +196,7 @@ const Bindings * PackageInfo::getMeta()
     if (!a)
         return 0;
     state->forceAttrs(*a->value, a->pos, "while evaluating the 'meta' attribute of a derivation");
-    meta = a->value->attrs();
+    meta = a->value->attrs(state->mem);
     return meta;
 }
 
@@ -221,9 +221,9 @@ bool PackageInfo::checkMeta(Value & v)
                 return false;
         return true;
     } else if (v.type() == nAttrs) {
-        if (v.attrs()->get(state->s.outPath))
+        if (v.attrs(state->mem)->get(state->s.outPath))
             return false;
-        for (auto & i : *v.attrs())
+        for (auto & i : *v.attrs(state->mem))
             if (!checkMeta(*i.value))
                 return false;
         return true;
@@ -335,10 +335,10 @@ static bool getDerivation(
 
         /* Remove spurious duplicates (e.g., a set like `rec { x =
            derivation {...}; y = x;}'. */
-        if (!done.insert(v.attrs()).second)
+        if (!done.insert(v.attrs(state.mem)).second)
             return false;
 
-        PackageInfo drv(state, attrPath, v.attrs());
+        PackageInfo drv(state, attrPath, v.attrs(state.mem));
 
         drv.queryName();
 
@@ -411,14 +411,14 @@ static void getDerivations(
 
         /* !!! undocumented hackery to support combining channels in
            nix-env.cc. */
-        bool combineChannels = v.attrs()->get(state.symbols.create("_combineChannels"));
+        bool combineChannels = v.attrs(state.mem)->get(state.symbols.create("_combineChannels"));
 
         /* Consider the attributes in sorted order to get more
            deterministic behaviour in nix-env operations (e.g. when
            there are names clashes between derivations, the derivation
            bound to the attribute with the "lower" name should take
            precedence). */
-        for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
+        for (auto & i : v.attrs(state.mem)->lexicographicOrder(state.symbols)) {
             std::string_view symbol{state.symbols[i->name]};
             try {
                 debug("evaluating attribute '%1%'", symbol);
@@ -432,7 +432,7 @@ static void getDerivations(
                     should we recurse into it?  => Only if it has a
                     `recurseForDerivations = true' attribute. */
                     if (i->value->type() == nAttrs) {
-                        auto j = i->value->attrs()->get(state.s.recurseForDerivations);
+                        auto j = i->value->attrs(state.mem)->get(state.s.recurseForDerivations);
                         if (j
                             && state.forceBool(
                                 *j->value, j->pos, "while evaluating the attribute `recurseForDerivations`"))

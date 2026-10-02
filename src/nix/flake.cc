@@ -181,7 +181,7 @@ static void enumerateOutputs(
     auto pos = vFlake.determinePos(noPos);
     state.forceAttrs(vFlake, pos, "while evaluating a flake to get its outputs");
 
-    auto aOutputs = vFlake.attrs()->get(state.symbols.create("outputs"));
+    auto aOutputs = vFlake.attrs(state.mem)->get(state.symbols.create("outputs"));
     assert(aOutputs);
 
     state.forceAttrs(*aOutputs->value, pos, "while evaluating the outputs of a flake");
@@ -191,10 +191,10 @@ static void enumerateOutputs(
     /* Hack: ensure that hydraJobs is evaluated before anything
        else. This way we can disable IFD for hydraJobs and then enable
        it for other outputs. */
-    if (auto attr = aOutputs->value->attrs()->get(sHydraJobs))
+    if (auto attr = aOutputs->value->attrs(state.mem)->get(sHydraJobs))
         callback(state.symbols[attr->name], *attr->value, attr->pos);
 
-    for (auto & attr : *aOutputs->value->attrs()) {
+    for (auto & attr : *aOutputs->value->attrs(state.mem)) {
         if (attr.name != sHydraJobs)
             callback(state.symbols[attr.name], *attr.value, attr.pos);
     }
@@ -438,12 +438,12 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking app '%s'", attrPath));
                 state->forceAttrs(v, pos, "");
-                if (auto attr = v.attrs()->get(state->symbols.create("type")))
+                if (auto attr = v.attrs(state->mem)->get(state->symbols.create("type")))
                     state->forceStringNoCtx(*attr->value, attr->pos, "");
                 else
                     throw Error("app '%s' lacks attribute 'type'", attrPath);
 
-                if (auto attr = v.attrs()->get(state->symbols.create("program"))) {
+                if (auto attr = v.attrs(state->mem)->get(state->symbols.create("program"))) {
                     if (attr->name == state->symbols.create("program")) {
                         NixStringContext context;
                         state->forceString(*attr->value, context, attr->pos, "");
@@ -451,9 +451,9 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                 } else
                     throw Error("app '%s' lacks attribute 'program'", attrPath);
 
-                if (auto attr = v.attrs()->get(state->symbols.create("meta"))) {
+                if (auto attr = v.attrs(state->mem)->get(state->symbols.create("meta"))) {
                     state->forceAttrs(*attr->value, attr->pos, "");
-                    if (auto dAttr = attr->value->attrs()->get(state->symbols.create("description")))
+                    if (auto dAttr = attr->value->attrs(state->mem)->get(state->symbols.create("description")))
                         state->forceStringNoCtx(*dAttr->value, dAttr->pos, "");
                     else
                         logWarning({
@@ -464,7 +464,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                         .msg = HintFmt("app '%s' lacks attribute 'meta'", attrPath),
                     });
 
-                for (auto & attr : *v.attrs()) {
+                for (auto & attr : *v.attrs(state->mem)) {
                     std::string_view name(state->symbols[attr.name]);
                     if (name != "type" && name != "program" && name != "meta")
                         throw Error("app '%s' has unsupported attribute '%s'", attrPath, name);
@@ -512,7 +512,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                 if (state->isDerivation(v))
                     throw Error("jobset should not be a derivation at top-level");
 
-                for (auto & attr : *v.attrs()) {
+                for (auto & attr : *v.attrs(state->mem)) {
                     state->forceAttrs(*attr.value, attr.pos, "");
                     auto attrPath2 = concatStrings(attrPath, ".", state->symbols[attr.name]);
                     if (state->isDerivation(*attr.value)) {
@@ -548,7 +548,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                 state->forceAttrs(v, pos, "");
 
-                if (auto attr = v.attrs()->get(state->symbols.create("path"))) {
+                if (auto attr = v.attrs(state->mem)->get(state->symbols.create("path"))) {
                     if (attr->name == state->symbols.create("path")) {
                         NixStringContext context;
                         auto path = state->coerceToPath(attr->pos, *attr->value, context, "");
@@ -559,12 +559,12 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                 } else
                     throw Error("template '%s' lacks attribute 'path'", attrPath);
 
-                if (auto attr = v.attrs()->get(state->symbols.create("description")))
+                if (auto attr = v.attrs(state->mem)->get(state->symbols.create("description")))
                     state->forceStringNoCtx(*attr->value, attr->pos, "");
                 else
                     throw Error("template '%s' lacks attribute 'description'", attrPath);
 
-                for (auto & attr : *v.attrs()) {
+                for (auto & attr : *v.attrs(state->mem)) {
                     std::string_view name(state->symbols[attr.name]);
                     if (name != "path" && name != "description" && name != "welcomeText")
                         throw Error("template '%s' has unsupported attribute '%s'", attrPath, name);
@@ -615,12 +615,12 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     if (name == "checks") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             std::string_view attr_name = state->symbols[attr.name];
                             checkSystemName(attr_name, attr.pos);
                             if (checkSystemType(attr_name, attr.pos)) {
                                 state->forceAttrs(*attr.value, attr.pos, "");
-                                for (auto & attr2 : *attr.value->attrs()) {
+                                for (auto & attr2 : *attr.value->attrs(state->mem)) {
                                     auto drvPath = checkDerivation(
                                         fmt("%s.%s.%s", name, attr_name, state->symbols[attr2.name]),
                                         *attr2.value,
@@ -644,7 +644,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "formatter") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             const auto & attr_name = state->symbols[attr.name];
                             checkSystemName(attr_name, attr.pos);
                             if (checkSystemType(attr_name, attr.pos)) {
@@ -655,12 +655,12 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "packages" || name == "devShells") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             const auto & attr_name = state->symbols[attr.name];
                             checkSystemName(attr_name, attr.pos);
                             if (checkSystemType(attr_name, attr.pos)) {
                                 state->forceAttrs(*attr.value, attr.pos, "");
-                                for (auto & attr2 : *attr.value->attrs())
+                                for (auto & attr2 : *attr.value->attrs(state->mem))
                                     checkDerivation(
                                         fmt("%s.%s.%s", name, attr_name, state->symbols[attr2.name]),
                                         *attr2.value,
@@ -671,12 +671,12 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "apps") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             const auto & attr_name = state->symbols[attr.name];
                             checkSystemName(attr_name, attr.pos);
                             if (checkSystemType(attr_name, attr.pos)) {
                                 state->forceAttrs(*attr.value, attr.pos, "");
-                                for (auto & attr2 : *attr.value->attrs())
+                                for (auto & attr2 : *attr.value->attrs(state->mem))
                                     checkApp(
                                         fmt("%s.%s.%s", name, attr_name, state->symbols[attr2.name]),
                                         *attr2.value,
@@ -687,7 +687,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "defaultPackage" || name == "devShell") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             const auto & attr_name = state->symbols[attr.name];
                             checkSystemName(attr_name, attr.pos);
                             if (checkSystemType(attr_name, attr.pos)) {
@@ -698,7 +698,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "defaultApp") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             const auto & attr_name = state->symbols[attr.name];
                             checkSystemName(attr_name, attr.pos);
                             if (checkSystemType(attr_name, attr.pos)) {
@@ -709,7 +709,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "legacyPackages") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             checkSystemName(state->symbols[attr.name], attr.pos);
                             checkSystemType(state->symbols[attr.name], attr.pos);
                             // FIXME: do getDerivations?
@@ -721,7 +721,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "overlays") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs())
+                        for (auto & attr : *vOutput.attrs(state->mem))
                             checkOverlay(fmt("%s.%s", name, state->symbols[attr.name]), *attr.value, attr.pos);
                     }
 
@@ -730,13 +730,13 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "nixosModules") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs())
+                        for (auto & attr : *vOutput.attrs(state->mem))
                             checkModule(fmt("%s.%s", name, state->symbols[attr.name]), *attr.value, attr.pos);
                     }
 
                     else if (name == "nixosConfigurations") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs())
+                        for (auto & attr : *vOutput.attrs(state->mem))
                             checkNixOSConfiguration(
                                 fmt("%s.%s", name, state->symbols[attr.name]), *attr.value, attr.pos);
                     }
@@ -749,13 +749,13 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "templates") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs())
+                        for (auto & attr : *vOutput.attrs(state->mem))
                             checkTemplate(fmt("%s.%s", name, state->symbols[attr.name]), *attr.value, attr.pos);
                     }
 
                     else if (name == "defaultBundler") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             const auto & attr_name = state->symbols[attr.name];
                             checkSystemName(attr_name, attr.pos);
                             if (checkSystemType(attr_name, attr.pos)) {
@@ -766,12 +766,12 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
                     else if (name == "bundlers") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
+                        for (auto & attr : *vOutput.attrs(state->mem)) {
                             const auto & attr_name = state->symbols[attr.name];
                             checkSystemName(attr_name, attr.pos);
                             if (checkSystemType(attr_name, attr.pos)) {
                                 state->forceAttrs(*attr.value, attr.pos, "");
-                                for (auto & attr2 : *attr.value->attrs()) {
+                                for (auto & attr2 : *attr.value->attrs(state->mem)) {
                                     checkBundler(
                                         fmt("%s.%s.%s", name, attr_name, state->symbols[attr2.name]),
                                         *attr2.value,

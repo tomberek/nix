@@ -274,7 +274,7 @@ private:
     void printDerivation(Value & v)
     {
         std::optional<StorePath> storePath;
-        if (auto i = v.attrs()->get(state.s.drvPath)) {
+        if (auto i = v.attrs(state.mem)->get(state.s.drvPath)) {
             NixStringContext context;
             storePath =
                 state.coerceToStorePath(i->pos, *i->value, context, "while evaluating the drvPath of a derivation");
@@ -331,7 +331,7 @@ private:
 
     void printAttrs(Value & v, size_t depth)
     {
-        if (seen && !seen->insert(v.attrs()).second) {
+        if (seen && !seen->insert(v.attrs(state.mem)).second) {
             printRepeated();
             return;
         }
@@ -343,7 +343,7 @@ private:
             output << "{";
 
             AttrVec sorted;
-            for (auto & i : *v.attrs())
+            for (auto & i : *v.attrs(state.mem))
                 sorted.emplace_back(std::pair(state.symbols[i.name], i.value));
 
             if (options.maxAttrs == std::numeric_limits<size_t>::max())

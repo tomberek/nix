@@ -24,7 +24,7 @@ void CachedEvalError::force()
     auto & v = cursor->forceValue();
 
     if (v.type() == nAttrs) {
-        auto a = v.attrs()->get(this->attr);
+        auto a = v.attrs(state.mem)->get(this->attr);
 
         state.forceValue(*a->value, a->pos);
     }
@@ -416,7 +416,7 @@ Value & AttrCursor::getValue()
         if (parent) {
             auto & vParent = parent->first->getValue();
             root->state.forceAttrs(vParent, noPos, "while searching for an attribute");
-            auto attr = vParent.attrs()->get(parent->second);
+            auto attr = vParent.attrs(root->state.mem)->get(parent->second);
             if (!attr)
                 throw Error("attribute '%s' is unexpectedly missing", getAttrPathStr());
             _value = allocRootValue(attr->value);
@@ -545,7 +545,7 @@ std::shared_ptr<AttrCursor> AttrCursor::maybeGetAttr(Symbol name)
         return nullptr;
     // error<TypeError>("'%s' is not an attribute set", getAttrPathStr()).debugThrow();
 
-    auto attr = v.attrs()->get(name);
+    auto attr = v.attrs(root->state.mem)->get(name);
 
     if (!attr) {
         if (root->db) {
@@ -758,7 +758,7 @@ std::vector<Symbol> AttrCursor::getAttrs()
         root->state.error<TypeError>("'%s' is not an attribute set", getAttrPathStr()).debugThrow();
 
     std::vector<Symbol> attrs;
-    for (auto & attr : *getValue().attrs())
+    for (auto & attr : *getValue().attrs(root->state.mem))
         attrs.push_back(attr.name);
     std::sort(attrs.begin(), attrs.end(), [&](Symbol a, Symbol b) {
         std::string_view sa = root->state.symbols[a], sb = root->state.symbols[b];

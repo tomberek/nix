@@ -62,7 +62,7 @@ json printValueAsJSON(
                 // Quirk: builtins.toJSON { outPath.foo = true; } == "{\"foo\":true}"
                 // All that remains is to return a JSON object.
                 json obj = json::object();
-                for (auto & a : peeled->attrs()->lexicographicOrder(state.symbols)) {
+                for (auto & a : peeled->attrs(state.mem)->lexicographicOrder(state.symbols)) {
                     try {
                         obj.emplace(
                             state.symbols[a->name],

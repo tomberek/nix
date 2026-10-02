@@ -203,7 +203,7 @@ PosIdx Value::determinePos(const PosIdx pos) const
 #pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (getInternalType()) {
     case tAttrs:
-        return attrs()->pos;
+        return attrsUnchecked()->pos;
     case tLambda:
         return lambda().fun->pos;
     case tApp:
@@ -511,7 +511,7 @@ void EvalState::addConstant(const std::string & name, Value * v, Constant info)
         /* Install value the base environment. */
         staticBaseEnv->vars.emplace_back(symbols.create(name), baseEnvDispl);
         baseEnv.values[baseEnvDispl++] = v;
-        const_cast<Bindings *>(getBuiltins().attrs())->push_back(Attr(symbols.create(name2), v));
+        const_cast<Bindings *>(getBuiltins().attrsUnchecked())->push_back(Attr(symbols.create(name2), v));
     }
 }
 
@@ -580,7 +580,7 @@ Value * EvalState::addPrimOp(PrimOp && primOp)
     else {
         staticBaseEnv->vars.emplace_back(envName, baseEnvDispl);
         baseEnv.values[baseEnvDispl++] = v;
-        const_cast<Bindings *>(getBuiltins().attrs())->push_back(Attr(symbols.create(primOp.name), v));
+        const_cast<Bindings *>(getBuiltins().attrsUnchecked())->push_back(Attr(symbols.create(primOp.name), v));
     }
 
     return v;
@@ -593,7 +593,7 @@ Value & EvalState::getBuiltins()
 
 Value & EvalState::getBuiltin(const std::string & name)
 {
-    auto it = getBuiltins().attrs()->get(symbols.create(name));
+    auto it = getBuiltins().attrsUnchecked()->get(symbols.create(name));
     if (it)
         return *it->value;
     else
@@ -660,7 +660,8 @@ std::optional<EvalState::Doc> EvalState::getDoc(Value & v)
     }
     if (isFunctor(v)) {
         try {
-            Value & functor = *v.attrs()->get(s.functor)->value;
+            // isFunctor() already excluded isAttrs2(), so this is safe.
+            Value & functor = *v.attrsUnchecked()->get(s.functor)->value;
             Value partiallyApplied;
             // The first parameter is not user-provided, and may be
             // handled by code that is opaque to the user, like lib.const = x: y: y;
@@ -697,12 +698,12 @@ static void printStaticEnvBindings(const SymbolTable & st, const StaticEnv & se)
 }
 
 // just for the current level of Env, not the whole chain.
-static void printWithBindings(const SymbolTable & st, const Env & env)
+static void printWithBindings(EvalMemory & mem, const SymbolTable & st, const Env & env)
 {
     if (!env.values[0]->isThunk()) {
         std::cout << "with: ";
         std::cout << ANSI_MAGENTA;
-        auto * bindings = env.values[0]->attrs();
+        auto * bindings = env.values[0]->attrs(mem);
         /* TODO: Don't print the whole attribute set, since it can be quite large. */
         for (const Attr * attr : bindings->lexicographicOrder(st))
             std::cout << st[attr->name] << " ";
@@ -711,7 +712,7 @@ static void printWithBindings(const SymbolTable & st, const Env & env)
     }
 }
 
-void printEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env, int lvl)
+void printEnvBindings(EvalMemory & mem, const SymbolTable & st, const StaticEnv & se, const Env & env, int lvl)
 {
     std::cout << "Env level " << lvl << std::endl;
 
@@ -719,9 +720,9 @@ void printEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & 
         std::cout << "static: ";
         printStaticEnvBindings(st, se);
         if (se.isWith)
-            printWithBindings(st, env);
+            printWithBindings(mem, st, env);
         std::cout << std::endl;
-        printEnvBindings(st, *se.up, *env.up, ++lvl);
+        printEnvBindings(mem, st, *se.up, *env.up, ++lvl);
     } else {
         std::cout << ANSI_MAGENTA;
         // for the top level, don't print the double underscore ones;
@@ -732,7 +733,7 @@ void printEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & 
         std::cout << ANSI_NORMAL;
         std::cout << std::endl;
         if (se.isWith)
-            printWithBindings(st, env); // probably nothing there for the top level.
+            printWithBindings(mem, st, env); // probably nothing there for the top level.
         std::cout << std::endl;
     }
 }
@@ -742,20 +743,20 @@ void printEnvBindings(const EvalState & es, const Expr & expr, const Env & env)
     // just print the names for now
     auto se = es.getStaticEnv(expr);
     if (se)
-        printEnvBindings(es.symbols, *se, env, 0);
+        printEnvBindings(const_cast<EvalState &>(es).mem, es.symbols, *se, env, 0);
 }
 
-void mapStaticEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env, ValMap & vm)
+static void mapStaticEnvBindings(EvalMemory & mem, const SymbolTable & st, const StaticEnv & se, const Env & env, ValMap & vm)
 {
     // add bindings for the next level up first, so that the bindings for this level
     // override the higher levels.
     // The top level bindings (builtins) are skipped since they are added for us by initEnv()
     if (env.up && se.up) {
-        mapStaticEnvBindings(st, *se.up, *env.up, vm);
+        mapStaticEnvBindings(mem, st, *se.up, *env.up, vm);
 
         if (se.isWith && !env.values[0]->isThunk()) {
             // add 'with' bindings.
-            for (auto & j : *env.values[0]->attrs())
+            for (auto & j : *env.values[0]->attrs(mem))
                 vm.insert_or_assign(std::string(st[j.name]), j.value);
         } else {
             // iterate through staticenv bindings and add them.
@@ -765,10 +766,10 @@ void mapStaticEnvBindings(const SymbolTable & st, const StaticEnv & se, const En
     }
 }
 
-std::unique_ptr<ValMap> mapStaticEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env)
+std::unique_ptr<ValMap> mapStaticEnvBindings(EvalMemory & mem, const SymbolTable & st, const StaticEnv & se, const Env & env)
 {
     auto vm = std::make_unique<ValMap>();
-    mapStaticEnvBindings(st, se, env, *vm);
+    mapStaticEnvBindings(mem, st, se, env, *vm);
     return vm;
 }
 
@@ -852,7 +853,7 @@ void EvalState::runDebugRepl(const Error * error, const Env & env, const Expr & 
 
     auto se = getStaticEnv(expr);
     if (se) {
-        auto vm = mapStaticEnvBindings(symbols, *se.get(), env);
+        auto vm = mapStaticEnvBindings(mem, symbols, *se.get(), env);
         DebuggerGuard _guard(inDebugger);
         auto exitStatus = (debugRepl) (ref<EvalState>(shared_from_this()), *vm);
         switch (exitStatus) {
@@ -947,7 +948,7 @@ void Value::mkPath(const SourcePath & path, EvalMemory & mem)
     auto * fromWith = var.fromWith;
     while (1) {
         forceAttrs(*env->values[0], fromWith->pos, "while evaluating the first subexpression of a with expression");
-        if (auto j = env->values[0]->attrs()->get(var.name)) {
+        if (auto j = env->values[0]->attrs(mem)->get(var.name)) {
             if (countCalls) [[unlikely]]
                 attrSelects->try_emplace_or_visit(j->pos, 1, [](auto & i) { i.second++; });
             return j->value;
@@ -1292,6 +1293,22 @@ Env * ExprAttrs::buildInheritFromEnv(EvalState & state, Env & up)
 
 void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
 {
+    if (isNameValuePair == -1) [[unlikely]] {
+        isNameValuePair = !recursive && !inheritFromExprs && dynamicAttrs->empty() && attrs->size() == 2
+                           && attrs->count(state.s.name) && attrs->count(state.s.value)
+                           && attrs->at(state.s.name).kind != AttrDef::Kind::InheritedFrom
+                           && attrs->at(state.s.value).kind != AttrDef::Kind::InheritedFrom;
+    }
+
+    if (isNameValuePair) {
+        auto & nameDef = attrs->at(state.s.name);
+        auto & valueDef = attrs->at(state.s.value);
+        Value * nameVal = nameDef.e->maybeThunk(state, env);
+        Value * valueVal = valueDef.e->maybeThunk(state, env);
+        v.mkAttrs2(nameVal, valueVal);
+        return;
+    }
+
     auto bindings = state.buildBindings(attrs->size() + dynamicAttrs->size());
     auto dynamicEnv = &env;
     bool sort = false;
@@ -1336,8 +1353,8 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
                 *vOverrides,
                 [&]() { return vOverrides->determinePos(noPos); },
                 "while evaluating the `__overrides` attribute");
-            bindings.grow(state.buildBindings(bindings.capacity() + vOverrides->attrs()->size()));
-            for (auto & i : *vOverrides->attrs()) {
+            bindings.grow(state.buildBindings(bindings.capacity() + vOverrides->attrs(state.mem)->size()));
+            for (auto & i : *vOverrides->attrs(state.mem)) {
                 AttrDefs::iterator j = attrs->find(i.name);
                 if (j != attrs->end()) {
                     (*bindings.bindings)[j->second.displ] = i;
@@ -1486,15 +1503,48 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
             auto name = getName(i, state, env);
             if (def) {
                 state.forceValue(*vAttrs, pos);
-                if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
+                if (vAttrs->isAttrs2()) {
+                    auto pair = vAttrs->nameValuePair();
+                    if (name == state.s.name) {
+                        vAttrs = pair.name;
+                        attrPos = noPos;
+                        unresolvedOrEnd = &i + 1;
+                        continue;
+                    }
+                    if (name == state.s.value) {
+                        vAttrs = pair.value;
+                        attrPos = noPos;
+                        unresolvedOrEnd = &i + 1;
+                        continue;
+                    }
+                    def->eval(state, env, v);
+                    return;
+                }
+                if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs(state.mem)->get(name))) {
                     def->eval(state, env, v);
                     return;
                 }
             } else {
+                state.forceValue(*vAttrs, pos);
+                if (vAttrs->isAttrs2()) {
+                    auto pair = vAttrs->nameValuePair();
+                    if (name == state.s.name) {
+                        vAttrs = pair.name;
+                        attrPos = noPos;
+                        unresolvedOrEnd = &i + 1;
+                        continue;
+                    }
+                    if (name == state.s.value) {
+                        vAttrs = pair.value;
+                        attrPos = noPos;
+                        unresolvedOrEnd = &i + 1;
+                        continue;
+                    }
+                }
                 state.forceAttrs(*vAttrs, pos, "while selecting an attribute");
-                if (!(j = vAttrs->attrs()->get(name))) {
+                if (!(j = vAttrs->attrs(state.mem)->get(name))) {
                     StringSet allAttrNames;
-                    for (auto & attr : *vAttrs->attrs())
+                    for (auto & attr : *vAttrs->attrs(state.mem))
                         allAttrNames.insert(std::string(state.symbols[attr.name]));
                     auto suggestions = Suggestions::bestMatches(allAttrNames, state.symbols[name]);
                     state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
@@ -1559,7 +1609,20 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
         state.forceValue(*vAttrs, getPos());
         const Attr * j;
         auto name = getName(i, state, env);
-        if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
+        if (vAttrs->isAttrs2()) {
+            auto pair = vAttrs->nameValuePair();
+            if (name == state.s.name) {
+                vAttrs = pair.name;
+                continue;
+            }
+            if (name == state.s.value) {
+                vAttrs = pair.value;
+                continue;
+            }
+            v.mkBool(false);
+            return;
+        }
+        if (vAttrs->type() == nAttrs && (j = vAttrs->attrs(state.mem)->get(name))) {
             vAttrs = j->value;
         } else {
             v.mkBool(false);
@@ -1632,7 +1695,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
                    argument has a default, use the default. */
                 size_t attrsUsed = 0;
                 for (auto & i : formals->formals) {
-                    auto j = args[0]->attrs()->get(i.name);
+                    auto j = args[0]->attrs(mem)->get(i.name);
                     if (!j) {
                         if (!i.def) {
                             error<TypeError>(
@@ -1653,10 +1716,10 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
                 /* Check that each actual argument is listed as a formal
                    argument (unless the attribute match specifies a `...'). */
-                if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size()) {
+                if (!formals->ellipsis && attrsUsed != args[0]->attrs(mem)->size()) {
                     /* Nope, so show the first unexpected argument to the
                        user. */
-                    for (auto & i : *args[0]->attrs())
+                    for (auto & i : *args[0]->attrs(mem))
                         if (!formals->has(i.name)) {
                             StringSet formalNames;
                             for (auto & formal : formals->formals)
@@ -1789,7 +1852,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
             }
         }
 
-        else if (vCur.type() == nAttrs && (functor = vCur.attrs()->get(s.functor))) {
+        else if (vCur.type() == nAttrs && (functor = vCur.attrs(mem)->get(s.functor))) {
             /* 'vCur' may be allocated on the stack of the calling
                function, but for functors we may keep a reference, so
                heap-allocate a copy and use that instead. */
@@ -1849,7 +1912,7 @@ void EvalState::autoCallFunction(const Bindings & args, Value & fun, Value & res
     forceValue(fun, pos);
 
     if (fun.type() == nAttrs) {
-        auto found = fun.attrs()->get(s.functor);
+        auto found = fun.attrs(mem)->get(s.functor);
         if (found) {
             Value * v = allocValue();
             callFunction(*found->value, fun, *v, pos);
@@ -1984,13 +2047,13 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
 
-    const Bindings & bindings1 = *v1.attrs();
+    const Bindings & bindings1 = *v1.attrs(state.mem);
     if (bindings1.empty()) {
         v = v2;
         return;
     }
 
-    const Bindings & bindings2 = *v2.attrs();
+    const Bindings & bindings2 = *v2.attrs(state.mem);
     if (bindings2.empty()) {
         v = v1;
         return;
@@ -2052,7 +2115,8 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
     v.mkAttrs(attrs.alreadySorted());
 
-    state.nrOpUpdateValuesCopied += v.attrs()->size();
+    // v was just constructed via mkAttrs above, so it's never tAttrs2.
+    state.nrOpUpdateValuesCopied += v.attrsUnchecked()->size();
 }
 
 void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)
@@ -2341,7 +2405,7 @@ void EvalState::forceValueDeep(Value & v)
         state.forceValue(v, v.determinePos(noPos));
 
         if (v.type() == nAttrs) {
-            for (auto & i : *v.attrs())
+            for (auto & i : *v.attrs(state.mem))
                 try {
                     // If the value is a thunk, we're evaling. Otherwise no trace necessary.
                     auto dts = state.debugRepl && i.value->isThunk() ? makeDebugTraceStacker(
@@ -2439,7 +2503,9 @@ const Attr * EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::s
 
 bool EvalState::isFunctor(const Value & fun) const
 {
-    return fun.type() == nAttrs && fun.attrs()->get(s.functor);
+    // `tAttrs2` values have exactly two fixed keys (`name`, `value`) and can
+    // never carry `__functor`, so this check never needs to materialize.
+    return fun.type() == nAttrs && !fun.isAttrs2() && fun.attrsUnchecked()->get(s.functor);
 }
 
 void EvalState::forceFunction(Value & v, const PosIdx pos, std::string_view errorCtx)
@@ -2511,7 +2577,7 @@ bool EvalState::isDerivation(Value & v)
 {
     if (v.type() != nAttrs)
         return false;
-    auto i = v.attrs()->get(s.type);
+    auto i = v.attrs(mem)->get(s.type);
     if (!i)
         return false;
     forceValue(*i->value, i->pos);
@@ -2847,8 +2913,8 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
 
     case nAttrs: {
         if (isDerivation(v1) && isDerivation(v2)) {
-            auto i = v1.attrs()->get(s.outPath);
-            auto j = v2.attrs()->get(s.outPath);
+            auto i = v1.attrs(mem)->get(s.outPath);
+            auto j = v2.attrs(mem)->get(s.outPath);
             if (i && j) {
                 try {
                     assertEqValues(*i->value, *j->value, pos, errorCtx);
@@ -2861,7 +2927,7 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
             }
         }
 
-        if (v1.attrs()->size() != v2.attrs()->size()) {
+        if (v1.attrs(mem)->size() != v2.attrs(mem)->size()) {
             error<AssertionError>(
                 "attribute names of attribute set '%s' differs from attribute set '%s'",
                 ValuePrinter(*this, v1, errorPrintOptions),
@@ -2874,11 +2940,11 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
         // report about its result, we should follow in its literal footsteps and not
         // try anything fancy that could lead to an error.
         Bindings::const_iterator i, j;
-        for (i = v1.attrs()->begin(), j = v2.attrs()->begin(); i != v1.attrs()->end(); ++i, ++j) {
+        for (i = v1.attrs(mem)->begin(), j = v2.attrs(mem)->begin(); i != v1.attrs(mem)->end(); ++i, ++j) {
             if (i->name != j->name) {
                 // A difference in a sorted list means that one attribute is not contained in the other, but we don't
                 // know which. Let's find out. Could use <, but this is more clear.
-                if (!v2.attrs()->get(i->name)) {
+                if (!v2.attrs(mem)->get(i->name)) {
                     error<AssertionError>(
                         "attribute name '%s' is contained in '%s', but not in '%s'",
                         symbols[i->name],
@@ -2886,7 +2952,7 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
                         ValuePrinter(*this, v2, errorPrintOptions))
                         .debugThrow();
                 }
-                if (!v1.attrs()->get(j->name)) {
+                if (!v1.attrs(mem)->get(j->name)) {
                     error<AssertionError>(
                         "attribute name '%s' is missing in '%s', but is contained in '%s'",
                         symbols[j->name],
@@ -3003,21 +3069,30 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
 
     case nAttrs: {
+        // `tAttrs2` values have exactly two fixed keys and can never be a
+        // derivation, so this compares them directly without
+        // materializing either side.
+        if (v1.isAttrs2() && v2.isAttrs2()) {
+            auto p1 = v1.nameValuePair();
+            auto p2 = v2.nameValuePair();
+            return eqValues(*p1.name, *p2.name, pos, errorCtx) && eqValues(*p1.value, *p2.value, pos, errorCtx);
+        }
+
         /* If both sets denote a derivation (type = "derivation"),
            then compare their outPaths. */
         if (isDerivation(v1) && isDerivation(v2)) {
-            auto i = v1.attrs()->get(s.outPath);
-            auto j = v2.attrs()->get(s.outPath);
+            auto i = v1.attrs(mem)->get(s.outPath);
+            auto j = v2.attrs(mem)->get(s.outPath);
             if (i && j)
                 return eqValues(*i->value, *j->value, pos, errorCtx);
         }
 
-        if (v1.attrs()->size() != v2.attrs()->size())
+        if (v1.attrs(mem)->size() != v2.attrs(mem)->size())
             return false;
 
         /* Otherwise, compare the attributes one by one. */
         Bindings::const_iterator i, j;
-        for (i = v1.attrs()->begin(), j = v2.attrs()->begin(); i != v1.attrs()->end(); ++i, ++j)
+        for (i = v1.attrs(mem)->begin(), j = v2.attrs(mem)->begin(); i != v1.attrs(mem)->end(); ++i, ++j)
             if (i->name != j->name || !eqValues(*i->value, *j->value, pos, errorCtx))
                 return false;
 

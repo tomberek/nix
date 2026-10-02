@@ -145,10 +145,10 @@ bool createUserEnv(
     debug("evaluating user environment builder");
     state.forceValue(topLevel, topLevel.determinePos(noPos));
     NixStringContext context;
-    auto & aDrvPath(*topLevel.attrs()->get(state.s.drvPath));
+    auto & aDrvPath(*topLevel.attrs(state.mem)->get(state.s.drvPath));
     auto topLevelDrv = state.coerceToStorePath(aDrvPath.pos, *aDrvPath.value, context, "");
     topLevelDrv.requireDerivation();
-    auto & aOutPath(*topLevel.attrs()->get(state.s.outPath));
+    auto & aOutPath(*topLevel.attrs(state.mem)->get(state.s.outPath));
     auto topLevelOut = state.coerceToStorePath(aOutPath.pos, *aOutPath.value, context, "");
 
     /* Realise the resulting store expression. */

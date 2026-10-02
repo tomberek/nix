@@ -174,9 +174,16 @@ MATCHER_P(IsAttrsOfSize, n, fmt("Is a set of size [%1%]", n))
     if (arg.type() != nAttrs) {
         *result_listener << "Expected set got " << arg.type();
         return false;
-    } else if (arg.attrs()->size() != (size_t) n) {
-        *result_listener << "Expected a set with " << n << " attributes but got " << arg.attrs()->size();
-        return false;
+    } else {
+        // Materializing tAttrs2 (if needed) is an internal representation
+        // change, not an observable mutation; a fresh EvalMemory is fine
+        // here since it carries no state beyond allocation bookkeeping.
+        EvalMemory mem;
+        auto & mutArg = const_cast<Value &>(arg);
+        if (mutArg.attrs(mem)->size() != (size_t) n) {
+            *result_listener << "Expected a set with " << n << " attributes but got " << mutArg.attrs(mem)->size();
+            return false;
+        }
     }
     return true;
 }
