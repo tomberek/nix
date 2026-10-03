@@ -3624,18 +3624,32 @@ static RegisterPrimOp primop_functionArgs({
     .impl = prim_functionArgs,
 });
 
-/*  */
 static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
     auto attrs = state.buildBindings(args[1]->attrs()->size());
 
-    for (auto & i : *args[1]->attrs()) {
-        Value * vName = Value::toPtr(state.symbols[i.name]);
-        Value * vFun2 = state.allocValue();
-        vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+    if (!args[1]->attrs()->isLayered()) {
+        /* Fast path: one shared descriptor for the whole call instead of
+           a fresh {fun,args} box per attribute -- halves mapAttrs' own
+           allocation count. Only valid for unlayered Bindings, since
+           forcing indexes `original` directly via operator[]. */
+        auto * descriptor = state.mem.allocMapAttrsDescriptor();
+        descriptor->fun = args[0];
+        descriptor->original = args[1]->attrs();
+        Bindings::size_type index = 0;
+        for (auto & i : *args[1]->attrs()) {
+            attrs.alloc(i.name).mkMapAttrsElem(descriptor, index);
+            index++;
+        }
+    } else {
+        for (auto & i : *args[1]->attrs()) {
+            Value * vName = Value::toPtr(state.symbols[i.name]);
+            Value * vFun2 = state.allocValue();
+            vFun2->mkApp(args[0], vName);
+            attrs.alloc(i.name).mkApp(vFun2, i.value);
+        }
     }
 
     v.mkAttrs(attrs.alreadySorted());

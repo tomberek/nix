@@ -59,6 +59,12 @@ Value * EvalMemory::allocValue()
 }
 
 [[gnu::always_inline]]
+detail::ValueBase::MapAttrsDescriptor * EvalMemory::allocMapAttrsDescriptor()
+{
+    return (detail::ValueBase::MapAttrsDescriptor *) allocValue();
+}
+
+[[gnu::always_inline]]
 Env & EvalMemory::allocEnv(size_t size)
 {
     stats.nrEnvs++;
@@ -95,7 +101,12 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    if (v.isThunk()) {
+    /* Single switch on the already-decoded discriminator (one jump-table
+       lookup) instead of a sequential isThunk()/isApp()/isMapAttrsElem()/
+       isFailed() chain, each of which independently recomputes it -- the
+       dominant case (already WHNF) falls straight to default. */
+    switch (v.rawInternalType()) {
+    case tThunk: {
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
@@ -109,7 +120,9 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
-    } else if (v.isApp()) {
+        break;
+    }
+    case tApp: {
         Value savedApp = v;
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);
@@ -117,8 +130,46 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
-    } else if (v.isFailed()) {
+        break;
+    }
+    case tMapAttrsElem: {
+        /* descriptor is shared across every attribute of one mapAttrs
+           call, so this Value only ever stores the descriptor pointer +
+           its own index, one allocation instead of two per attribute. */
+        Value savedApp = v;
+        try {
+            auto elem = v.mapAttrsElem();
+            size_t index = ((uintptr_t) elem.packedIndex) >> 3;
+            auto & attr = (*elem.descriptor->original)[(Bindings::size_type) index];
+            Value * nameValue = Value::toPtr(symbols[attr.name]);
+            Value * args[2] = {nameValue, attr.value};
+            callFunction(*elem.descriptor->fun, args, v, pos);
+        } catch (...) {
+            handleEvalExceptionForApp(v, savedApp);
+            throw;
+        }
+        break;
+    }
+    case tFailed:
         handleEvalFailed(v, pos);
+        break;
+    /* Already WHNF -- nothing to do. */
+    case tUninitialized:
+    case tInt:
+    case tBool:
+    case tNull:
+    case tFloat:
+    case tExternal:
+    case tPrimOp:
+    case tAttrs:
+    case tListSmall:
+    case tPrimOpApp:
+    case tLambda:
+    case tListN:
+    case tString:
+    case tPath:
+    case tNumberOfInternalTypes:
+        break;
     }
 }
 
