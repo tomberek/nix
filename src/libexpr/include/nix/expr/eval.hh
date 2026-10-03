@@ -366,6 +366,12 @@ public:
     inline void * allocBytes(size_t n);
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
+    /**
+     * Allocates a GC-visible box for Value::mkMapAttrsElem's shared
+     * MapAttrsDescriptor -- reuses allocValue()'s own batched pool
+     * directly (same 16-byte block size).
+     */
+    inline detail::ValueBase::MapAttrsDescriptor * allocMapAttrsDescriptor();
 
     Bindings * allocBindings(size_t capacity);
 

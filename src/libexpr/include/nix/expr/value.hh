@@ -56,6 +56,12 @@ enum InternalType {
     tListSmall = tFirstPairOfPointers,
     tPrimOpApp,
     tApp,
+    /** mapAttrs' per-attribute pending call: {sharedDescriptor, packedIndex}
+        instead of a fresh per-attribute {fun,args} box -- descriptor
+        (fun + the original Bindings*) is allocated once per mapAttrs
+        call, not once per attribute, halving mapAttrs' own allocation
+        count. @see MapAttrsElemThunk. */
+    tMapAttrsElem,
     tThunk,
     tLambda,
     tLastPairOfPointers = tLambda,
@@ -409,6 +415,35 @@ struct ValueBase
     };
 
     /**
+     * Shared across every attribute of one mapAttrs call -- allocated
+     * once per call, not once per attribute. @see MapAttrsElemThunk.
+     */
+    struct MapAttrsDescriptor
+    {
+        Value * fun;
+        const Bindings * original;
+    };
+
+    /**
+     * mapAttrs' per-attribute pending call. `index` is packed as a
+     * pointer-shaped value (`index << 3`) so it satisfies
+     * setPairOfPointersPayload's "looks like an aligned pointer" check --
+     * unpacked with `>> 3` on read, never dereferenced as a real pointer.
+     * Forcing looks up `(*descriptor->original)[index]` directly (flat
+     * array access -- only valid when `original` is unlayered, checked
+     * once at construction time in prim_mapAttrs, not here) to get this
+     * attribute's name and original value, then calls `descriptor->fun`
+     * with both -- one callFunction invocation, no virtual dispatch, and
+     * only one allocation (this Value itself) per attribute instead of
+     * two.
+     */
+    struct MapAttrsElemThunk
+    {
+        MapAttrsDescriptor * descriptor;
+        void * packedIndex;
+    };
+
+    /**
      * Like FunctionApplicationThunk, but must be a distinct type in order to
      * resolve overloads to `tPrimOpApp` instead of `tApp`.
      * This type helps with the efficient implementation of arity>=2 primop calls.
@@ -510,6 +545,7 @@ struct PayloadTypeToInternalType
     MACRO(ValueBase::SmallList, smallList, tListSmall)              \
     MACRO(ValueBase::ClosureThunk, thunk, tThunk)                   \
     MACRO(ValueBase::FunctionApplicationThunk, app, tApp)           \
+    MACRO(ValueBase::MapAttrsElemThunk, mapAttrsElem, tMapAttrsElem) \
     MACRO(ValueBase::Lambda, lambda, tLambda)                       \
     MACRO(PrimOp *, primOp, tPrimOp)                                \
     MACRO(ValueBase::PrimOpApplicationThunk, primOpApp, tPrimOpApp) \
@@ -861,6 +897,7 @@ protected:
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(SmallList, [0], [1])
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(PrimOpApplicationThunk, .left, .right)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(FunctionApplicationThunk, .left, .right)
+    NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(MapAttrsElemThunk, .descriptor, .packedIndex)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(ClosureThunk, .env, .expr)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(Lambda, .env, .fun)
 
@@ -1245,6 +1282,22 @@ public:
         return isa<tApp>();
     }
 
+    inline bool isMapAttrsElem() const
+    {
+        return isa<tMapAttrsElem>();
+    }
+
+    /**
+     * @internal Exposes the raw discriminator so EvalState::forceValue can
+     * dispatch via a single switch (one jump-table lookup) instead of a
+     * sequential isThunk()/isApp()/isMapAttrsElem()/isFailed() chain, each
+     * of which independently recomputes this.
+     */
+    inline InternalType rawInternalType() const noexcept
+    {
+        return getInternalType();
+    }
+
     inline bool isBlackhole() const;
 
     // type() == nFunction
@@ -1294,6 +1347,7 @@ public:
             t[tLambda] = nFunction;
             t[tPrimOpApp] = nFunction;
             t[tApp] = nThunk;
+            t[tMapAttrsElem] = nThunk;
             t[tThunk] = nThunk;
             t[tListSmall] = nList;
             t[tListN] = nList;
@@ -1335,6 +1389,7 @@ public:
             panic("attempt to use uninitialized Value");
         case tFailed:
         case tApp:
+        case tMapAttrsElem:
         case tThunk:
             return false;
         case tInt:
@@ -1428,6 +1483,19 @@ public:
     inline void mkApp(Value * l, Value * r) noexcept
     {
         setStorage(FunctionApplicationThunk{.left = l, .right = r});
+    }
+
+    /**
+     * `descriptor` must outlive this Value (allocated once per mapAttrs
+     * call, shared by every attribute). `index` must be in range for
+     * `descriptor->original` and that Bindings must be unlayered --
+     * neither is checked here, both are the caller's responsibility
+     * (prim_mapAttrs only takes this path when it has already verified
+     * `original` is unlayered).
+     */
+    inline void mkMapAttrsElem(MapAttrsDescriptor * descriptor, uint32_t index) noexcept
+    {
+        setStorage(MapAttrsElemThunk{.descriptor = descriptor, .packedIndex = (void *) (uintptr_t(index) << 3)});
     }
 
     inline void mkLambda(Env * e, ExprLambda * f) noexcept
@@ -1562,6 +1630,11 @@ public:
     FunctionApplicationThunk app() const noexcept
     {
         return getStorage<FunctionApplicationThunk>();
+    }
+
+    MapAttrsElemThunk mapAttrsElem() const noexcept
+    {
+        return getStorage<MapAttrsElemThunk>();
     }
 
     const char * pathStr() const noexcept
