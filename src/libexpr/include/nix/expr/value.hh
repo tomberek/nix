@@ -417,6 +417,16 @@ struct ValueBase
     /**
      * Shared across every attribute of one mapAttrs call -- allocated
      * once per call, not once per attribute. @see MapAttrsElemThunk.
+     *
+     * `original` must be a flat (unlayered) Bindings, since forcing
+     * indexes it directly via `operator[]`. For an unlayered input this
+     * is the input itself (zero extra allocation); for a layered input,
+     * `prim_mapAttrs` first materializes a flat copy via the ordinary
+     * `BindingsBuilder` machinery (same safe, GC-rooted allocation every
+     * other flat Bindings uses -- a raw pointer into the *interior* of
+     * the original layered Bindings' own backing array would not keep
+     * that array reachable under Boehm's conservative, non-interior-
+     * pointer-aware collection).
      */
     struct MapAttrsDescriptor
     {
@@ -430,12 +440,10 @@ struct ValueBase
      * setPairOfPointersPayload's "looks like an aligned pointer" check --
      * unpacked with `>> 3` on read, never dereferenced as a real pointer.
      * Forcing looks up `(*descriptor->original)[index]` directly (flat
-     * array access -- only valid when `original` is unlayered, checked
-     * once at construction time in prim_mapAttrs, not here) to get this
-     * attribute's name and original value, then calls `descriptor->fun`
-     * with both -- one callFunction invocation, no virtual dispatch, and
-     * only one allocation (this Value itself) per attribute instead of
-     * two.
+     * array access) to get this attribute's name and original value,
+     * then calls `descriptor->fun` with both -- one callFunction
+     * invocation, no virtual dispatch, and only one allocation (this
+     * Value itself) per attribute instead of two.
      */
     struct MapAttrsElemThunk
     {

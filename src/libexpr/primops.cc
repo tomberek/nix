@@ -3628,27 +3628,43 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindings(args[1]->attrs()->size());
+    auto * inputAttrs = args[1]->attrs();
+    auto attrs = state.buildBindings(inputAttrs->size());
 
-    if (!args[1]->attrs()->isLayered()) {
-        /* Fast path: one shared descriptor for the whole call instead of
-           a fresh {fun,args} box per attribute -- halves mapAttrs' own
-           allocation count. Only valid for unlayered Bindings, since
-           forcing indexes `original` directly via operator[]. */
+    if (!inputAttrs->empty()) {
         auto * descriptor = state.mem.allocMapAttrsDescriptor();
         descriptor->fun = args[0];
-        descriptor->original = args[1]->attrs();
-        Bindings::size_type index = 0;
-        for (auto & i : *args[1]->attrs()) {
-            attrs.alloc(i.name).mkMapAttrsElem(descriptor, index);
-            index++;
-        }
-    } else {
-        for (auto & i : *args[1]->attrs()) {
-            Value * vName = Value::toPtr(state.symbols[i.name]);
-            Value * vFun2 = state.allocValue();
-            vFun2->mkApp(args[0], vName);
-            attrs.alloc(i.name).mkApp(vFun2, i.value);
+
+        if (!inputAttrs->isLayered()) {
+            /* Fast path: `original` is just the input itself -- zero
+               extra allocation beyond the shared descriptor. */
+            descriptor->original = inputAttrs;
+            Bindings::size_type index = 0;
+            for (auto & i : *inputAttrs) {
+                attrs.alloc(i.name).mkMapAttrsElem(descriptor, index);
+                index++;
+            }
+        } else {
+            /* Layered: there's no O(1) positional index into a k-way
+               merge (Bindings::operator[] is unreachable() for a layered
+               chain), so materialize a flat copy of the merged iteration
+               order once -- via the ordinary BindingsBuilder, which
+               copies {name,value,pos} triples without allocating fresh
+               Values -- then every attribute's lazy value is exactly as
+               cheap as the unlayered case. One allocation instead of one
+               per attribute. */
+            auto flatCopy = state.buildBindings(inputAttrs->size());
+            Bindings::size_type index = 0;
+            for (auto & i : *inputAttrs) {
+                flatCopy.insert(i.name, i.value, i.pos);
+                attrs.alloc(i.name).mkMapAttrsElem(descriptor, index);
+                index++;
+            }
+            /* `descriptor->original` only needs to be valid by the time
+               some MapAttrsElemThunk is actually forced, which is always
+               after this function returns -- setting it after the loop,
+               once flatCopy is finished, is fine. */
+            descriptor->original = flatCopy.alreadySorted();
         }
     }
 
