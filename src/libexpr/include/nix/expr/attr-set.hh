@@ -85,20 +85,10 @@ private:
 
     /**
      * Number of attributes with unique names in the layer chain -- the
-     * *real* size, whereas @ref numAttrs is just this layer's own count.
-     *
-     * Computed lazily (0 = not yet computed, see @ref size /
-     * @ref computeChainSize): many layered accumulators are only ever read
-     * via get() and never need this. 0 is never a real chain size, since
-     * layering only happens between two non-empty Bindings.
-     *
-     * Atomic (relaxed) rather than a plain `mutable`: the computed value is
-     * deterministic, so concurrent writers racing to compute and store it
-     * would always agree on the value, but a plain non-atomic write would
-     * still be a data race (undefined behavior) under any future
-     * multi-threaded evaluator. Relaxed ordering is enough since no other
-     * memory access needs to be ordered against this one -- it's a pure
-     * function of already-fixed data, not a synchronization point.
+     * real size, vs. @ref numAttrs which is just this layer's own count.
+     * Computed lazily (0 = not yet computed; never a real chain size,
+     * since layering requires two non-empty Bindings). Atomic since
+     * concurrent writers may race to compute and store it.
      */
     mutable std::atomic<size_type> numAttrsInChain{0};
 
