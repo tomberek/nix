@@ -189,6 +189,7 @@ std::string showType(const Value & v)
     case tThunk:
         return v.isBlackhole() ? "a black hole" : "a thunk";
     case tApp:
+    case tMapAttrsElem:
         return "a function application";
     default:
         return std::string(showType(v.type()));
@@ -208,6 +209,8 @@ PosIdx Value::determinePos(const PosIdx pos) const
         return lambda().fun->pos;
     case tApp:
         return app().left->determinePos(pos);
+    case tMapAttrsElem:
+        return mapAttrsElem().descriptor->fun->determinePos(pos);
     default:
         return pos;
     }
