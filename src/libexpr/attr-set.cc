@@ -39,6 +39,61 @@ void Bindings::sort()
     std::sort(attrs, attrs + numAttrs);
 }
 
+size_t Bindings::absorbedSize(const Bindings & overlay) const noexcept
+{
+    auto own = ownAttrs();
+    auto i = own.begin();
+    auto j = overlay.begin();
+    size_t total = own.size() + overlay.size();
+    while (i != own.end() && j != overlay.end()) {
+        if (i->name == j->name) {
+            --total;
+            ++i;
+            ++j;
+        } else if (i->name < j->name) {
+            ++i;
+        } else {
+            ++j;
+        }
+    }
+    return total;
+}
+
+size_t Bindings::absorbInto(const Bindings & overlay, BindingsBuilder & attrs) const
+{
+    auto own = ownAttrs();
+    auto i = own.begin();
+    auto j = overlay.begin();
+    size_t copied = 0;
+    while (i != own.end() && j != overlay.end()) {
+        if (i->name == j->name) {
+            attrs.insert(*j);
+            ++copied;
+            ++i;
+            ++j;
+        } else if (i->name < j->name) {
+            attrs.insert(*i);
+            ++copied;
+            ++i;
+        } else {
+            attrs.insert(*j);
+            ++copied;
+            ++j;
+        }
+    }
+    while (i != own.end()) {
+        attrs.insert(*i);
+        ++copied;
+        ++i;
+    }
+    while (j != overlay.end()) {
+        attrs.insert(*j);
+        ++copied;
+        ++j;
+    }
+    return copied;
+}
+
 Value & Value::mkAttrs(BindingsBuilder & bindings)
 {
     mkAttrs(bindings.finish());

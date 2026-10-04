@@ -12,6 +12,7 @@
 #include <functional>
 #include <ranges>
 #include <optional>
+#include <vector>
 
 namespace nix {
 
@@ -114,6 +115,14 @@ private:
     Bindings & operator=(Bindings &&) = delete;
 
     ~Bindings() = default;
+
+    /**
+     * This Bindings' own attrs, as a span.
+     */
+    std::span<const Attr> ownAttrs() const noexcept
+    {
+        return {attrs, numAttrs};
+    }
 
     friend class BindingsBuilder;
 
@@ -435,6 +444,51 @@ public:
     {
         return numLayers > 1;
     }
+
+    /**
+     * The Bindings this one is layered on top of, or nullptr if not
+     * layered.
+     */
+    const Bindings * baseLayerPtr() const noexcept
+    {
+        return baseLayer;
+    }
+
+    /**
+     * How close in size an overlay must be to this layer's own attrs
+     * (within this ratio either way) for @ref absorbInto to apply.
+     */
+    static constexpr unsigned absorbRatio = 2;
+
+    /**
+     * Whether `overlay` is comparably sized to this layer's own attrs
+     * and this layer is already layered -- i.e. whether to fold
+     * `overlay` in via @ref absorbInto instead of stacking it as a new
+     * layer. Cheap: no allocation.
+     */
+    bool canAbsorb(const Bindings & overlay) const noexcept
+    {
+        if (!baseLayer)
+            return false;
+        auto overlaySize = overlay.size();
+        return overlaySize <= (size_type) numAttrs * absorbRatio && numAttrs <= overlaySize * absorbRatio;
+    }
+
+    /**
+     * Exact post-dedup size of this layer's own attrs merged with
+     * `overlay` -- the capacity @ref absorbInto needs. Only call after
+     * @ref canAbsorb.
+     */
+    size_t absorbedSize(const Bindings & overlay) const noexcept;
+
+    /**
+     * Merge-join this layer's own attrs with `overlay` into `attrs`
+     * (already layered onto @ref baseLayerPtr()), instead of stacking
+     * `overlay` as a new layer -- bounds chain depth logarithmically
+     * rather than linearly in the number of merges. Only call after
+     * @ref canAbsorb. Returns the count inserted.
+     */
+    size_t absorbInto(const Bindings & overlay, BindingsBuilder & attrs) const;
 
     const_iterator begin() const
     {

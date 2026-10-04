@@ -2065,8 +2065,20 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
     if (threshold != 0) {
         /* attrs2 is small: layer it on attrs1 (the common
-           `prev // overlay` pattern). */
+           `prev // overlay` pattern), or fold it into attrs1's top
+           layer via canAbsorb/absorbInto if comparably sized. */
         if (!bindings1.isLayerListFull() && (bindings2.size() <= threshold || bindings2.size() < bindings1.size())) {
+            if (bindings1.canAbsorb(bindings2)) {
+                auto attrs = state.buildBindings(bindings1.absorbedSize(bindings2));
+                attrs.layerOnTopOf(*bindings1.baseLayerPtr());
+
+                auto copied = bindings1.absorbInto(bindings2, attrs);
+                v.mkAttrs(attrs.alreadySorted());
+
+                state.nrOpUpdateValuesCopied += copied;
+                return;
+            }
+
             auto attrs = state.buildBindings(bindings2.size());
             attrs.layerOnTopOf(bindings1);
 
