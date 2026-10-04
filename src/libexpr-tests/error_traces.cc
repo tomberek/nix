@@ -11,8 +11,6 @@ class ErrorTraceTest : public LibExprTest
 
 TEST_F(ErrorTraceTest, TraceBuilder)
 {
-    using namespace testing;
-
     ASSERT_THROW(state.error<EvalError>("puppy").debugThrow(), EvalError);
 
     ASSERT_THROW(state.error<EvalError>("puppy").withTrace(noPos, "doggy").debugThrow(), EvalError);
@@ -26,12 +24,12 @@ TEST_F(ErrorTraceTest, TraceBuilder)
                 throw;
             }
         } catch (BaseError & e) {
-            ASSERT_EQ(PrintToString(e.info().msg), PrintToString(HintFmt("puppy")));
+            ASSERT_EQ(::testing::PrintToString(e.info().msg), ::testing::PrintToString(HintFmt("puppy")));
             auto trace = e.info().traces.rbegin();
             ASSERT_EQ(e.info().traces.size(), 2u);
-            ASSERT_EQ(PrintToString(trace->hint), PrintToString(HintFmt("doggy")));
+            ASSERT_EQ(::testing::PrintToString(trace->hint), ::testing::PrintToString(HintFmt("doggy")));
             trace++;
-            ASSERT_EQ(PrintToString(trace->hint), PrintToString(HintFmt("beans")));
+            ASSERT_EQ(::testing::PrintToString(trace->hint), ::testing::PrintToString(HintFmt("beans")));
             throw;
         },
         EvalError);
