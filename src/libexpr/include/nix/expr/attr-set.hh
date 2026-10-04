@@ -8,9 +8,11 @@
 #include <boost/iterator/function_output_iterator.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <ranges>
 #include <optional>
+#include <vector>
 
 namespace nix {
 
@@ -83,12 +85,13 @@ private:
     size_type numAttrs = 0;
 
     /**
-     * Number of attributes with unique names in the layer chain.
-     *
-     * This is the *real* user-facing size of bindings, whereas @ref numAttrs is
-     * an implementation detail of the data structure.
+     * Number of attributes with unique names in the layer chain -- the
+     * real size, vs. @ref numAttrs which is just this layer's own count.
+     * Computed lazily (0 = not yet computed; never a real chain size,
+     * since layering requires two non-empty Bindings). Atomic since
+     * concurrent writers may race to compute and store it.
      */
-    size_type numAttrsInChain = 0;
+    mutable std::atomic<size_type> numAttrsInChain{0};
 
     /**
      * Length of the layers list.
@@ -113,22 +116,69 @@ private:
 
     ~Bindings() = default;
 
+    /**
+     * This Bindings' own attrs, as a span.
+     */
+    std::span<const Attr> ownAttrs() const noexcept
+    {
+        return {attrs, numAttrs};
+    }
+
     friend class BindingsBuilder;
 
     /**
      * Maximum length of the Bindings layer chains.
      */
-    static constexpr unsigned maxLayers = 8;
+    static constexpr unsigned maxLayers = 16;
+
+    /**
+     * Lazily compute and memoize numAttrsInChain for a layered Bindings --
+     * see its doc comment. Only ever called from @ref size / @ref empty,
+     * on demand.
+     */
+    void computeChainSize() const noexcept
+    {
+        auto & base = *baseLayer;
+        auto ownAttrs = std::span(attrs, numAttrs);
+
+        size_type duplicates = 0;
+
+        /* If the base bindings is smaller than the newly added attributes
+           iterate using std::set_intersection to run in O(|base| + |attrs|) =
+           O(|attrs|). Otherwise use an O(|attrs| * log(|base|)) per-attr binary
+           search to check for duplicates. */
+        if (ownAttrs.size() > base.size()) {
+            std::set_intersection(
+                base.begin(),
+                base.end(),
+                ownAttrs.begin(),
+                ownAttrs.end(),
+                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
+        } else {
+            for (const auto & attr : ownAttrs)
+                if (base.get(attr.name))
+                    ++duplicates;
+        }
+
+        numAttrsInChain.store(base.size() + ownAttrs.size() - duplicates, std::memory_order_relaxed);
+    }
 
 public:
     size_type size() const
     {
-        return numAttrsInChain;
+        if (baseLayer && numAttrsInChain.load(std::memory_order_relaxed) == 0)
+            computeChainSize();
+        return numAttrsInChain.load(std::memory_order_relaxed);
     }
 
     bool empty() const
     {
-        return size() == 0;
+        /* A layered chain is never empty (layering only happens between
+           two non-empty Bindings), so this avoids forcing size()'s
+           computation on every `//` for the long-lived "prev" accumulator. */
+        if (baseLayer)
+            return false;
+        return numAttrsInChain.load(std::memory_order_relaxed) == 0;
     }
 
     class iterator
@@ -213,6 +263,14 @@ public:
          */
         bool doMerge = true;
 
+        /**
+         * Fast path for the common case (~2 layers observed on average): a
+         * plain two-cursor merge instead of cursorHeap's heap machinery.
+         * Falls back to the general k-way merge for 3+ layers.
+         */
+        bool doTwo = false;
+        BindingsCursor cursor0, cursor1;
+
         void push(BindingsCursor cursor) noexcept
         {
             cursorHeap.push_back(cursor);
@@ -261,12 +319,38 @@ public:
             return cursor;
         }
 
+        /**
+         * Advance the two-cursor merge by one step: yield the smaller name
+         * (cursor0 wins ties), skipping a shadowed duplicate in the other
+         * cursor if present.
+         */
+        void advanceTwo() noexcept
+        {
+            bool active0 = cursor0.current != cursor0.end;
+            bool active1 = cursor1.current != cursor1.end;
+
+            if (!active0 && !active1) {
+                current = nullptr;
+                return;
+            }
+
+            if (active0 && (!active1 || cursor0.current->name <= cursor1.current->name)) {
+                current = cursor0.current;
+                ++cursor0.current;
+                if (active1 && cursor1.current->name == current->name)
+                    ++cursor1.current;
+            } else {
+                current = cursor1.current;
+                ++cursor1.current;
+            }
+        }
+
         explicit iterator(const Bindings & attrs) noexcept
             : doMerge(attrs.baseLayer)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
                 auto first = layer.attrs;
-                push(
+                cursorHeap.push_back(
                     BindingsCursor{
                         .current = first,
                         .end = first + layer.numAttrs,
@@ -291,9 +375,19 @@ public:
                 layer = layer->baseLayer;
             }
 
+            if (cursorHeap.size() == 2) {
+                doTwo = true;
+                cursor0 = cursorHeap[0];
+                cursor1 = cursorHeap[1];
+                cursorHeap.clear();
+                advanceTwo();
+                return;
+            }
+
             if (cursorHeap.empty())
                 return;
 
+            std::ranges::make_heap(cursorHeap, comp);
             next(pop());
         }
 
@@ -316,6 +410,11 @@ public:
                 ++current;
                 if (current == cursorHeap.front().end)
                     return finished();
+                return *this;
+            }
+
+            if (doTwo) {
+                advanceTwo();
                 return *this;
             }
 
@@ -348,7 +447,10 @@ public:
     void push_back(const Attr & attr)
     {
         attrs[numAttrs++] = attr;
-        numAttrsInChain = numAttrs;
+        // layerOnTopOf runs before push_back for a layered Bindings, so
+        // numAttrsInChain is already reset to the "not computed" sentinel.
+        if (!baseLayer)
+            numAttrsInChain.store(numAttrs, std::memory_order_relaxed);
     }
 
     /**
@@ -391,6 +493,51 @@ public:
     {
         return numLayers > 1;
     }
+
+    /**
+     * The Bindings this one is layered on top of, or nullptr if not
+     * layered.
+     */
+    const Bindings * baseLayerPtr() const noexcept
+    {
+        return baseLayer;
+    }
+
+    /**
+     * How close in size an overlay must be to this layer's own attrs
+     * (within this ratio either way) for @ref absorbInto to apply.
+     */
+    static constexpr unsigned absorbRatio = 2;
+
+    /**
+     * Whether `overlay` is comparably sized to this layer's own attrs
+     * and this layer is already layered -- i.e. whether to fold
+     * `overlay` in via @ref absorbInto instead of stacking it as a new
+     * layer. Cheap: no allocation.
+     */
+    bool canAbsorb(const Bindings & overlay) const noexcept
+    {
+        if (!baseLayer)
+            return false;
+        auto overlaySize = overlay.size();
+        return overlaySize <= (size_type) numAttrs * absorbRatio && numAttrs <= overlaySize * absorbRatio;
+    }
+
+    /**
+     * Exact post-dedup size of this layer's own attrs merged with
+     * `overlay` -- the capacity @ref absorbInto needs. Only call after
+     * @ref canAbsorb.
+     */
+    size_t absorbedSize(const Bindings & overlay) const noexcept;
+
+    /**
+     * Merge-join this layer's own attrs with `overlay` into `attrs`
+     * (already layered onto @ref baseLayerPtr()), instead of stacking
+     * `overlay` as a new layer -- bounds chain depth logarithmically
+     * rather than linearly in the number of merges. Only call after
+     * @ref canAbsorb. Returns the count inserted.
+     */
+    size_t absorbInto(const Bindings & overlay, BindingsBuilder & attrs) const;
 
     const_iterator begin() const
     {
@@ -465,55 +612,6 @@ private:
     {
     }
 
-    bool hasBaseLayer() const noexcept
-    {
-        return bindings->baseLayer;
-    }
-
-    /**
-     * If the bindings gets "layered" on top of another we need to recalculate
-     * the number of unique attributes in the chain.
-     *
-     * This is done by either iterating over the base "layer" and the newly added
-     * attributes and counting duplicates. If the base "layer" is big this approach
-     * is inefficient and we fall back to doing per-element binary search in the base
-     * "layer".
-     */
-    void finishSizeIfNecessary()
-    {
-        if (!hasBaseLayer())
-            return;
-
-        auto & base = *bindings->baseLayer;
-        auto attrs = std::span(bindings->attrs, bindings->numAttrs);
-
-        Bindings::size_type duplicates = 0;
-
-        /* If the base bindings is smaller than the newly added attributes
-           iterate using std::set_intersection to run in O(|base| + |attrs|) =
-           O(|attrs|). Otherwise use an O(|attrs| * log(|base|)) per-attr binary
-           search to check for duplicates. Note that if we are in this code path then
-           |attrs| <= bindingsUpdateLayerRhsSizeThreshold, which 16 by default. We are
-           optimizing for the case when a small attribute set gets "layered" on top of
-           a much larger one. When attrsets are already small it's fine to do a linear
-           scan, but we should avoid expensive iterations over large "base" attrsets. */
-        if (attrs.size() > base.size()) {
-            std::set_intersection(
-                base.begin(),
-                base.end(),
-                attrs.begin(),
-                attrs.end(),
-                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
-        } else {
-            for (const auto & attr : attrs) {
-                if (base.get(attr.name))
-                    ++duplicates;
-            }
-        }
-
-        bindings->numAttrsInChain = base.numAttrsInChain + attrs.size() - duplicates;
-    }
-
 public:
     std::reference_wrapper<EvalMemory> mem;
     std::reference_wrapper<SymbolTable> symbols;
@@ -548,6 +646,8 @@ public:
     {
         bindings->baseLayer = &base;
         bindings->numLayers = base.numLayers + 1;
+        // Reset to the "not computed" sentinel now that it's layered.
+        bindings->numAttrsInChain.store(0, std::memory_order_relaxed);
     }
 
     Value & alloc(Symbol name, PosIdx pos = noPos);
@@ -557,13 +657,11 @@ public:
     const Bindings * finish()
     {
         bindings->sort();
-        finishSizeIfNecessary();
         return bindings;
     }
 
     const Bindings * alreadySorted()
     {
-        finishSizeIfNecessary();
         return bindings;
     }
 

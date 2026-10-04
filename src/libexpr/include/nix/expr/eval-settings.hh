@@ -480,7 +480,9 @@ public:
           Setting this to larger values generally leads to less memory allocations,
           but may lead to worse evaluation performance.
 
-          A value of `0` disables this optimization completely.
+          A value of `0` disables *this* threshold only -- a separate,
+          independently-thresholded optimization still applies when the right
+          operand is much bigger than the left, regardless of this setting.
 
           This is an advanced performance tuning option and typically should not be changed.
           The default value is chosen to balance performance and memory usage. On 32 bit systems
