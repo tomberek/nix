@@ -83,6 +83,21 @@ Env & EvalMemory::allocEnv(size_t size)
         *env1AllocCache = GC_NEXT(p);
         GC_NEXT(p) = nullptr;
         env = (Env *) p;
+    } else if (size == 2) {
+        /* Same batched fast path, for size-2 Envs (e.g. mapAttrs' shared
+           {name,value} fallback Env). */
+        static thread_local std::shared_ptr<void *> env2AllocCache{
+            std::allocate_shared<void *>(traceable_allocator<void *>(), nullptr)};
+        if (!*env2AllocCache) {
+            *env2AllocCache = GC_malloc_many(sizeof(Env) + 2 * sizeof(Value *));
+            if (!*env2AllocCache)
+                throw std::bad_alloc();
+        }
+
+        void * p = *env2AllocCache;
+        *env2AllocCache = GC_NEXT(p);
+        GC_NEXT(p) = nullptr;
+        env = (Env *) p;
     } else
 #endif
         env = (Env *) allocBytes(sizeof(Env) + size * sizeof(Value *));
