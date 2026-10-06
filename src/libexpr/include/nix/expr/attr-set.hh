@@ -377,6 +377,116 @@ public:
     }
 
     /**
+     * Direct access to the chunk `depth` baseLayer-hops from this object
+     * (0 = this object's own chunk) at local position `localIndex` within
+     * that chunk's own backing array -- unlike `get()`/`operator[]` on the
+     * outer object, this is NOT layered-chain-aware itself (it does no
+     * search, no merge): it's only valid for a (depth, localIndex) pair
+     * obtained from this exact chain's layout via `forEachWithOrigin()`,
+     * and only while that layout hasn't changed (Bindings are otherwise
+     * immutable after `BindingsBuilder::finish()`/`alreadySorted()`, so
+     * this holds for the lifetime of any Bindings reachable this way).
+     */
+    const Attr & rawAttrAt(uint32_t depth, uint32_t localIndex) const noexcept
+    {
+        const Bindings * chunk = this;
+        while (depth--) {
+            assert(chunk->baseLayer);
+            chunk = chunk->baseLayer;
+        }
+        assert(localIndex < chunk->numAttrs);
+        return chunk->attrs[localIndex];
+    }
+
+    /**
+     * Like begin()/end(), but calls `f(attr, depth, localIndex)` for each
+     * attribute in merged order, where `depth` is the chunk it came from
+     * (counted via baseLayer from this object, 0 = this object's own
+     * chunk) and `localIndex` is its position within that chunk's own
+     * backing array -- information the ordinary iterator doesn't expose.
+     *
+     * This is a SEPARATE, small k-way merge -- not a reuse of
+     * `Bindings::iterator`/`BindingsCursor`, deliberately, so that the
+     * (quite rare) callers needing per-attribute origin information don't
+     * add any cost to the (near-universal) callers that don't. It
+     * mirrors `iterator`'s override-priority/dedup logic exactly (lower
+     * depth wins a name clash, matching `GENERATE_CMP`'s (name, priority)
+     * ascending order there) but shares no code or data with it.
+     *
+     * @see rawAttrAt, which this is meant to be used together with.
+     */
+    template<typename F>
+    void forEachWithOrigin(F && f) const
+    {
+        if (!baseLayer) {
+            for (uint32_t i = 0; i < numAttrs; i++)
+                f(attrs[i], 0, i);
+            return;
+        }
+
+        struct Cursor
+        {
+            const Attr * current;
+            const Attr * end;
+            const Attr * base;
+            uint32_t depth;
+
+            bool empty() const noexcept
+            {
+                return current == end;
+            }
+
+            GENERATE_CMP(Cursor, me->current->name, me->depth)
+        };
+
+        static constexpr auto comp = std::greater<Cursor>();
+        boost::container::static_vector<Cursor, maxLayers> heap;
+        auto push = [&](Cursor c) {
+            heap.push_back(c);
+            std::ranges::push_heap(heap, comp);
+        };
+        auto pop = [&]() -> Cursor {
+            std::ranges::pop_heap(heap, comp);
+            Cursor c = heap.back();
+            heap.pop_back();
+            return c;
+        };
+
+        uint32_t depth = 0;
+        for (const Bindings * layer = this; layer; layer = layer->baseLayer, depth++)
+            if (layer->numAttrs != 0)
+                push(Cursor{layer->attrs, layer->attrs + layer->numAttrs, layer->attrs, depth});
+
+        while (!heap.empty()) {
+            Cursor winner = pop();
+
+            f(*winner.current, winner.depth, (uint32_t) (winner.current - winner.base));
+            Symbol justYielded = winner.current->name;
+
+            winner.current++;
+            if (!winner.empty())
+                push(winner);
+
+            /* Any other cursor whose top entry has the same name is
+               shadowed by the one just yielded (which had the lowest
+               depth among ties, by construction of `comp`) -- consume
+               (skip, without yielding) those entries, mirroring
+               `iterator::consumeAllUntilCurrentName`. */
+            while (!heap.empty()) {
+                Cursor top = pop();
+                if (top.current->name != justYielded) {
+                    push(top);
+                    break;
+                }
+                while (!top.empty() && top.current->name == justYielded)
+                    top.current++;
+                if (!top.empty())
+                    push(top);
+            }
+        }
+    }
+
+    /**
      * Check if the layer chain is full.
      */
     bool isLayerListFull() const noexcept

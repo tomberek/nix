@@ -366,6 +366,12 @@ public:
     inline void * allocBytes(size_t n);
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
+    /**
+     * Allocates a GC-visible box for Value::mkMapAttrsElem's shared
+     * MapAttrsDescriptor -- reuses allocValue()'s own batched pool
+     * directly (same 16-byte block size).
+     */
+    inline detail::ValueBase::MapAttrsDescriptor * allocMapAttrsDescriptor();
 
     Bindings * allocBindings(size_t capacity);
 
@@ -711,6 +717,17 @@ private:
      * This code is factored out so that it's not in the heavily inlined hot path.
      */
     void handleEvalExceptionForApp(Value & v, const Value & savedApp);
+
+    /**
+     * Internal support function for forceValue's tMapAttrsElem case.
+     *
+     * This code is factored out (and marked noinline) so that it's not
+     * duplicated into every one of forceValue's ~99 always-inline call
+     * sites across the evaluator -- mapAttrs elements are a small
+     * fraction of all forced values, so the rest of forceValue's callers
+     * shouldn't pay icache cost for logic they essentially never reach.
+     */
+    [[gnu::noinline]] void forceMapAttrsElem(Value & v, const PosIdx pos);
 
     void handleEvalFailed(Value & v, PosIdx pos);
 

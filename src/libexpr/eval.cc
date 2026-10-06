@@ -189,6 +189,7 @@ std::string showType(const Value & v)
     case tThunk:
         return v.isBlackhole() ? "a black hole" : "a thunk";
     case tApp:
+    case tMapAttrsElem:
         return "a function application";
     default:
         return std::string(showType(v.type()));
@@ -208,6 +209,8 @@ PosIdx Value::determinePos(const PosIdx pos) const
         return lambda().fun->pos;
     case tApp:
         return app().left->determinePos(pos);
+    case tMapAttrsElem:
+        return mapAttrsElem().descriptor->fun->determinePos(pos);
     default:
         return pos;
     }
@@ -2300,6 +2303,35 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
         *recovery = savedApp;
     }
     v.mkFailed(e, recovery);
+}
+
+[[gnu::noinline]]
+void EvalState::forceMapAttrsElem(Value & v, const PosIdx pos)
+{
+    /* descriptor is shared across every attribute of one mapAttrs
+       call, so this Value only ever stores the descriptor pointer +
+       its own index, one allocation instead of two per attribute. */
+    Value savedApp = v;
+    try {
+        auto elem = v.mapAttrsElem();
+        uint32_t raw = (uint32_t) (((uintptr_t) elem.packedIndex) >> 3);
+        const Bindings * original = elem.descriptor->original;
+        const Attr * attrPtr;
+        if (original->isLayered()) {
+            /* No O(1) positional index into a layered merge chain --
+               `raw` instead packs (depth, localIndex), resolved via a
+               fixed number of baseLayer hops, no search at all. */
+            attrPtr = &original->rawAttrAt(unpackMapAttrsOriginDepth(raw), unpackMapAttrsOriginLocalIndex(raw));
+        } else {
+            attrPtr = &(*original)[(Bindings::size_type) raw];
+        }
+        Value * nameValue = Value::toPtr(symbols[attrPtr->name]);
+        Value * args[2] = {nameValue, attrPtr->value};
+        callFunction(*elem.descriptor->fun, args, v, pos);
+    } catch (...) {
+        handleEvalExceptionForApp(v, savedApp);
+        throw;
+    }
 }
 
 [[gnu::noinline]]
