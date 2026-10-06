@@ -56,6 +56,12 @@ enum InternalType {
     tListSmall = tFirstPairOfPointers,
     tPrimOpApp,
     tApp,
+    /** mapAttrs' per-attribute pending call: {sharedDescriptor, packedIndex}
+        instead of a fresh per-attribute {fun,args} box -- descriptor
+        (fun + the original Bindings*) is allocated once per mapAttrs
+        call, not once per attribute, halving mapAttrs' own allocation
+        count. @see MapAttrsElemThunk. */
+    tMapAttrsElem,
     tThunk,
     tLambda,
     tLastPairOfPointers = tLambda,
@@ -409,6 +415,51 @@ struct ValueBase
     };
 
     /**
+     * Shared across every attribute of one mapAttrs call -- allocated
+     * once per call, not once per attribute. @see MapAttrsElemThunk.
+     *
+     * `original` is always the input itself -- a safe, whole-object
+     * reference (the per-element Values keep `descriptor` reachable,
+     * which keeps `original` reachable, exactly like any other GC
+     * pointer chain), never an interior pointer into its backing array.
+     * Unlayered inputs are indexed directly (`operator[]`, O(1)).
+     * Layered inputs have no O(1) positional index into their merge
+     * chain either, but each per-attribute thunk packs exactly which
+     * chunk (depth) and position within that chunk (localIndex) it came
+     * from -- see `MapAttrsElemThunk` -- so forcing is a fixed number of
+     * `baseLayer` hops (`Bindings::rawAttrAt`) with no search at all.
+     * Either way, zero extra allocation beyond this descriptor itself.
+     */
+    struct MapAttrsDescriptor
+    {
+        Value * fun;
+        const Bindings * original;
+    };
+
+    /**
+     * mapAttrs' per-attribute pending call. If `descriptor->original` is
+     * unlayered, `packedIndex` is a plain positional index (shifted left
+     * by 3, so it satisfies setPairOfPointersPayload's "looks like an
+     * aligned pointer" check -- unpacked with `>> 3`, never dereferenced
+     * as a real pointer), looked up via `operator[]`. If layered,
+     * `packedIndex` instead packs `(depth << mapAttrsOriginDepthBits) |
+     * localIndex` (see `packMapAttrsOrigin`/`unpackMapAttrsOrigin*`),
+     * recovered from `Bindings::iterator::originDepth()`/
+     * `originLocalIndex()` at construction time and resolved via
+     * `Bindings::rawAttrAt(depth, localIndex)` at force time -- a fixed
+     * number of pointer hops, no binary search, no extra allocation.
+     * Either way, this gets the attribute's name and original value,
+     * then calls `descriptor->fun` with both -- one callFunction
+     * invocation, no virtual dispatch, and only one allocation (this
+     * Value itself) per attribute instead of two.
+     */
+    struct MapAttrsElemThunk
+    {
+        MapAttrsDescriptor * descriptor;
+        void * packedIndex;
+    };
+
+    /**
      * Like FunctionApplicationThunk, but must be a distinct type in order to
      * resolve overloads to `tPrimOpApp` instead of `tApp`.
      * This type helps with the efficient implementation of arity>=2 primop calls.
@@ -510,6 +561,7 @@ struct PayloadTypeToInternalType
     MACRO(ValueBase::SmallList, smallList, tListSmall)              \
     MACRO(ValueBase::ClosureThunk, thunk, tThunk)                   \
     MACRO(ValueBase::FunctionApplicationThunk, app, tApp)           \
+    MACRO(ValueBase::MapAttrsElemThunk, mapAttrsElem, tMapAttrsElem) \
     MACRO(ValueBase::Lambda, lambda, tLambda)                       \
     MACRO(PrimOp *, primOp, tPrimOp)                                \
     MACRO(ValueBase::PrimOpApplicationThunk, primOpApp, tPrimOpApp) \
@@ -532,6 +584,37 @@ template<typename T>
 inline constexpr InternalType payloadTypeToInternalType = PayloadTypeToInternalType<T>::value;
 
 } // namespace detail
+
+/**
+ * Number of bits reserved for the chunk depth in a layered mapAttrs
+ * element's packed origin (@see detail::ValueBase::MapAttrsElemThunk).
+ * Must stay comfortably above log2(Bindings::maxLayers).
+ */
+inline constexpr unsigned mapAttrsOriginDepthBits = 8;
+
+inline constexpr uint32_t mapAttrsOriginLocalIndexMask = (uint32_t(1) << (32 - mapAttrsOriginDepthBits)) - 1;
+
+/**
+ * Packs a layered mapAttrs element's chunk depth and position within that
+ * chunk into one uint32_t, for `MapAttrsElemThunk::packedIndex`. @see
+ * unpackMapAttrsOriginDepth, unpackMapAttrsOriginLocalIndex.
+ */
+inline constexpr uint32_t packMapAttrsOrigin(uint32_t depth, uint32_t localIndex) noexcept
+{
+    assert(depth < (uint32_t(1) << mapAttrsOriginDepthBits));
+    assert(localIndex <= mapAttrsOriginLocalIndexMask);
+    return (depth << (32 - mapAttrsOriginDepthBits)) | (localIndex & mapAttrsOriginLocalIndexMask);
+}
+
+inline constexpr uint32_t unpackMapAttrsOriginDepth(uint32_t packed) noexcept
+{
+    return packed >> (32 - mapAttrsOriginDepthBits);
+}
+
+inline constexpr uint32_t unpackMapAttrsOriginLocalIndex(uint32_t packed) noexcept
+{
+    return packed & mapAttrsOriginLocalIndexMask;
+}
 
 /**
  * Discriminated union of types stored in the value.
@@ -861,6 +944,7 @@ protected:
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(SmallList, [0], [1])
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(PrimOpApplicationThunk, .left, .right)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(FunctionApplicationThunk, .left, .right)
+    NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(MapAttrsElemThunk, .descriptor, .packedIndex)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(ClosureThunk, .env, .expr)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(Lambda, .env, .fun)
 
@@ -1245,6 +1329,22 @@ public:
         return isa<tApp>();
     }
 
+    inline bool isMapAttrsElem() const
+    {
+        return isa<tMapAttrsElem>();
+    }
+
+    /**
+     * @internal Exposes the raw discriminator so EvalState::forceValue can
+     * dispatch via a single switch (one jump-table lookup) instead of a
+     * sequential isThunk()/isApp()/isMapAttrsElem()/isFailed() chain, each
+     * of which independently recomputes this.
+     */
+    inline InternalType rawInternalType() const noexcept
+    {
+        return getInternalType();
+    }
+
     inline bool isBlackhole() const;
 
     // type() == nFunction
@@ -1294,6 +1394,7 @@ public:
             t[tLambda] = nFunction;
             t[tPrimOpApp] = nFunction;
             t[tApp] = nThunk;
+            t[tMapAttrsElem] = nThunk;
             t[tThunk] = nThunk;
             t[tListSmall] = nList;
             t[tListN] = nList;
@@ -1335,6 +1436,7 @@ public:
             panic("attempt to use uninitialized Value");
         case tFailed:
         case tApp:
+        case tMapAttrsElem:
         case tThunk:
             return false;
         case tInt:
@@ -1428,6 +1530,21 @@ public:
     inline void mkApp(Value * l, Value * r) noexcept
     {
         setStorage(FunctionApplicationThunk{.left = l, .right = r});
+    }
+
+    /**
+     * `descriptor` must outlive this Value (allocated once per mapAttrs
+     * call, shared by every attribute). If `descriptor->original` is
+     * unlayered, `index` must be a valid positional index into it
+     * (direct `operator[]`); if layered, `index` must instead be a
+     * Symbol id valid for it (looked up via `get()`, since a layered
+     * chain has no O(1) positional index) -- neither is checked here,
+     * both are the caller's responsibility (`prim_mapAttrs` packs
+     * whichever one matches the path it took).
+     */
+    inline void mkMapAttrsElem(MapAttrsDescriptor * descriptor, uint32_t index) noexcept
+    {
+        setStorage(MapAttrsElemThunk{.descriptor = descriptor, .packedIndex = (void *) (uintptr_t(index) << 3)});
     }
 
     inline void mkLambda(Env * e, ExprLambda * f) noexcept
@@ -1562,6 +1679,11 @@ public:
     FunctionApplicationThunk app() const noexcept
     {
         return getStorage<FunctionApplicationThunk>();
+    }
+
+    MapAttrsElemThunk mapAttrsElem() const noexcept
+    {
+        return getStorage<MapAttrsElemThunk>();
     }
 
     const char * pathStr() const noexcept
