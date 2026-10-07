@@ -377,6 +377,100 @@ public:
     }
 
     /**
+     * Direct access to the chunk `depth` baseLayer-hops away, at
+     * `localIndex` within that chunk's own array. No search, no merge --
+     * only valid for a (depth, localIndex) pair obtained from this exact
+     * chain via `forEachWithOrigin()`.
+     */
+    const Attr & rawAttrAt(uint32_t depth, uint32_t localIndex) const noexcept
+    {
+        const Bindings * chunk = this;
+        while (depth--) {
+            assert(chunk->baseLayer);
+            chunk = chunk->baseLayer;
+        }
+        assert(localIndex < chunk->numAttrs);
+        return chunk->attrs[localIndex];
+    }
+
+    /**
+     * Like begin()/end(), but also passes each attribute's (depth,
+     * localIndex) -- see `rawAttrAt`. A separate k-way merge from
+     * `Bindings::iterator` so callers that don't need origin info don't
+     * pay for it.
+     */
+    template<typename F>
+    void forEachWithOrigin(F && f) const
+    {
+        if (!baseLayer) {
+            for (uint32_t i = 0; i < numAttrs; i++)
+                f(attrs[i], 0, i);
+            return;
+        }
+
+        struct Cursor
+        {
+            const Attr * current;
+            const Attr * end;
+            const Attr * base;
+            uint32_t depth;
+
+            bool empty() const noexcept
+            {
+                return current == end;
+            }
+
+            GENERATE_CMP(Cursor, me->current->name, me->depth)
+        };
+
+        static constexpr auto comp = std::greater<Cursor>();
+        boost::container::static_vector<Cursor, maxLayers> heap;
+        auto push = [&](Cursor c) {
+            heap.push_back(c);
+            std::ranges::push_heap(heap, comp);
+        };
+        auto pop = [&]() -> Cursor {
+            std::ranges::pop_heap(heap, comp);
+            Cursor c = heap.back();
+            heap.pop_back();
+            return c;
+        };
+
+        uint32_t depth = 0;
+        for (const Bindings * layer = this; layer; layer = layer->baseLayer, depth++)
+            if (layer->numAttrs != 0)
+                push(Cursor{layer->attrs, layer->attrs + layer->numAttrs, layer->attrs, depth});
+
+        while (!heap.empty()) {
+            Cursor winner = pop();
+
+            f(*winner.current, winner.depth, (uint32_t) (winner.current - winner.base));
+            Symbol justYielded = winner.current->name;
+
+            winner.current++;
+            if (!winner.empty())
+                push(winner);
+
+            /* Any other cursor whose top entry has the same name is
+               shadowed by the one just yielded (which had the lowest
+               depth among ties, by construction of `comp`) -- consume
+               (skip, without yielding) those entries, mirroring
+               `iterator::consumeAllUntilCurrentName`. */
+            while (!heap.empty()) {
+                Cursor top = pop();
+                if (top.current->name != justYielded) {
+                    push(top);
+                    break;
+                }
+                while (!top.empty() && top.current->name == justYielded)
+                    top.current++;
+                if (!top.empty())
+                    push(top);
+            }
+        }
+    }
+
+    /**
      * Check if the layer chain is full.
      */
     bool isLayerListFull() const noexcept

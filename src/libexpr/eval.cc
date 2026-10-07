@@ -189,6 +189,7 @@ std::string showType(const Value & v)
     case tThunk:
         return v.isBlackhole() ? "a black hole" : "a thunk";
     case tApp:
+    case tIndexedCall:
         return "a function application";
     default:
         return std::string(showType(v.type()));
@@ -208,6 +209,8 @@ PosIdx Value::determinePos(const PosIdx pos) const
         return lambda().fun->pos;
     case tApp:
         return app().left->determinePos(pos);
+    case tIndexedCall:
+        return indexedCall().descriptor->fun->determinePos(pos);
     default:
         return pos;
     }
@@ -2300,6 +2303,34 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
         *recovery = savedApp;
     }
     v.mkFailed(e, recovery);
+}
+
+[[gnu::noinline]]
+void EvalState::forceIndexedCall(Value & v, const PosIdx pos)
+{
+    Value savedApp = v;
+    try {
+        auto elem = v.indexedCall();
+        uint32_t raw = (uint32_t) (uintptr_t(elem.packedIndex) >> 3);
+        const Bindings * original = elem.descriptor->original;
+        const Attr * attrPtr =
+            original->isLayered()
+                ? &original->rawAttrAt(unpackIndexedCallOriginDepth(raw), unpackIndexedCallOriginLocalIndex(raw))
+                : &(*original)[(Bindings::size_type) raw];
+
+        Value * nameValue = Value::toPtr(symbols[attrPtr->name]);
+        Value * args[2] = {nameValue, attrPtr->value};
+        try {
+            callFunction(*elem.descriptor->fun, args, v, pos);
+        } catch (Error & e) {
+            if (loggerSettings.showTrace.get())
+                e.addTrace(positions[attrPtr->pos], "while evaluating the attribute '%s'", symbols[attrPtr->name]);
+            throw;
+        }
+    } catch (...) {
+        handleEvalExceptionForApp(v, savedApp);
+        throw;
+    }
 }
 
 [[gnu::noinline]]
