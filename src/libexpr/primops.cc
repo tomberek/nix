@@ -3624,20 +3624,47 @@ static RegisterPrimOp primop_functionArgs({
     .impl = prim_functionArgs,
 });
 
-/*  */
+namespace {
+/**
+ * Shared core of mapAttrs/zipAttrsWith: lazily applies `fun` to every
+ * {name, value} pair of `inputAttrs`, one Value per attribute, sharing a
+ * single descriptor instead of a fresh {fun, name, value} box per
+ * attribute. `inputAttrs` need not be user-visible -- zipAttrsWith builds
+ * one internally to hold {name, list-of-values} pairs.
+ */
+void buildIndexedCalls(EvalState & state, Value * fun, const Bindings * inputAttrs, BindingsBuilder & attrs)
+{
+    if (inputAttrs->empty())
+        return;
+
+    auto * descriptor = state.mem.allocIndexedCallDescriptor();
+    descriptor->fun = fun;
+    descriptor->original = inputAttrs;
+
+    if (!inputAttrs->isLayered()) {
+        Bindings::size_type index = 0;
+        for (auto & i : *inputAttrs) {
+            attrs.alloc(i.name).mkIndexedCall(descriptor, index);
+            index++;
+        }
+    } else {
+        /* No O(1) positional index into a layered merge chain, so pack
+           (depth, localIndex) instead -- resolved at force time via
+           Bindings::rawAttrAt, no search needed. */
+        inputAttrs->forEachWithOrigin([&](const Attr & attr, uint32_t depth, uint32_t localIndex) {
+            attrs.alloc(attr.name).mkIndexedCall(descriptor, packIndexedCallOrigin(depth, localIndex));
+        });
+    }
+}
+} // namespace
+
 static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindings(args[1]->attrs()->size());
-
-    for (auto & i : *args[1]->attrs()) {
-        Value * vName = Value::toPtr(state.symbols[i.name]);
-        Value * vFun2 = state.allocValue();
-        vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
-    }
-
+    auto * inputAttrs = args[1]->attrs();
+    auto attrs = state.buildBindings(inputAttrs->size());
+    buildIndexedCalls(state, args[0], inputAttrs, attrs);
     v.mkAttrs(attrs.alreadySorted());
 }
 
@@ -3699,18 +3726,19 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
         }
     }
 
-    auto attrs = state.buildBindings(attrsSeen.size());
-
+    /* Build a small Bindings holding {name, list-of-values} per key --
+       never exposed to the user -- so the lazy per-key call to `f` can
+       reuse the exact same shared indexed-call machinery mapAttrs uses,
+       instead of a fresh pair of App thunks per key. */
+    auto zipped = state.buildBindings(attrsSeen.size());
     for (auto & [sym, elem] : attrsSeen) {
-        auto name = Value::toPtr(state.symbols[sym]);
-        auto call1 = state.allocValue();
-        call1->mkApp(args[0], name);
-        auto call2 = state.allocValue();
-        auto arg = state.allocValue();
-        arg->mkList(*elem.list);
-        call2->mkApp(call1, arg);
-        attrs.insert(sym, call2);
+        auto * listValue = state.allocValue();
+        listValue->mkList(*elem.list);
+        zipped.insert(sym, listValue);
     }
+
+    auto attrs = state.buildBindings(attrsSeen.size());
+    buildIndexedCalls(state, args[0], zipped.alreadySorted(), attrs);
 
     v.mkAttrs(attrs.alreadySorted());
 }
