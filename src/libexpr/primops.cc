@@ -12,7 +12,6 @@
 #include "nix/store/path-references.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/configuration.hh"
-#include "nix/util/logging.hh"
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/store/build.hh"
 #include "nix/util/strings.hh"
@@ -3627,56 +3626,21 @@ static RegisterPrimOp primop_functionArgs({
 
 namespace {
 /**
- * Wraps the inner lambda's body with the same "while calling ..." trace
- * frame that `EvalState::callFunction`'s curry loop would add -- shared
- * across every attribute of one mapAttrs call (like `MapAttrsDescriptor`),
- * since the fast path below thunks the body directly and never calls
- * `callFunction`.
- */
-struct MapAttrsFastBody : Expr
-{
-    Expr * body;
-    PosIdx pos;
-    Symbol name;
-
-    MapAttrsFastBody(Expr * body, PosIdx pos, Symbol name)
-        : body(body)
-        , pos(pos)
-        , name(name)
-    {
-    }
-
-    void eval(EvalState & state, Env & env, Value & v) override
-    {
-        try {
-            body->eval(state, env, v);
-        } catch (Error & e) {
-            if (loggerSettings.showTrace.get())
-                e.addTrace(
-                    state.positions[pos],
-                    "while calling %s",
-                    name ? concatStrings("'", state.symbols[name], "'") : "anonymous lambda");
-            throw;
-        }
-    }
-};
-
-/**
  * Peeked, without forcing anything, from `f`'s unevaluated AST: true iff
- * `f` is syntactically `name: value: body` -- two nested plain-identifier
+ * `f` is syntactically `arg1: arg2: body` -- two nested plain-identifier
  * lambdas, no formals/destructuring at either level. `tThunk{env,
  * ExprLambda*}` and `tLambda{env,fun}` both carry the exact (env, fun)
  * pair that forcing would produce, so this is a pure dynamic_cast + tag
  * check -- never forces anything beyond what the fallback path would
  * also eventually force.
  */
-struct MapAttrsFastShape
+struct TwoSimpleLambdasShape
 {
     Env * closureEnv;
     ExprLambda * inner;
 };
 
-std::optional<MapAttrsFastShape> peekMapAttrsFastShape(Value * f)
+std::optional<TwoSimpleLambdasShape> peekTwoSimpleLambdas(Value * f)
 {
     Env * closureEnv;
     ExprLambda * outer;
@@ -3696,7 +3660,78 @@ std::optional<MapAttrsFastShape> peekMapAttrsFastShape(Value * f)
     auto * inner = dynamic_cast<ExprLambda *>(outer->body);
     if (!inner || inner->getFormals())
         return std::nullopt;
-    return MapAttrsFastShape{closureEnv, inner};
+    return TwoSimpleLambdasShape{closureEnv, inner};
+}
+
+/**
+ * Shared core of mapAttrs/zipAttrsWith (and any future builtin with the
+ * same shape): lazily applies `fun` to every {name, value} pair of
+ * `inputAttrs`, writing one Value per attribute into `attrs`. `inputAttrs`
+ * need not be user-visible -- zipAttrsWith builds one internally to hold
+ * {name, list-of-values} pairs rather than exposing a real attrset.
+ *
+ * When `fun` is syntactically two simple lambdas, thunks each attribute's
+ * body directly via a hand-built Env chain, skipping `callFunction`
+ * entirely. Otherwise (and always for layered input -- measured slower on
+ * the fast path, for reasons distinct from allocation count) falls back
+ * to a shared `IndexedCallDescriptor` + one `IndexedCallThunk` per
+ * attribute, deferring the {name, value} lookup and the call itself to
+ * force time with zero extra allocation beyond the one shared descriptor.
+ */
+void buildIndexedCalls(EvalState & state, Value * fun, const Bindings * inputAttrs, BindingsBuilder & attrs)
+{
+    if (inputAttrs->empty())
+        return;
+
+    if (!inputAttrs->isLayered()) {
+        if (auto shape = peekTwoSimpleLambdas(fun)) {
+            /* Construct exactly the Env chain that calling `fun arg1 arg2`
+               would produce (both size 1, so they hit allocEnv's batched
+               fast path), and thunk `body` directly -- skips the shared
+               descriptor and callFunction entirely for this shape. */
+            auto * body =
+                state.mem.exprs.add<TwoArgCallBody>(shape->inner->body, shape->inner->pos, shape->inner->name);
+            for (auto & i : *inputAttrs) {
+                Env & envArg1 = state.mem.allocEnv(1);
+                envArg1.up = shape->closureEnv;
+                envArg1.values[0] = Value::toPtr(state.symbols[i.name]);
+
+                Env & envArg2 = state.mem.allocEnv(1);
+                envArg2.up = &envArg1;
+                envArg2.values[0] = i.value;
+
+                attrs.alloc(i.name).mkThunk(&envArg2, body);
+            }
+            return;
+        }
+    }
+
+    auto * descriptor = state.mem.allocIndexedCallDescriptor();
+    descriptor->fun = fun;
+    descriptor->original = inputAttrs;
+
+    if (!inputAttrs->isLayered()) {
+        /* Fast path: `original` is just the input itself -- zero
+           extra allocation beyond the shared descriptor. */
+        Bindings::size_type index = 0;
+        for (auto & i : *inputAttrs) {
+            attrs.alloc(i.name).mkIndexedCall(descriptor, index);
+            index++;
+        }
+    } else {
+        /* Layered: there's no O(1) positional index into a k-way
+           merge (Bindings::operator[] is unreachable() for a layered
+           chain). Rather than searching by name at force time, pack
+           exactly which chunk (depth) and position within it
+           (localIndex) each attribute came from -- the merge walk
+           here already computes both -- so forcing is a fixed
+           number of pointer hops (Bindings::rawAttrAt), no search at
+           all. Zero extra allocation beyond the shared descriptor
+           either way. */
+        inputAttrs->forEachWithOrigin([&](const Attr & attr, uint32_t depth, uint32_t localIndex) {
+            attrs.alloc(attr.name).mkIndexedCall(descriptor, packIndexedCallOrigin(depth, localIndex));
+        });
+    }
 }
 } // namespace
 
@@ -3706,65 +3741,7 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
 
     auto * inputAttrs = args[1]->attrs();
     auto attrs = state.buildBindings(inputAttrs->size());
-
-    if (!inputAttrs->empty()) {
-        /* Layered input keeps using the descriptor path below unconditionally --
-           measured slower than the shipped layered-origin-packing fast path on
-           this fast path, for reasons distinct from the allocation count. */
-        if (!inputAttrs->isLayered()) {
-            if (auto shape = peekMapAttrsFastShape(args[0])) {
-                /* Construct exactly the Env chain that calling `f name value`
-                   would produce (both size 1, so they hit allocEnv's batched
-                   fast path), and thunk `body` directly -- skips the shared
-                   descriptor and callFunction entirely for this shape. */
-                auto * body =
-                    state.mem.exprs.add<MapAttrsFastBody>(shape->inner->body, shape->inner->pos, shape->inner->name);
-                for (auto & i : *inputAttrs) {
-                    Env & envName = state.mem.allocEnv(1);
-                    envName.up = shape->closureEnv;
-                    envName.values[0] = Value::toPtr(state.symbols[i.name]);
-
-                    Env & envValue = state.mem.allocEnv(1);
-                    envValue.up = &envName;
-                    envValue.values[0] = i.value;
-
-                    attrs.alloc(i.name).mkThunk(&envValue, body);
-                }
-                v.mkAttrs(attrs.alreadySorted());
-                return;
-            }
-        }
-
-        auto * descriptor = state.mem.allocMapAttrsDescriptor();
-        descriptor->fun = args[0];
-
-        if (!inputAttrs->isLayered()) {
-            /* Fast path: `original` is just the input itself -- zero
-               extra allocation beyond the shared descriptor. */
-            descriptor->original = inputAttrs;
-            Bindings::size_type index = 0;
-            for (auto & i : *inputAttrs) {
-                attrs.alloc(i.name).mkMapAttrsElem(descriptor, index);
-                index++;
-            }
-        } else {
-            /* Layered: there's no O(1) positional index into a k-way
-               merge (Bindings::operator[] is unreachable() for a layered
-               chain). Rather than searching by name at force time, pack
-               exactly which chunk (depth) and position within it
-               (localIndex) each attribute came from -- the merge walk
-               here already computes both -- so forcing is a fixed
-               number of pointer hops (Bindings::rawAttrAt), no search at
-               all. `original` is the input itself, same safe
-               whole-object reference as the unlayered case: zero extra
-               allocation beyond the shared descriptor either way. */
-            descriptor->original = inputAttrs;
-            inputAttrs->forEachWithOrigin([&](const Attr & attr, uint32_t depth, uint32_t localIndex) {
-                attrs.alloc(attr.name).mkMapAttrsElem(descriptor, packMapAttrsOrigin(depth, localIndex));
-            });
-        }
-    }
-
+    buildIndexedCalls(state, args[0], inputAttrs, attrs);
     v.mkAttrs(attrs.alreadySorted());
 }
 
@@ -3826,18 +3803,19 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
         }
     }
 
-    auto attrs = state.buildBindings(attrsSeen.size());
-
+    /* Build a small Bindings holding {name, list-of-values} per key --
+       never exposed to the user -- so the lazy per-key call to `f` can
+       reuse the exact same shared indexed-call machinery mapAttrs uses,
+       instead of a fresh pair of App thunks per key. */
+    auto zipped = state.buildBindings(attrsSeen.size());
     for (auto & [sym, elem] : attrsSeen) {
-        auto name = Value::toPtr(state.symbols[sym]);
-        auto call1 = state.allocValue();
-        call1->mkApp(args[0], name);
-        auto call2 = state.allocValue();
-        auto arg = state.allocValue();
-        arg->mkList(*elem.list);
-        call2->mkApp(call1, arg);
-        attrs.insert(sym, call2);
+        auto * listValue = state.allocValue();
+        listValue->mkList(*elem.list);
+        zipped.insert(sym, listValue);
     }
+
+    auto attrs = state.buildBindings(attrsSeen.size());
+    buildIndexedCalls(state, args[0], zipped.alreadySorted(), attrs);
 
     v.mkAttrs(attrs.alreadySorted());
 }

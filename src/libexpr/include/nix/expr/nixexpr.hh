@@ -832,6 +832,49 @@ struct ExprBlackHole : Expr
 
 extern ExprBlackHole eBlackHole;
 
+/**
+ * Hand-built per-attribute Expr for the mapAttrs/zipAttrsWith-style fast
+ * path (builtins that lazily apply a 2-arg curried function to every
+ * {name,value} pair of a Bindings): wraps the inner lambda's body with
+ * the same "while calling ..." trace frame `EvalState::callFunction`'s
+ * curry loop would add, since the fast path thunks the body directly and
+ * never calls `callFunction`.
+ *
+ * Does NOT also reproduce `callFunction`'s conditional "from call site"
+ * frame: that would need `Value::determinePos` to chase through a plain
+ * `tThunk` the way it already does for `tApp`/`tIndexedCall`, which this
+ * fast path deliberately has nothing for it to chase through (that's the
+ * whole point of skipping `callFunction`). This exact gap already existed
+ * for mapAttrs' own fast path before zipAttrsWith started sharing it --
+ * confirmed via `Value::determinePos` never seeing anything but a bare
+ * `tThunk` here, so `pos` always stays unset regardless of whether `fun`
+ * itself happens to be forced already.
+ */
+struct TwoArgCallBody : Expr
+{
+    Expr * body;
+    PosIdx innerPos;
+    Symbol name;
+
+    TwoArgCallBody(Expr * body, PosIdx innerPos, Symbol name)
+        : body(body)
+        , innerPos(innerPos)
+        , name(name)
+    {
+    }
+
+    void show(const SymbolTable & symbols, std::ostream & str) const override {}
+
+    void eval(EvalState & state, Env & env, Value & v) override;
+
+    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override {}
+
+    PosIdx getPos() const override
+    {
+        return innerPos;
+    }
+};
+
 class Exprs
 {
     /* Thread-safe fallback resource, which might be a bit slower. */
