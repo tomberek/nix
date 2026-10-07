@@ -51,11 +51,16 @@ enum InternalType {
     tExternal,
     tPrimOp,
     tAttrs,
-    /** mapAttrs' per-attribute pending call: {sharedDescriptor, packedIndex}
-        instead of a fresh per-attribute {fun,args} box -- descriptor
-        (fun + the original Bindings*) is allocated once per mapAttrs
-        call, not once per attribute, halving mapAttrs' own allocation
-        count. @see MapAttrsElemThunk.
+    /** A per-attribute pending call: {sharedDescriptor, packedIndex} instead
+        of a fresh per-attribute {fun,args} box -- descriptor (fun + the
+        original Bindings*) is allocated once per CALL to a builtin like
+        mapAttrs or zipAttrsWith, not once per attribute, halving the
+        builtin's own allocation count. Not specific to any one builtin:
+        anything that needs to lazily apply a 2-arg function to every
+        {name,value} pair of a Bindings can reuse this -- mapAttrs applies
+        it to its real input directly; zipAttrsWith applies it to a small
+        Bindings it builds itself to hold {name, list-of-values} pairs.
+        @see IndexedCallThunk.
 
         Deliberately NOT part of the tFirstPairOfPointers..tLastPairOfPointers
         family below, even though its payload is also a pair of pointers --
@@ -63,8 +68,8 @@ enum InternalType {
         one of that family's 8 shared secondary-discriminator slots (2 of
         which, at the time this was added, were already unclaimed and still
         are after this: PrimaryDiscriminator itself has 8 possible 3-bit
-        values and only 6 were in use). See ValueStorage::pdMapAttrsElem. */
-    tMapAttrsElem,
+        values and only 6 were in use). See ValueStorage::pdIndexedCall. */
+    tIndexedCall,
     /* layout: Pair of pointers payload */
     tFirstPairOfPointers,
     tListSmall = tFirstPairOfPointers,
@@ -423,8 +428,9 @@ struct ValueBase
     };
 
     /**
-     * Shared across every attribute of one mapAttrs call -- allocated
-     * once per call, not once per attribute. @see MapAttrsElemThunk.
+     * Shared across every attribute of one call to a builtin like mapAttrs
+     * or zipAttrsWith -- allocated once per call, not once per attribute.
+     * @see IndexedCallThunk.
      *
      * `original` is always the input itself -- a safe, whole-object
      * reference (the per-element Values keep `descriptor` reachable,
@@ -434,22 +440,22 @@ struct ValueBase
      * Layered inputs have no O(1) positional index into their merge
      * chain either, but each per-attribute thunk packs exactly which
      * chunk (depth) and position within that chunk (localIndex) it came
-     * from -- see `MapAttrsElemThunk` -- so forcing is a fixed number of
+     * from -- see `IndexedCallThunk` -- so forcing is a fixed number of
      * `baseLayer` hops (`Bindings::rawAttrAt`) with no search at all.
      * Either way, zero extra allocation beyond this descriptor itself.
      */
-    struct MapAttrsDescriptor
+    struct IndexedCallDescriptor
     {
         Value * fun;
         const Bindings * original;
     };
 
     /**
-     * mapAttrs' per-attribute pending call. If `descriptor->original` is
+     * A per-attribute pending call. If `descriptor->original` is
      * unlayered, `packedIndex` is a plain positional index, looked up via
      * `operator[]`. If layered, `packedIndex` instead packs `(depth <<
-     * mapAttrsOriginDepthBits) | localIndex` (see
-     * `packMapAttrsOrigin`/`unpackMapAttrsOrigin*`), recovered from
+     * indexedCallOriginDepthBits) | localIndex` (see
+     * `packIndexedCallOrigin`/`unpackIndexedCallOrigin*`), recovered from
      * `Bindings::iterator::originDepth()`/`originLocalIndex()` at
      * construction time and resolved via `Bindings::rawAttrAt(depth,
      * localIndex)` at force time -- a fixed number of pointer hops, no
@@ -460,15 +466,15 @@ struct ValueBase
      * two.
      *
      * Stored via its own dedicated PrimaryDiscriminator (see
-     * ValueStorage::pdMapAttrsElem) rather than one of
+     * ValueStorage::pdIndexedCall) rather than one of
      * pdPairOfPointers' shared secondary-discriminator slots, so
      * `packedIndex` is a plain, unshifted uint32_t -- no need for it to
      * "look like" an aligned pointer the way a pdPairOfPointers payload
      * would require.
      */
-    struct MapAttrsElemThunk
+    struct IndexedCallThunk
     {
-        MapAttrsDescriptor * descriptor;
+        IndexedCallDescriptor * descriptor;
         uint32_t packedIndex;
     };
 
@@ -574,7 +580,7 @@ struct PayloadTypeToInternalType
     MACRO(ValueBase::SmallList, smallList, tListSmall)              \
     MACRO(ValueBase::ClosureThunk, thunk, tThunk)                   \
     MACRO(ValueBase::FunctionApplicationThunk, app, tApp)           \
-    MACRO(ValueBase::MapAttrsElemThunk, mapAttrsElem, tMapAttrsElem) \
+    MACRO(ValueBase::IndexedCallThunk, indexedCall, tIndexedCall) \
     MACRO(ValueBase::Lambda, lambda, tLambda)                       \
     MACRO(PrimOp *, primOp, tPrimOp)                                \
     MACRO(ValueBase::PrimOpApplicationThunk, primOpApp, tPrimOpApp) \
@@ -599,34 +605,34 @@ inline constexpr InternalType payloadTypeToInternalType = PayloadTypeToInternalT
 } // namespace detail
 
 /**
- * Number of bits reserved for the chunk depth in a layered mapAttrs
- * element's packed origin (@see detail::ValueBase::MapAttrsElemThunk).
+ * Number of bits reserved for the chunk depth in a layered
+ * IndexedCallThunk's packed origin (@see detail::ValueBase::IndexedCallThunk).
  * Must stay comfortably above log2(Bindings::maxLayers).
  */
-inline constexpr unsigned mapAttrsOriginDepthBits = 8;
+inline constexpr unsigned indexedCallOriginDepthBits = 8;
 
-inline constexpr uint32_t mapAttrsOriginLocalIndexMask = (uint32_t(1) << (32 - mapAttrsOriginDepthBits)) - 1;
+inline constexpr uint32_t indexedCallOriginLocalIndexMask = (uint32_t(1) << (32 - indexedCallOriginDepthBits)) - 1;
 
 /**
- * Packs a layered mapAttrs element's chunk depth and position within that
- * chunk into one uint32_t, for `MapAttrsElemThunk::packedIndex`. @see
- * unpackMapAttrsOriginDepth, unpackMapAttrsOriginLocalIndex.
+ * Packs a layered IndexedCallThunk's chunk depth and position within that
+ * chunk into one uint32_t, for `IndexedCallThunk::packedIndex`. @see
+ * unpackIndexedCallOriginDepth, unpackIndexedCallOriginLocalIndex.
  */
-inline constexpr uint32_t packMapAttrsOrigin(uint32_t depth, uint32_t localIndex) noexcept
+inline constexpr uint32_t packIndexedCallOrigin(uint32_t depth, uint32_t localIndex) noexcept
 {
-    assert(depth < (uint32_t(1) << mapAttrsOriginDepthBits));
-    assert(localIndex <= mapAttrsOriginLocalIndexMask);
-    return (depth << (32 - mapAttrsOriginDepthBits)) | (localIndex & mapAttrsOriginLocalIndexMask);
+    assert(depth < (uint32_t(1) << indexedCallOriginDepthBits));
+    assert(localIndex <= indexedCallOriginLocalIndexMask);
+    return (depth << (32 - indexedCallOriginDepthBits)) | (localIndex & indexedCallOriginLocalIndexMask);
 }
 
-inline constexpr uint32_t unpackMapAttrsOriginDepth(uint32_t packed) noexcept
+inline constexpr uint32_t unpackIndexedCallOriginDepth(uint32_t packed) noexcept
 {
-    return packed >> (32 - mapAttrsOriginDepthBits);
+    return packed >> (32 - indexedCallOriginDepthBits);
 }
 
-inline constexpr uint32_t unpackMapAttrsOriginLocalIndex(uint32_t packed) noexcept
+inline constexpr uint32_t unpackIndexedCallOriginLocalIndex(uint32_t packed) noexcept
 {
-    return packed & mapAttrsOriginLocalIndexMask;
+    return packed & indexedCallOriginLocalIndexMask;
 }
 
 /**
@@ -766,15 +772,17 @@ class alignas(16)
         pdString,
         pdPath,
         pdPairOfPointers, //< layout: Pair of pointers payload
-        /** mapAttrs' per-attribute pending call -- also a pair of pointers,
-            but given its own PrimaryDiscriminator value (one of 2 that were
+        /** A per-attribute pending call (used by mapAttrs, zipAttrsWith, and
+            any future builtin with the same shape) -- also a pair of
+            pointers, but given its own PrimaryDiscriminator value (one of 2
+            that were
             otherwise unused: 3 bits allow 8 values, only 6 were claimed)
             instead of spending one of pdPairOfPointers' own 8 secondary
             discriminator slots. Payload: payload[0] = this tag | descriptor
             pointer (as usual); payload[1] = the raw packed index, with no
             secondary discriminator to OR in since this tag alone already
             fully identifies the layout. */
-        pdMapAttrsElem,
+        pdIndexedCall,
     };
 
 #if defined(__x86_64__) && defined(__SSE2__)
@@ -893,28 +901,28 @@ class alignas(16)
     }
 
     /**
-     * mapAttrs' own dedicated layout: payload[0] = pdMapAttrsElem | descriptor
+     * IndexedCall's own dedicated layout: payload[0] = pdIndexedCall | descriptor
      * pointer (same aligned-pointer trick as pdPairOfPointers' first word);
      * payload[1] = the raw packed index, unmasked -- no secondary
-     * discriminator needed since pdMapAttrsElem alone fully identifies this
+     * discriminator needed since pdIndexedCall alone fully identifies this
      * layout, so (unlike the old pdPairOfPointers-based scheme) the index
      * doesn't need to be shifted to "look like" an aligned pointer.
      */
     template<typename T>
         requires std::is_pointer_v<T>
-    void setMapAttrsElemPayload(T firstPtrField, uint32_t index) noexcept
+    void setIndexedCallPayload(T firstPtrField, uint32_t index) noexcept
     {
         Payload payload;
         auto firstFieldPayload = std::bit_cast<PackedPointer>(firstPtrField);
         assertAligned(firstFieldPayload);
-        payload[0] = static_cast<int>(pdMapAttrsElem) | firstFieldPayload;
+        payload[0] = static_cast<int>(pdIndexedCall) | firstFieldPayload;
         payload[1] = static_cast<PackedPointer>(index);
         updatePayload(payload);
     }
 
     template<typename T>
         requires std::is_pointer_v<T>
-    void getMapAttrsElemPayload(T & firstPtrField, uint32_t & index) const noexcept
+    void getIndexedCallPayload(T & firstPtrField, uint32_t & index) const noexcept
     {
         Payload payload = loadPayload();
         firstPtrField = untagPointer<T>(payload[0]);
@@ -975,8 +983,8 @@ protected:
             return static_cast<InternalType>(tFirstSingleUntaggable + (pd - pdListN));
         case pdPairOfPointers:
             return static_cast<InternalType>(tFirstPairOfPointers + (payload[1] & discriminatorMask));
-        case pdMapAttrsElem:
-            return tMapAttrsElem;
+        case pdIndexedCall:
+            return tIndexedCall;
         [[unlikely]] default:
             nixUnreachableWhenHardened();
         }
@@ -1003,16 +1011,16 @@ protected:
 #undef NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS
 
     /* Hand-written rather than via NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS: this
-       type has its own dedicated PrimaryDiscriminator (pdMapAttrsElem), not
+       type has its own dedicated PrimaryDiscriminator (pdIndexedCall), not
        one of pdPairOfPointers' secondary-discriminator slots. */
-    void getStorage(ValueBase::MapAttrsElemThunk & val) const noexcept
+    void getStorage(ValueBase::IndexedCallThunk & val) const noexcept
     {
-        getMapAttrsElemPayload(val.descriptor, val.packedIndex);
+        getIndexedCallPayload(val.descriptor, val.packedIndex);
     }
 
-    void setStorage(ValueBase::MapAttrsElemThunk val) noexcept
+    void setStorage(ValueBase::IndexedCallThunk val) noexcept
     {
-        setMapAttrsElemPayload(val.descriptor, val.packedIndex);
+        setIndexedCallPayload(val.descriptor, val.packedIndex);
     }
 
     void getStorage(NixInt & integer) const noexcept
@@ -1394,15 +1402,15 @@ public:
         return isa<tApp>();
     }
 
-    inline bool isMapAttrsElem() const
+    inline bool isIndexedCall() const
     {
-        return isa<tMapAttrsElem>();
+        return isa<tIndexedCall>();
     }
 
     /**
      * @internal Exposes the raw discriminator so EvalState::forceValue can
      * dispatch via a single switch (one jump-table lookup) instead of a
-     * sequential isThunk()/isApp()/isMapAttrsElem()/isFailed() chain, each
+     * sequential isThunk()/isApp()/isIndexedCall()/isFailed() chain, each
      * of which independently recomputes this.
      */
     inline InternalType rawInternalType() const noexcept
@@ -1459,7 +1467,7 @@ public:
             t[tLambda] = nFunction;
             t[tPrimOpApp] = nFunction;
             t[tApp] = nThunk;
-            t[tMapAttrsElem] = nThunk;
+            t[tIndexedCall] = nThunk;
             t[tThunk] = nThunk;
             t[tListSmall] = nList;
             t[tListN] = nList;
@@ -1501,7 +1509,7 @@ public:
             panic("attempt to use uninitialized Value");
         case tFailed:
         case tApp:
-        case tMapAttrsElem:
+        case tIndexedCall:
         case tThunk:
             return false;
         case tInt:
@@ -1598,18 +1606,18 @@ public:
     }
 
     /**
-     * `descriptor` must outlive this Value (allocated once per mapAttrs
-     * call, shared by every attribute). If `descriptor->original` is
-     * unlayered, `index` must be a valid positional index into it
-     * (direct `operator[]`); if layered, `index` must instead be a
-     * Symbol id valid for it (looked up via `get()`, since a layered
-     * chain has no O(1) positional index) -- neither is checked here,
-     * both are the caller's responsibility (`prim_mapAttrs` packs
-     * whichever one matches the path it took).
+     * `descriptor` must outlive this Value (allocated once per call,
+     * shared by every attribute). If `descriptor->original` is unlayered,
+     * `index` must be a valid positional index into it (direct
+     * `operator[]`); if layered, `index` must instead be a packed
+     * `(depth, localIndex)` pair (see `packIndexedCallOrigin`), since a
+     * layered chain has no O(1) positional index -- neither is checked
+     * here, both are the caller's responsibility (the builtin constructing
+     * this packs whichever one matches the path it took).
      */
-    inline void mkMapAttrsElem(MapAttrsDescriptor * descriptor, uint32_t index) noexcept
+    inline void mkIndexedCall(IndexedCallDescriptor * descriptor, uint32_t index) noexcept
     {
-        setStorage(MapAttrsElemThunk{.descriptor = descriptor, .packedIndex = index});
+        setStorage(IndexedCallThunk{.descriptor = descriptor, .packedIndex = index});
     }
 
     inline void mkLambda(Env * e, ExprLambda * f) noexcept
@@ -1746,9 +1754,9 @@ public:
         return getStorage<FunctionApplicationThunk>();
     }
 
-    MapAttrsElemThunk mapAttrsElem() const noexcept
+    IndexedCallThunk indexedCall() const noexcept
     {
-        return getStorage<MapAttrsElemThunk>();
+        return getStorage<IndexedCallThunk>();
     }
 
     const char * pathStr() const noexcept

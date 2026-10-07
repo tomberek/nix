@@ -59,9 +59,9 @@ Value * EvalMemory::allocValue()
 }
 
 [[gnu::always_inline]]
-detail::ValueBase::MapAttrsDescriptor * EvalMemory::allocMapAttrsDescriptor()
+detail::ValueBase::IndexedCallDescriptor * EvalMemory::allocIndexedCallDescriptor()
 {
-    return (detail::ValueBase::MapAttrsDescriptor *) allocValue();
+    return (detail::ValueBase::IndexedCallDescriptor *) allocValue();
 }
 
 [[gnu::always_inline]]
@@ -102,7 +102,7 @@ Env & EvalMemory::allocEnv(size_t size)
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
     /* Single switch on the already-decoded discriminator (one jump-table
-       lookup) instead of a sequential isThunk()/isApp()/isMapAttrsElem()/
+       lookup) instead of a sequential isThunk()/isApp()/isIndexedCall()/
        isFailed() chain, each of which independently recomputes it -- the
        dominant case (already WHNF) falls straight to default. */
     switch (v.rawInternalType()) {
@@ -132,8 +132,8 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         }
         break;
     }
-    case tMapAttrsElem:
-        forceMapAttrsElem(v, pos);
+    case tIndexedCall:
+        forceIndexedCall(v, pos);
         break;
     case tFailed:
         handleEvalFailed(v, pos);

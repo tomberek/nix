@@ -313,6 +313,46 @@ TEST_F(PrimOpTest, mapAttrsLayeredFallback)
     ASSERT_THAT(*c->value, IsIntEq(40));
 }
 
+/* zipAttrsWith shares its lazy per-key call with mapAttrs via the generic
+   buildIndexedCalls helper, building a small internal Bindings to hold
+   {name, list-of-values} pairs instead of a fresh pair of App thunks per
+   key. Covers both the fast path (f is two simple lambdas) and the
+   fallback (f isn't). */
+TEST_F(PrimOpTest, zipAttrsWithFastPath)
+{
+    auto v = eval("builtins.zipAttrsWith (name: values: name + \"=\" + toString (builtins.length values)) "
+                  "[ { a = 1; } { a = 2; b = 3; } ]");
+    ASSERT_THAT(v, IsAttrsOfSize(2));
+
+    auto a = v.attrs()->get(createSymbol("a"));
+    ASSERT_NE(a, nullptr);
+    state.forceValue(*a->value, noPos);
+    ASSERT_THAT(*a->value, IsStringEq("a=2"));
+
+    auto b = v.attrs()->get(createSymbol("b"));
+    ASSERT_NE(b, nullptr);
+    state.forceValue(*b->value, noPos);
+    ASSERT_THAT(*b->value, IsStringEq("b=1"));
+}
+
+TEST_F(PrimOpTest, zipAttrsWithFallback)
+{
+    auto v = eval("let f = name: if name == \"a\" then (values: builtins.length values * 100) "
+                  "else (values: builtins.length values); "
+                  "in builtins.zipAttrsWith f [ { a = 1; b = 1; } { a = 2; b = 2; } ]");
+    ASSERT_THAT(v, IsAttrsOfSize(2));
+
+    auto a = v.attrs()->get(createSymbol("a"));
+    ASSERT_NE(a, nullptr);
+    state.forceValue(*a->value, noPos);
+    ASSERT_THAT(*a->value, IsIntEq(200));
+
+    auto b = v.attrs()->get(createSymbol("b"));
+    ASSERT_NE(b, nullptr);
+    state.forceValue(*b->value, noPos);
+    ASSERT_THAT(*b->value, IsIntEq(2));
+}
+
 TEST_F(PrimOpTest, isList)
 {
     auto v = eval("builtins.isList []");
