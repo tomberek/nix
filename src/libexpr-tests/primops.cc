@@ -282,6 +282,37 @@ TEST_F(PrimOpTest, mapAttrs)
     ASSERT_THAT(*b->value, IsIntEq(20));
 }
 
+/* Regression test: mapAttrs over LAYERED (`//`-built) input with a
+   function that doesn't match the two-simple-lambdas fast path shape
+   (here, syntactically ambiguous via an ExprIf body) must resolve the
+   layered depth/localIndex-packed index correctly rather than crashing.
+   Caught a real `assert(localIndex < chunk->numAttrs)` crash in
+   `Bindings::rawAttrAt` during development: `packedIndex` had stopped
+   being shifted at construction time but was still being unshifted at
+   force time, corrupting both the unlayered and layered index. */
+TEST_F(PrimOpTest, mapAttrsLayeredFallback)
+{
+    auto v = eval(
+        "let f = name: if name == \"b\" then (value: value * 100) else (value: value * 10); "
+        "in builtins.mapAttrs f ({ a = 1; b = 2; } // { b = 3; c = 4; })");
+    ASSERT_THAT(v, IsAttrsOfSize(3));
+
+    auto a = v.attrs()->get(createSymbol("a"));
+    ASSERT_NE(a, nullptr);
+    state.forceValue(*a->value, noPos);
+    ASSERT_THAT(*a->value, IsIntEq(10));
+
+    auto b = v.attrs()->get(createSymbol("b"));
+    ASSERT_NE(b, nullptr);
+    state.forceValue(*b->value, noPos);
+    ASSERT_THAT(*b->value, IsIntEq(300));
+
+    auto c = v.attrs()->get(createSymbol("c"));
+    ASSERT_NE(c, nullptr);
+    state.forceValue(*c->value, noPos);
+    ASSERT_THAT(*c->value, IsIntEq(40));
+}
+
 TEST_F(PrimOpTest, isList)
 {
     auto v = eval("builtins.isList []");

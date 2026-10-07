@@ -2314,7 +2314,7 @@ void EvalState::forceMapAttrsElem(Value & v, const PosIdx pos)
     Value savedApp = v;
     try {
         auto elem = v.mapAttrsElem();
-        uint32_t raw = (uint32_t) (((uintptr_t) elem.packedIndex) >> 3);
+        uint32_t raw = elem.packedIndex;
         const Bindings * original = elem.descriptor->original;
         const Attr * attrPtr;
         if (original->isLayered()) {

@@ -51,17 +51,25 @@ enum InternalType {
     tExternal,
     tPrimOp,
     tAttrs,
+    /** mapAttrs' per-attribute pending call: {sharedDescriptor, packedIndex}
+        instead of a fresh per-attribute {fun,args} box -- descriptor
+        (fun + the original Bindings*) is allocated once per mapAttrs
+        call, not once per attribute, halving mapAttrs' own allocation
+        count. @see MapAttrsElemThunk.
+
+        Deliberately NOT part of the tFirstPairOfPointers..tLastPairOfPointers
+        family below, even though its payload is also a pair of pointers --
+        it gets its own PrimaryDiscriminator value instead of competing for
+        one of that family's 8 shared secondary-discriminator slots (2 of
+        which, at the time this was added, were already unclaimed and still
+        are after this: PrimaryDiscriminator itself has 8 possible 3-bit
+        values and only 6 were in use). See ValueStorage::pdMapAttrsElem. */
+    tMapAttrsElem,
     /* layout: Pair of pointers payload */
     tFirstPairOfPointers,
     tListSmall = tFirstPairOfPointers,
     tPrimOpApp,
     tApp,
-    /** mapAttrs' per-attribute pending call: {sharedDescriptor, packedIndex}
-        instead of a fresh per-attribute {fun,args} box -- descriptor
-        (fun + the original Bindings*) is allocated once per mapAttrs
-        call, not once per attribute, halving mapAttrs' own allocation
-        count. @see MapAttrsElemThunk. */
-    tMapAttrsElem,
     tThunk,
     tLambda,
     tLastPairOfPointers = tLambda,
@@ -438,25 +446,30 @@ struct ValueBase
 
     /**
      * mapAttrs' per-attribute pending call. If `descriptor->original` is
-     * unlayered, `packedIndex` is a plain positional index (shifted left
-     * by 3, so it satisfies setPairOfPointersPayload's "looks like an
-     * aligned pointer" check -- unpacked with `>> 3`, never dereferenced
-     * as a real pointer), looked up via `operator[]`. If layered,
-     * `packedIndex` instead packs `(depth << mapAttrsOriginDepthBits) |
-     * localIndex` (see `packMapAttrsOrigin`/`unpackMapAttrsOrigin*`),
-     * recovered from `Bindings::iterator::originDepth()`/
-     * `originLocalIndex()` at construction time and resolved via
-     * `Bindings::rawAttrAt(depth, localIndex)` at force time -- a fixed
-     * number of pointer hops, no binary search, no extra allocation.
-     * Either way, this gets the attribute's name and original value,
-     * then calls `descriptor->fun` with both -- one callFunction
-     * invocation, no virtual dispatch, and only one allocation (this
-     * Value itself) per attribute instead of two.
+     * unlayered, `packedIndex` is a plain positional index, looked up via
+     * `operator[]`. If layered, `packedIndex` instead packs `(depth <<
+     * mapAttrsOriginDepthBits) | localIndex` (see
+     * `packMapAttrsOrigin`/`unpackMapAttrsOrigin*`), recovered from
+     * `Bindings::iterator::originDepth()`/`originLocalIndex()` at
+     * construction time and resolved via `Bindings::rawAttrAt(depth,
+     * localIndex)` at force time -- a fixed number of pointer hops, no
+     * binary search, no extra allocation. Either way, this gets the
+     * attribute's name and original value, then calls `descriptor->fun`
+     * with both -- one callFunction invocation, no virtual dispatch, and
+     * only one allocation (this Value itself) per attribute instead of
+     * two.
+     *
+     * Stored via its own dedicated PrimaryDiscriminator (see
+     * ValueStorage::pdMapAttrsElem) rather than one of
+     * pdPairOfPointers' shared secondary-discriminator slots, so
+     * `packedIndex` is a plain, unshifted uint32_t -- no need for it to
+     * "look like" an aligned pointer the way a pdPairOfPointers payload
+     * would require.
      */
     struct MapAttrsElemThunk
     {
         MapAttrsDescriptor * descriptor;
-        void * packedIndex;
+        uint32_t packedIndex;
     };
 
     /**
@@ -753,6 +766,15 @@ class alignas(16)
         pdString,
         pdPath,
         pdPairOfPointers, //< layout: Pair of pointers payload
+        /** mapAttrs' per-attribute pending call -- also a pair of pointers,
+            but given its own PrimaryDiscriminator value (one of 2 that were
+            otherwise unused: 3 bits allow 8 values, only 6 were claimed)
+            instead of spending one of pdPairOfPointers' own 8 secondary
+            discriminator slots. Payload: payload[0] = this tag | descriptor
+            pointer (as usual); payload[1] = the raw packed index, with no
+            secondary discriminator to OR in since this tag alone already
+            fully identifies the layout. */
+        pdMapAttrsElem,
     };
 
 #if defined(__x86_64__) && defined(__SSE2__)
@@ -870,6 +892,35 @@ class alignas(16)
         secondPtrField = untagPointer<U>(payload[1]);
     }
 
+    /**
+     * mapAttrs' own dedicated layout: payload[0] = pdMapAttrsElem | descriptor
+     * pointer (same aligned-pointer trick as pdPairOfPointers' first word);
+     * payload[1] = the raw packed index, unmasked -- no secondary
+     * discriminator needed since pdMapAttrsElem alone fully identifies this
+     * layout, so (unlike the old pdPairOfPointers-based scheme) the index
+     * doesn't need to be shifted to "look like" an aligned pointer.
+     */
+    template<typename T>
+        requires std::is_pointer_v<T>
+    void setMapAttrsElemPayload(T firstPtrField, uint32_t index) noexcept
+    {
+        Payload payload;
+        auto firstFieldPayload = std::bit_cast<PackedPointer>(firstPtrField);
+        assertAligned(firstFieldPayload);
+        payload[0] = static_cast<int>(pdMapAttrsElem) | firstFieldPayload;
+        payload[1] = static_cast<PackedPointer>(index);
+        updatePayload(payload);
+    }
+
+    template<typename T>
+        requires std::is_pointer_v<T>
+    void getMapAttrsElemPayload(T & firstPtrField, uint32_t & index) const noexcept
+    {
+        Payload payload = loadPayload();
+        firstPtrField = untagPointer<T>(payload[0]);
+        index = static_cast<uint32_t>(payload[1]);
+    }
+
 public:
     ValueStorage()
     {
@@ -924,6 +975,8 @@ protected:
             return static_cast<InternalType>(tFirstSingleUntaggable + (pd - pdListN));
         case pdPairOfPointers:
             return static_cast<InternalType>(tFirstPairOfPointers + (payload[1] & discriminatorMask));
+        case pdMapAttrsElem:
+            return tMapAttrsElem;
         [[unlikely]] default:
             nixUnreachableWhenHardened();
         }
@@ -944,11 +997,23 @@ protected:
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(SmallList, [0], [1])
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(PrimOpApplicationThunk, .left, .right)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(FunctionApplicationThunk, .left, .right)
-    NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(MapAttrsElemThunk, .descriptor, .packedIndex)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(ClosureThunk, .env, .expr)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(Lambda, .env, .fun)
 
 #undef NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS
+
+    /* Hand-written rather than via NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS: this
+       type has its own dedicated PrimaryDiscriminator (pdMapAttrsElem), not
+       one of pdPairOfPointers' secondary-discriminator slots. */
+    void getStorage(ValueBase::MapAttrsElemThunk & val) const noexcept
+    {
+        getMapAttrsElemPayload(val.descriptor, val.packedIndex);
+    }
+
+    void setStorage(ValueBase::MapAttrsElemThunk val) noexcept
+    {
+        setMapAttrsElemPayload(val.descriptor, val.packedIndex);
+    }
 
     void getStorage(NixInt & integer) const noexcept
     {
@@ -1544,7 +1609,7 @@ public:
      */
     inline void mkMapAttrsElem(MapAttrsDescriptor * descriptor, uint32_t index) noexcept
     {
-        setStorage(MapAttrsElemThunk{.descriptor = descriptor, .packedIndex = (void *) (uintptr_t(index) << 3)});
+        setStorage(MapAttrsElemThunk{.descriptor = descriptor, .packedIndex = index});
     }
 
     inline void mkLambda(Env * e, ExprLambda * f) noexcept
