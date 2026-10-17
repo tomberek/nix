@@ -168,6 +168,16 @@ if [ ! -t 0 ]; then
   echo ""
 fi
 
+# -p breaks NFS. On the other hand, --preserve breaks BSD/Darwin/BusyBox.
+nix_cp_test_flags_dir=$(mktemp -d -t nix-cp-test.XXXXXXXXXX)
+touch "$nix_cp_test_flags_dir/src"
+if cp --preserve=ownership,timestamps "$nix_cp_test_flags_dir/src" "$nix_cp_test_flags_dir/dst" >/dev/null 2>&1; then
+    cp_flags="-RP --preserve=ownership,timestamps"
+else
+    cp_flags="-RPp"
+fi
+rm -rf "$nix_cp_test_flags_dir"
+
 for i in $(cd "$self/store" >/dev/null && echo ./*); do
     if [ -t 0 ]; then
       printf "." >&2
@@ -177,16 +187,17 @@ for i in $(cd "$self/store" >/dev/null && echo ./*); do
         rm -rf "$i_tmp"
     fi
     if ! [ -e "$dest/store/$i" ]; then
-        if [ "$OS" = "Darwin" ] || [ "$OS" = "FreeBSD" ]; then
-            cp -RPp "$self/store/$i" "$i_tmp"
-        else
-            cp -RP --preserve=ownership,timestamps "$self/store/$i" "$i_tmp"
-        fi
+        # shellcheck disable=SC2086
+        cp $cp_flags "$self/store/$i" "$i_tmp"
         chmod -R a-w "$i_tmp"
         chmod +w "$i_tmp"
         mv "$i_tmp" "$dest/store/$i"
         chmod -w "$dest/store/$i"
     fi
+    # BusyBox tar is bad at preserving mtime because it doesn't seem to do the correct
+    # thing of doing a final fixup pass for fixing parent directory permissions and doesn't
+    # handle symlinks at all. So we can set the correct mtime here.
+    find "$dest/store/$i" -depth -exec touch -hmd "@1" {} +
 done
 echo "" >&2
 

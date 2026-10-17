@@ -5,10 +5,31 @@
 }:
 
 let
+  commonCheck = ''
+    export NIX_CONFIG="substituters = "
 
-  installScripts = {
+    nix-env --version
+
+    nix --extra-experimental-features nix-command store info
+    nix-store --verify --check-contents
+    nix store verify --all --extra-experimental-features nix-command --no-trust
+
+    nix-channel --add file://$HOME/channel myChannel
+    nix-channel --update
+    [[ $(nix-instantiate --eval --expr 'builtins.readFile <myChannel/someFile>') = '"someContent"' ]]
+
+    bad_mtime=$( find /nix/store/ -mindepth 1 ! -path /nix/store/.links \
+                 -exec sh -c '[ "$(stat -c %Y "{}")" -ne 1 ]' \; -print -quit )
+    if [ -n "$bad_mtime" ]; then
+      echo "bad filesystem object mtime after install:"
+      stat "$bad_mtime"
+      exit 1
+    fi
+  '';
+
+  installCases = {
     install-default = {
-      script = ''
+      install = ''
         tar -xf ./nix.tar.xz
         mv ./nix-* nix
         ./nix/install --no-channel-add
@@ -16,7 +37,7 @@ let
     };
 
     install-both-profile-links = {
-      script = ''
+      install = ''
         tar -xf ./nix.tar.xz
         mv ./nix-* nix
         ln -s $HOME/.local/state/nix/profiles/a-profile $HOME/.nix-profile
@@ -27,7 +48,7 @@ let
     };
 
     install-force-no-daemon = {
-      script = ''
+      install = ''
         tar -xf ./nix.tar.xz
         mv ./nix-* nix
         ./nix/install --no-daemon --no-channel-add
@@ -35,10 +56,25 @@ let
     };
 
     install-force-daemon = {
-      script = ''
+      install = ''
         tar -xf ./nix.tar.xz
         mv ./nix-* nix
         ./nix/install --daemon --no-channel-add
+      '';
+
+      check = ''
+        [ "$(stat -c '%a %U:%G' /nix/store)" = "1775 root:nixbld" ] || {
+          echo "/nix/store is not 1775 root:nixbld:"
+          stat /nix/store
+          exit 1
+        }
+
+        bad_ownership=$(find /nix/store/ -mindepth 1 ! \( -user root -group root \) -print -quit)
+        if [ -n "$bad_ownership" ]; then
+          echo "bad store object ownership in the store after install:"
+          stat "$bad_ownership"
+          exit 1
+        fi
       '';
     };
 
@@ -58,7 +94,12 @@ let
   disableSELinux = "sudo setenforce 0";
 
   images = {
-    "ubuntu-22-04" = {
+    # Images are named such that the DrvName logic that extracts the derivation
+    # name for logs doesn't treat the everything after the `-` as the version.
+    # That's accomplished by adding `v` after the dash. This makes logs more
+    # legible.
+
+    "ubuntu-v22_04" = {
       "x86_64-linux" = {
         image = import <nix/fetchurl.nix> {
           url = "https://cloud-images.ubuntu.com/releases/jammy/release-20260913/ubuntu-22.04-server-cloudimg-amd64-disk-kvm.img";
@@ -67,7 +108,7 @@ let
       };
     };
 
-    "ubuntu-24-04" = {
+    "ubuntu-v24_04" = {
       "x86_64-linux" = {
         image = import <nix/fetchurl.nix> {
           url = "https://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-amd64.img";
@@ -76,7 +117,7 @@ let
       };
     };
 
-    "fedora-44" = {
+    "fedora-v44" = {
       "x86_64-linux" = {
         image = import <nix/fetchurl.nix> {
           url = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2";
@@ -86,7 +127,7 @@ let
       };
     };
 
-    "rocky-8" = {
+    "rocky-v8" = {
       "x86_64-linux" = {
         image = import <nix/fetchurl.nix> {
           url = "https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base-8.10-20240528.0.x86_64.qcow2";
@@ -96,7 +137,7 @@ let
       };
     };
 
-    "rocky-9" = {
+    "rocky-v9" = {
       "x86_64-linux" = {
         image = import <nix/fetchurl.nix> {
           url = "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base-9.8-20260525.0.x86_64.qcow2";
@@ -108,7 +149,7 @@ let
       };
     };
 
-    "rocky-10" = {
+    "rocky-v10" = {
       "x86_64-linux" = {
         image = import <nix/fetchurl.nix> {
           url = "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base-10.2-20260525.0.x86_64.qcow2";
@@ -117,6 +158,22 @@ let
         postBoot = disableSELinux;
         # Needs x86_64-v3
         extraQemuOpts = "-cpu Haswell-v1";
+      };
+    };
+
+    # Docs on cloud-init quirks: https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/cloud-init/README.Alpine?ref_type=heads
+    "alpine-v3_23" = {
+      "x86_64-linux" = {
+        image = import <nix/fetchurl.nix> {
+          url = "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/alpine-3.23.6-x86_64-bios-cloudinit-r0.qcow2";
+          hash = "sha512-+F0E0lvjkmC273NNkY1+X2lpdf7uuuMuQtkBL6dmnWBX8gEZ0bq2fihWJIttnJaCTcaEMpT5IoSGrZ4IvBfVpg==";
+        };
+        shell = "/bin/sh";
+        postBoot = "touch ~/.profile";
+        installCases = {
+          # Multi-user installer doesn't support non-bash shells or OpenRC.
+          inherit (installCases) install-default install-both-profile-links install-force-no-daemon;
+        };
       };
     };
   };
@@ -129,6 +186,7 @@ let
     }:
     let
       image = images.${imageName}.${system};
+      test = installCases.${testName};
     in
     with nixpkgsFor.${system}.native;
     runCommand "installer-test-${imageName}-${testName}"
@@ -140,14 +198,17 @@ let
         ];
         image = image.image;
         postBoot = image.postBoot or "";
-        installScript = installScripts.${testName}.script;
+        installScript = test.install;
+        checkScript = commonCheck + (test.check or "");
         binaryTarball = binaryTarballs.${system};
       }
       ''
         shopt -s nullglob
+        set -eu
 
         image_type=$(qemu-img info $image | sed 's/file format: \(.*\)/\1/; t; d')
         qemu-img create -b $image -F "$image_type" -f qcow2 ./disk.qcow2
+        qemu-img resize ./disk.qcow2 +2G
         ssh-keygen -t ed25519 -f ./id_test
 
         # Configure our test user via cloud-init to get passwordless sudo and
@@ -158,9 +219,13 @@ let
         #cloud-config
         users:
         - name: user
-          shell: /bin/bash
+          shell: ${image.shell or "/bin/bash"}
           sudo: ALL=(ALL) NOPASSWD:ALL
-          lock_passwd: true
+          doas:
+           - permit nopass user as root
+          # Workaround for alpine that refuses ssh connections with locked accounts even with keys.
+          hashed_passwd: '*'
+          lock_passwd: false
           ssh_authorized_keys:
           - $(cat ./id_test.pub)
         EOF
@@ -199,39 +264,33 @@ let
 
         if [[ -n $postBoot ]]; then
           echo "Running post-boot commands..."
-          $ssh "set -ex; $postBoot"
+          $ssh "set -eux; $postBoot"
         fi
 
         echo "Copying installer..."
         scp -P $ssh_port $ssh_opts $binaryTarball/nix-*.tar.xz user@localhost:nix.tar.xz
 
         echo "Running installer..."
-        $ssh "set -eux; $installScript"
+        $ssh <<EOF
+          set -eux
 
-        echo "Copying the mock channel"
-        ssh -p $ssh_port $ssh_opts user@localhost "mkdir channel"
-        scp -P $ssh_port $ssh_opts ${mockChannel pkgs}/channel/nixexprs.tar.bz2 user@localhost:channel/
+          # TODO: The installer should probably autodetect instead of requiring manually specifying this.
+          if command -v sudo; then
+            export NIX_BECOME=sudo
+          elif command -v doas; then
+            export NIX_BECOME=doas
+          fi
+
+          $installScript
+        EOF
+
+        echo "Copying the mock channel..."
+        scp -r -P $ssh_port $ssh_opts ${mockChannel pkgs}/channel user@localhost:./
 
         echo "Testing Nix installation..."
         $ssh <<EOF
-          set -ex
-
-          nix-env --version
-          nix --extra-experimental-features nix-command store info
-
-          out=\$(nix-build --no-substitute -E 'derivation { name = "foo"; system = "${system}"; builder = "/bin/sh"; args = ["-c" "echo foobar > \$out"]; }')
-          [[ \$(cat \$out) = foobar ]]
-
-          if pgrep nix-daemon; then
-            MAYBESUDO="sudo --preserve-env=NIX_CONFIG"
-          else
-            MAYBESUDO=""
-          fi
-
-          export NIX_CONFIG="substituters = "
-          $MAYBESUDO \$(which nix-channel) --add file://\$HOME/channel myChannel
-          $MAYBESUDO \$(which nix-channel) --update
-          [[ \$(nix-instantiate --eval --expr 'builtins.readFile <myChannel/someFile>') = '"someContent"' ]]
+          set -eux
+          $checkScript
         EOF
 
         echo "Done!"
@@ -243,8 +302,8 @@ in
 builtins.mapAttrs (
   imageName: imageForSystems:
   lib.concatMapAttrs (system: image: {
-    ${system} = builtins.mapAttrs (
-      testName: test: makeTest { inherit imageName testName system; }
-    ) installScripts;
+    ${system} = builtins.mapAttrs (testName: test: makeTest { inherit imageName testName system; }) (
+      image.installCases or installCases
+    );
   }) imageForSystems
 ) images
