@@ -74,6 +74,7 @@ sources = files(
   'spawn.cc',
   'strings.cc',
   'suggestions.cc',
+  'tarfile.cc',
   'terminal.cc',
   'topo-sort.cc',
   'url.cc',
@@ -83,6 +84,10 @@ sources = files(
 
 if host_machine.system() != 'windows'
   subdir('unix')
+endif
+
+if host_machine.system() == 'darwin'
+  subdir('darwin')
 endif
 
 include_dirs = [ include_directories('.') ]
@@ -113,7 +118,6 @@ if build_unit_tests
     include_directories : include_dirs,
     # TODO: -lrapidcheck, see ../libutil-support/build.meson
     link_args : linker_export_flags + [ '-lrapidcheck' ],
-    # get main from gtest
     install : true,
     cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
   )

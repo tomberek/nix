@@ -1,5 +1,5 @@
-# Zstd-compressed Nix closure in the layout expected by
-# `NixOS/nix-installer` (`include_bytes!` at build time).
+# Zstd-compressed Nix closure in the layout expected to be embedded into
+# nix-installer binary.
 {
   lib,
   stdenv,
@@ -36,10 +36,11 @@ runCommand "nix-installer-tarball-${nix.version}"
 
     cp ${installerClosureInfo}/registration $TMPDIR/reginfo
 
+    # Store mtime is 1 second into the epoch.
     tar cf - \
       --sort=name \
       --owner=0 --group=0 --mode=u+rw,uga+r \
-      --mtime='1970-01-01' \
+      --mtime='@1' \
       --absolute-names \
       --hard-dereference \
       --transform "s,$TMPDIR/reginfo,$dir/.reginfo," \

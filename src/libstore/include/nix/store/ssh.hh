@@ -9,6 +9,13 @@
 
 namespace nix {
 
+/**
+ * The ssh program used for all ssh invocations (build-time configurable
+ * via the `ssh-program` option; either a name resolved via PATH or an
+ * absolute path).
+ */
+const std::filesystem::path & sshProgram();
+
 OsStrings getNixSshOpts();
 
 class SSHMaster
@@ -40,9 +47,7 @@ private:
     void addCommonSSHOpts(OsStrings & args);
     bool isMasterRunning();
 
-#ifndef _WIN32 // TODO re-enable on Windows, once we can fork.
     std::filesystem::path startMaster();
-#endif
 
 public:
 
