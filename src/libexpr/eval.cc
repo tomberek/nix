@@ -2310,7 +2310,11 @@ void EvalState::forceIndexedCall(Value & v, const PosIdx pos)
     try {
         auto elem = v.indexedCall();
         uint32_t raw = (uint32_t) (uintptr_t(elem.packedIndex) >> 3);
-        const Attr * attrPtr = &(*elem.descriptor->original)[(Bindings::size_type) raw];
+        const Bindings * original = elem.descriptor->original;
+        const Attr * attrPtr =
+            original->isLayered()
+                ? &original->rawAttrAt(unpackIndexedCallOriginDepth(raw), unpackIndexedCallOriginLocalIndex(raw))
+                : &(*original)[(Bindings::size_type) raw];
 
         Value * nameValue = Value::toPtr(symbols[attrPtr->name]);
         Value * args[2] = {nameValue, attrPtr->value};

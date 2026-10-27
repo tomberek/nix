@@ -3644,21 +3644,20 @@ static void buildIndexedCalls(EvalState & state, Value * fun, const Bindings * i
     if (inputAttrs->empty())
         return;
 
-    if (inputAttrs->isLayered()) {
-        auto flattened = state.buildBindings(inputAttrs->size());
-        for (auto & i : *inputAttrs)
-            flattened.insert(i.name, i.value, i.pos);
-        inputAttrs = flattened.alreadySorted();
-    }
-
     auto * descriptor = state.mem.allocIndexedCallDescriptor();
     descriptor->fun = fun;
     descriptor->original = inputAttrs;
 
-    Bindings::size_type index = 0;
-    for (auto & i : *inputAttrs) {
-        attrs.alloc(i.name).mkIndexedCall(descriptor, index);
-        index++;
+    if (!inputAttrs->isLayered()) {
+        Bindings::size_type index = 0;
+        for (auto & i : *inputAttrs) {
+            attrs.alloc(i.name).mkIndexedCall(descriptor, index);
+            index++;
+        }
+    } else {
+        inputAttrs->forEachWithOrigin([&](const Attr & attr, uint32_t depth, uint32_t localIndex) {
+            attrs.alloc(attr.name).mkIndexedCall(descriptor, packIndexedCallOrigin(depth, localIndex));
+        });
     }
 }
 

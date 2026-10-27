@@ -418,8 +418,10 @@ struct ValueBase
     };
 
     /**
-     * `packedIndex` is `index << 3`: the low 3 bits of this slot are
-     * reserved for `ValueStorage`'s own discriminator.
+     * Unlayered attrsets index `descriptor->original` directly; layered ones
+     * pack `(depth, localIndex)` via `packIndexedCallOrigin`. `packedIndex`
+     * is shifted left 3 bits: the low 3 bits of this slot are reserved for
+     * `ValueStorage`'s own discriminator.
      */
     struct IndexedCallThunk
     {
@@ -552,6 +554,28 @@ template<typename T>
 inline constexpr InternalType payloadTypeToInternalType = PayloadTypeToInternalType<T>::value;
 
 } // namespace detail
+
+/** Must stay above log2(Bindings::maxLayers); kept small to leave more bits for localIndex. */
+inline constexpr unsigned indexedCallOriginDepthBits = 4;
+
+inline constexpr uint32_t indexedCallOriginLocalIndexMask = (uint32_t(1) << (32 - indexedCallOriginDepthBits)) - 1;
+
+inline constexpr uint32_t packIndexedCallOrigin(uint32_t depth, uint32_t localIndex) noexcept
+{
+    assert(depth < (uint32_t(1) << indexedCallOriginDepthBits));
+    assert(localIndex <= indexedCallOriginLocalIndexMask);
+    return (depth << (32 - indexedCallOriginDepthBits)) | (localIndex & indexedCallOriginLocalIndexMask);
+}
+
+inline constexpr uint32_t unpackIndexedCallOriginDepth(uint32_t packed) noexcept
+{
+    return packed >> (32 - indexedCallOriginDepthBits);
+}
+
+inline constexpr uint32_t unpackIndexedCallOriginLocalIndex(uint32_t packed) noexcept
+{
+    return packed & indexedCallOriginLocalIndexMask;
+}
 
 /**
  * Discriminated union of types stored in the value.
