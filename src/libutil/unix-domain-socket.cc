@@ -84,7 +84,7 @@ static bool tryBindConnectAtDir(
     auto * psaddr = reinterpret_cast<struct sockaddr *>(&addr);
 
     if (base.native().size() + 1 >= sizeof(addr.sun_path))
-        throw Error("socket path '%s' is too long", PathFmt(path));
+        throw Error("socket path %s is too long", PathFmt(path));
 
     // O_PATH opens the directory as a path-resolution-only handle, with no read permission needed.
     AutoCloseFD dirfd = ::open(path.parent_path().c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
@@ -94,7 +94,7 @@ static bool tryBindConnectAtDir(
 #    if HAVE_BINDAT && HAVE_CONNECTAT
     memcpy(addr.sun_path, base.c_str(), base.native().size() + 1);
     if (operationAt(dirfd.get(), fd, psaddr, sizeof(addr)) == -1)
-        throw SysError("cannot %s to socket at '%s'", operationName, PathFmt(path));
+        throw SysError("cannot %s to socket at %s", operationName, PathFmt(path));
     return true;
 #    else // __linux__
     // A long basename plus a multi-digit dirfd can push this past sun_path even when the
@@ -107,7 +107,7 @@ static bool tryBindConnectAtDir(
         // /proc not being mounted is the case where fork+chdir remains useful.
         if (errno == ENOENT || errno == ENOTDIR)
             return false;
-        throw SysError("cannot %s to socket at '%s'", operationName, PathFmt(path));
+        throw SysError("cannot %s to socket at %s", operationName, PathFmt(path));
     }
     return true;
 #    endif
@@ -155,10 +155,10 @@ static void bindConnectProcHelper(
                     throw SysError("chdir to %s failed", PathFmt(dir));
                 auto base = path.filename();
                 if (base.native().size() + 1 >= sizeof(addr.sun_path))
-                    throw Error("socket path '%s' is too long", PathFmt(path));
+                    throw Error("socket path %s is too long", PathFmt(path));
                 memcpy(addr.sun_path, base.c_str(), base.native().size() + 1);
                 if (operation(fd, psaddr, sizeof(addr)) == -1)
-                    throw SysError("cannot %s to socket at '%s'", operationName, PathFmt(path));
+                    throw SysError("cannot %s to socket at %s", operationName, PathFmt(path));
                 writeFull(pipe.writeSide.get(), "0\n");
             } catch (SysError & e) {
                 writeFull(pipe.writeSide.get(), fmt("%d\n", e.errNo));
@@ -169,16 +169,16 @@ static void bindConnectProcHelper(
         pipe.writeSide.close();
         auto errNo = string2Int<int>(chomp(drainFD(pipe.readSide.get())));
         if (!errNo || *errNo == -1)
-            throw Error("cannot %s to socket at '%s'", operationName, PathFmt(path));
+            throw Error("cannot %s to socket at %s", operationName, PathFmt(path));
         else if (*errNo > 0) {
             errno = *errNo;
-            throw SysError("cannot %s to socket at '%s'", operationName, PathFmt(path));
+            throw SysError("cannot %s to socket at %s", operationName, PathFmt(path));
         }
 #endif
     } else {
         memcpy(addr.sun_path, pathStr.c_str(), pathStr.size() + 1);
         if (operation(fd, psaddr, sizeof(addr)) == -1)
-            throw NativeSysError("cannot %s to socket at '%s'", operationName, PathFmt(path));
+            throw NativeSysError("cannot %s to socket at %s", operationName, PathFmt(path));
     }
 }
 

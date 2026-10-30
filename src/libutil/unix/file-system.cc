@@ -8,6 +8,11 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#  include <linux/capability.h>
+#  include <sys/syscall.h>
+#endif
+
 #ifdef __FreeBSD__
 #  include <sys/param.h>
 #  include <sys/mount.h>
@@ -156,7 +161,8 @@ static void _deletePath(
     Descriptor parentfd,
     const std::filesystem::path & path,
     uint64_t & bytesFreed,
-    std::exception_ptr & ex MOUNTEDPATHS_PARAM)
+    std::exception_ptr & ex,
+    bool forceDontChmod MOUNTEDPATHS_PARAM)
 {
     checkInterrupt();
 #ifdef __FreeBSD__
@@ -199,9 +205,10 @@ static void _deletePath(
     }
 
     if (S_ISDIR(st.st_mode)) {
-        /* Make the directory accessible. */
         const auto PERM_MASK = S_IRUSR | S_IWUSR | S_IXUSR;
-        if ((st.st_mode & PERM_MASK) != PERM_MASK)
+        const bool needsPermissionChange = !forceDontChmod && ((st.st_mode & PERM_MASK) != PERM_MASK);
+        /* Make the directory accessible, but only if we really need to. */
+        if (needsPermissionChange)
             try {
                 unix::fchmodatTryNoFollow(parentfd, name, st.st_mode | PERM_MASK);
             } catch (SysError & e) {
@@ -224,7 +231,7 @@ static void _deletePath(
             std::string childName = dirent->d_name;
             if (childName == "." || childName == "..")
                 continue;
-            _deletePath(dirfd(dir.get()), path / childName, bytesFreed, ex MOUNTEDPATHS_ARG);
+            _deletePath(dirfd(dir.get()), path / childName, bytesFreed, ex, forceDontChmod MOUNTEDPATHS_ARG);
         }
         if (errno)
             throw SysError("reading directory %1%", PathFmt(path));
@@ -260,7 +267,26 @@ static void _deletePath(const std::filesystem::path & path, uint64_t & bytesFree
 
     std::exception_ptr ex;
 
-    _deletePath(dirfd.get(), path, bytesFreed, ex MOUNTEDPATHS_ARG);
+    /* Whether directories don't need to be made writable/readable/traversable
+       for them to be emptied. */
+    bool forceDontChmod = false;
+
+#ifdef __APPLE__
+    /* Root can traverse and recursively remove unreadable, non-executable and
+       non-writable directories on Darwin. App Management can deny changing a
+       launched app bundle's mode even when deleting the bundle is allowed. */
+    if (::geteuid() == 0)
+        forceDontChmod = true;
+#elif defined(__linux__)
+    /* UID 0 alone does not guarantee permission to bypass directory modes.
+       Query the calling thread, and keep chmod if the query fails. */
+    __user_cap_header_struct header{.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+    __user_cap_data_struct caps[_LINUX_CAPABILITY_U32S_3]{};
+    if (::syscall(SYS_capget, &header, caps) == 0)
+        forceDontChmod = caps[CAP_TO_INDEX(CAP_DAC_OVERRIDE)].effective & CAP_TO_MASK(CAP_DAC_OVERRIDE);
+#endif
+
+    _deletePath(dirfd.get(), path, bytesFreed, ex, forceDontChmod MOUNTEDPATHS_ARG);
 
     if (ex)
         std::rethrow_exception(ex);
@@ -274,7 +300,7 @@ void deletePath(const std::filesystem::path & path)
 
 void deletePath(const std::filesystem::path & path, uint64_t & bytesFreed)
 {
-    // Activity act(*logger, lvlDebug, "recursively deleting path '%1%'", path);
+    bytesFreed = 0;
 #ifdef __FreeBSD__
     std::set<std::filesystem::path> mountedPaths;
     struct statfs * mntbuf;
@@ -287,7 +313,6 @@ void deletePath(const std::filesystem::path & path, uint64_t & bytesFreed)
         mountedPaths.emplace(mntbuf[i].f_mntonname);
     }
 #endif
-    bytesFreed = 0;
     _deletePath(path, bytesFreed MOUNTEDPATHS_ARG);
 }
 

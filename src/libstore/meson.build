@@ -97,11 +97,6 @@ configdata_pub.set(
   description : 'FIXME: It\'s a bit peculiar that this needs to be exposed. The reason is that that it effects whether the settings struct in a header has a particular field. This is also odd, because it means when there is no ACL support one will just get an "unknown setting" warning from their configuration.',
 )
 
-if host_machine.system() == 'darwin'
-  sandbox = cxx.find_library('sandbox')
-  deps_private_no_pkgconfig += [ sandbox ]
-endif
-
 if host_machine.system() == 'windows'
   wsock32 = cxx.find_library('wsock32')
   deps_private_no_pkgconfig += [ wsock32 ]
@@ -239,13 +234,15 @@ if host_machine.system() != 'windows'
   configdata_priv.set_quoted('NIX_CONF_DIR', sysconfdir / 'nix')
 endif
 
-lsof = find_program('lsof', required : false)
-configdata_priv.set_quoted(
-  'LSOF',
-  lsof.found() ? lsof.full_path()
-  # Just look up on the PATH
-: 'lsof',
-)
+lsof_program = get_option('lsof-program')
+if lsof_program == ''
+  lsof = find_program('lsof', required : false)
+  # Just look up on the PATH if not found at build time
+  lsof_program = lsof.found() ? lsof.full_path() : 'lsof'
+endif
+configdata_priv.set_quoted('LSOF', lsof_program)
+
+configdata_priv.set_quoted('SSH_PROGRAM', get_option('ssh-program'))
 
 config_priv_h = configure_file(
   configuration : configdata_priv,

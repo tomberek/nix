@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory_resource>
 #include <algorithm>
+#include <ranges>
 
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/value.hh"
@@ -408,6 +409,37 @@ struct ExprAttrs : Expr
      * new pmr::map using a different allocator (move assignment will copy into the old allocator)
      */
     std::optional<AttrDefs> attrs;
+
+    /**
+     * Sorted, contiguous replacement for `attrs`, populated exactly once by
+     * moveDataToAllocator() once parsing of this node is complete. Everything
+     * that runs after bindVars() -- eval(), bindVars() itself, showBindings() --
+     * reads this, not `attrs` (which is reset immediately after conversion).
+     * Kept sorted by Symbol to match std::pmr::map's order (bindVars's
+     * displacement loop depends on this). Never mutate size after construction:
+     * unlike map iterators, vector iterators/pointers are not stable across
+     * insertion.
+     */
+    struct BoundAttrDefs : std::pmr::vector<std::pair<Symbol, AttrDef>>
+    {
+        using Base = std::pmr::vector<std::pair<Symbol, AttrDef>>;
+        using Base::Base;
+
+        iterator find(Symbol s)
+        {
+            auto it = std::ranges::lower_bound(*this, s, {}, &value_type::first);
+            return it != end() && it->first == s ? it : end();
+        }
+
+        const_iterator find(Symbol s) const
+        {
+            auto it = std::ranges::lower_bound(*this, s, {}, &value_type::first);
+            return it != end() && it->first == s ? it : end();
+        }
+    };
+
+    std::optional<BoundAttrDefs> boundAttrs;
+
     std::unique_ptr<std::pmr::vector<Expr *>> inheritFromExprs;
 
     struct DynamicAttrDef

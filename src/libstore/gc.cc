@@ -464,7 +464,17 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
                 debug("GC roots server accepted new client");
 
-                /* Process the connection in a separate thread. */
+                /* Process the connection in a separate thread. Hold
+                   the `connections` lock while starting the thread
+                   and registering it, so that the thread's cleanup
+                   handler (which removes it from `connections`)
+                   can't run before it has been inserted. Otherwise
+                   a client that disconnects immediately would leave
+                   a stale entry, and a later client that gets the
+                   same fd number would cause a duplicate key insert,
+                   destroying a joinable std::thread and thus calling
+                   std::terminate(). */
+                auto conn(connections.lock());
                 auto fdClient_ = fdClient.get();
                 std::thread clientThread([&, fdClient = std::move(fdClient)]() {
                     Finally cleanup([&]() {
@@ -514,7 +524,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     }
                 });
 
-                connections.lock()->insert({fdClient_, std::move(clientThread)});
+                auto [it, inserted] = conn->insert({fdClient_, std::move(clientThread)});
+                assert(inserted);
             }
         }
     });
@@ -555,6 +566,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        GCLimitReached if we've deleted enough garbage. */
     auto deleteFromStore = [&](std::string_view baseName, bool isKnownPath) {
         assert(!std::filesystem::path(baseName).is_absolute());
+
         /* Using `std::string` since this is the logical store dir. Hopefully that is the right choice. */
         std::string path = storeDir + "/" + std::string(baseName);
         auto realPath = config->realStoreDir.get() / std::string(baseName);
@@ -575,7 +587,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
         results.paths.insert(path);
 
-        uint64_t bytesFreed;
+        uint64_t bytesFreed = 0;
         deleteStorePath(realPath, bytesFreed, isKnownPath);
 
         results.bytesFreed += bytesFreed;
@@ -831,7 +843,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
                         if (auto storePath = maybeParseStorePath(storeDir + "/" + name))
                             maybeDeleteReferrersClosure(*storePath);
-                        else
+                        else if (shouldDelete)
                             deleteFromStore(name, false);
                     }
                 },

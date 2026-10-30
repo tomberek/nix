@@ -5,6 +5,13 @@
 
 namespace nix {
 
+/**
+ * The git program used for all git invocations (build-time configurable
+ * via the `git-program` option; either a name resolved via PATH or an
+ * absolute path).
+ */
+const std::filesystem::path & gitProgram();
+
 namespace fetchers {
 struct PublicKey;
 struct Settings;
@@ -25,6 +32,12 @@ struct GitRepo
         bool create = false;
         bool bare = false;
         bool packfilesOnly = false;
+        /**
+         * Whether to avoid finding deltas when writing packfiles. It's an
+         * expensive operation, which should be avoided if no benefit is
+         * expected from possible deduplication in the same packfile.
+         */
+        bool dontFindDeltas = false;
     };
 
     static ref<GitRepo> openRepo(const std::filesystem::path & path, Options options);
